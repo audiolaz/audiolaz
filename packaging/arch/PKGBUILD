@@ -1,0 +1,78 @@
+# Maintainer: audiolaz <contact@audiolaz.com>
+
+pkgbase=audiolaz
+pkgname=(audiolaz-player snd-audiolaz-dkms)
+pkgver=1.3.0
+pkgrel=1
+pkgdesc='Free bit-perfect network audio player: Roon/LMS, UPnP, AirPlay and Spotify Connect in, ALSA, Squeezebox, UPnP and audiolaz Link out'
+arch=(x86_64 aarch64)
+url='https://github.com/audiolaz/audiolaz'
+license=(MIT OFL-1.1)
+makedepends=(alsa-lib flac dkms)  # flac: its headers only (libFLAC is opened at run time); dkms: the split package
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        audiolaz-player.service
+        audiolaz-player.conf
+        50-audiolaz.conf)
+sha256sums=('4fc4d8833f63c74a3f59dcbfa181a6fad29126170f2f86e658b672d9565f6853'
+            '2d0acb504f39627fb3a46b8007b61d265415c292aba328013c364cfc8459a647'
+            '16d6ed94872d3c2fd1ef89af808666dfb52221e0f3945784ebcd242bd3bd248b'
+            'dfbebfd8ccc5d783db8f54421422827c4172f227c127eeb95a343d726ff9c4d4')
+
+prepare() {
+  cd "$pkgbase-$pkgver"
+  # the tag's VERSION file still says 1.2.6: the player reports the packaged version
+  echo "$pkgver" > VERSION
+}
+
+build() {
+  cd "$pkgbase-$pkgver"
+  # build.sh links in the same command it compiles: LDFLAGS go with CFLAGS
+  CC="${CC:-cc}" CFLAGS="$CFLAGS $LDFLAGS" LANG_BUILD=en ./build.sh player
+}
+
+check() {
+  cd "$pkgbase-$pkgver"
+  # the unit tests: no sound card, the network on this machine only (127.0.0.1 and mDNS)
+  sh tests/run.sh
+}
+
+package_audiolaz-player() {
+  depends=(alsa-lib glibc)
+  optdepends=('flac: FLAC streams from Roon/LMS and UPnP (libFLAC, opened at run time)'
+              'shairport-sync: AirPlay input (through the snd-aloop Loopback)'
+              'librespot: Spotify Connect input (through the snd-aloop Loopback)'
+              'snd-audiolaz-dkms: the audiolaz sound card, any application plays into the player')
+  backup=(etc/audiolaz-player.conf)
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 build/audiolaz-player -t "$pkgdir/usr/bin"
+  install -Dm755 build/audiolaz-recv -t "$pkgdir/usr/bin"
+  # ALSA loads libasound_module_pcm_<type>.so for "type <type>": the plug-in's type is azdrv
+  install -Dm755 build/libasound_module_pcm_audiolaz.so "$pkgdir/usr/lib/alsa-lib/libasound_module_pcm_azdrv.so"
+  # the PCM "audiolaz"; alsa-lib reads /etc/alsa/conf.d (as pipewire-alsa: a link to /usr/share/alsa/alsa.conf.d)
+  install -Dm644 "$srcdir/50-audiolaz.conf" -t "$pkgdir/usr/share/alsa/alsa.conf.d"
+  install -dm755 "$pkgdir/etc/alsa/conf.d"
+  ln -s /usr/share/alsa/alsa.conf.d/50-audiolaz.conf "$pkgdir/etc/alsa/conf.d/50-audiolaz.conf"
+
+  install -Dm644 "$srcdir/audiolaz-player.service" -t "$pkgdir/usr/lib/systemd/system"
+  install -Dm644 "$srcdir/audiolaz-player.conf" -t "$pkgdir/etc"
+
+  install -Dm644 README.md NOTICE.md docs/*.md -t "$pkgdir/usr/share/doc/audiolaz-player"
+  install -Dm644 LICENSE NOTICE.md -t "$pkgdir/usr/share/licenses/audiolaz-player"
+}
+
+package_snd-audiolaz-dkms() {
+  pkgdesc='The audiolaz sound card for Linux (kernel module, DKMS): any application plays into the audiolaz player'
+  arch=(any)
+  license=(GPL-2.0-only)
+  depends=(dkms)
+  optdepends=('audiolaz-player: the player that reads the card')
+
+  cd "$pkgbase-$pkgver/src/linux/kmod"
+  local dest="$pkgdir/usr/src/snd-audiolaz-$pkgver"
+  install -Dm644 Makefile azcard.h snd-audiolaz.c -t "$dest"
+  # the package's version; CLEAN is deprecated in dkms 3 (it cleans by itself)
+  sed -e "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$pkgver\"/" -e '/^CLEAN=/d' dkms.conf > "$dest/dkms.conf"
+  chmod 644 "$dest/dkms.conf"
+  install -Dm644 COPYING -t "$pkgdir/usr/share/licenses/$pkgname"
+}
