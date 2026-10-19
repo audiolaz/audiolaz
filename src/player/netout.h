@@ -94,8 +94,15 @@ void netout_receivers_json(char *out, size_t len);
 void netout_out_name(const char *spec, char *out, size_t len);   /* spec: the out= read */
 
 void netout_out_dac(const char *spec, char *out, size_t len);
+/* 1: an out=audiolaz:<key> naming no receiver heard and no address; heard: those heard ("" none) */
+int netout_az_unknown(const char *spec, char *heard, size_t hl);
 void netout_out_hw(const char *spec, char *out, size_t len);
 void netout_out_longname(const char *spec, char *out, size_t len);
+/* the UPnP renderers searched again now (a voie waiting for one that is off: every 10 s, not 30) */
+void netout_search_soon(void);
+/* a renderer by its description's URL (its last known one: no search needed), and that URL ("" none) */
+void netout_upnp_probe(const char *loc);
+void netout_upnp_loc(const char *spec, char *out, size_t len);
 
 void netout_set_name(const char *name);
 void netout_claims(int port, const char *to);

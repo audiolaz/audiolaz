@@ -130,9 +130,11 @@ static void card_name_apply(void) {
         struct azc_name nm;
         memset(&nm, 0, sizeof nm);
         snprintf(nm.name, sizeof nm.name, "%s", card_name_want);
-        if (ioctl(CFD[cs], AZC_IOC_SET_NAME, &nm) == 0) {
+        const int r = ioctl(CFD[cs], AZC_IOC_SET_NAME, &nm);
+        if (r == 0 || r == 1) {
             snprintf(card_name_done, sizeof card_name_done, "%s", card_name_want);
-            slog("the « audiolaz » card: shown as « %s », the DAC it plays to", card_name_done);
+            /* 1: an application holds the card (Roon): renamed by the card itself once it lets go */
+            slog("the « audiolaz » card: shown as « %s »%s, the DAC it plays to", card_name_done, r == 1 ? " once its stream closes (an application holds it)" : "");
         } else if (!card_name_said++) slog("the « audiolaz » card: its name not changed (%s: a module before 18/10), its options' kept", strerror(errno));
         return;
     }
@@ -158,9 +160,12 @@ void plat_src_hold(int k, int ms) {
     if (!c || CFD[CKS[k]] < 0) return;
     __u32 v = ms > 0 ? (__u32)ms : 0;
     static uint32_t said_gen = UINT32_MAX;
-    if (ioctl(CFD[CKS[k]], AZC_IOC_HOLD, &v) == 0 && c->gen != said_gen) {   /* said once a stream */
+    const int r = ioctl(CFD[CKS[k]], AZC_IOC_HOLD, &v);
+    if ((r == 0 || r == 1) && c->gen != said_gen && ms > 0) {   /* said once a stream */
         said_gen = c->gen;
-        slog("input %d: the « audiolaz » card holds its music (up to %d ms at a time) while the output opens", k, ms);
+        if (r == 0) slog("input %d: the « audiolaz » card holds its music (up to %d ms at a time) while the output opens", k, ms);
+        /* a stream read already (the output switched under it): its application's clock goes on */
+        else slog("input %d: the « audiolaz » card's stream already played: not held (its application's clock goes on while the output opens)", k);
     }
 }
 

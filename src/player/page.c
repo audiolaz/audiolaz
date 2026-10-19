@@ -992,6 +992,18 @@ static void handle(int c) {
                 return;
             }
         }
+
+        if (good && netout_is_net(to)) {
+            char heard[400], hj[900];
+            const char *f = q ? strstr(q, "force=1") : NULL;
+            if (!(f && (f == q || f[-1] == '&')) && netout_az_unknown(to, heard, sizeof heard)) {
+                clean_json(hj, sizeof hj, heard);
+                char b[1000];
+                const int n2 = snprintf(b, sizeof b, "{\"ok\":false,\"why\":\"unknown\",\"heard\":\"%s\"}", hj);
+                reply(c, "application/json", b, (size_t)n2);
+                return;
+            }
+        }
         if (good) { const char *k[] = { "out" }, *vv[] = { to }; control_set(k, vv, 1); }
         if (good) reply(c, "application/json", "{\"ok\":true}", 11);
         else { static const char BAD[] = "{\"ok\":false,\"why\":\"bad\"}"; reply(c, "application/json", BAD, sizeof BAD - 1); }

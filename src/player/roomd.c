@@ -86,7 +86,8 @@ static const char *ROOMS = "/var/lib/audiolaz";
 static const char *VOIE = NULL;
 static const char *VOIE_NAME = NULL;
 static const char *VOIE_OUT = NULL;
-static const char *VOIE_SELF = NULL;           /* --voie-self: the player's own name (its AirPlay input: never an output) */
+static const char *VOIE_SELF = NULL;
+static const char *VOIE_LOC = NULL;            /* --voie-loc: its renderer's description URL, asked directly while not found */           /* --voie-self: the player's own name (its AirPlay input: never an output) */
 static int voie_unbound = 0;                   /* its room bound to no output now (the player stops it) */
 static char status_dir_v[700];
 static const char *status_dir(void) {          /* where status (and what this process alone keeps) goes */
@@ -648,6 +649,16 @@ static void air_name_want(const control *c, char *nm, size_t len, char *alone, s
     me[w] = 0;
     if (alone) snprintf(alone, alen, "%s", me);
     out_short(c, os, sizeof os);
+
+    if (!strncmp(c->out, "audiolaz:", 9)) {
+        char d[120], t[120];
+        netout_out_dac(c->out, d, sizeof d);
+        size_t w2 = 0;
+        for (const char *q = d; *q && w2 + 1 < sizeof t; q++) if ((unsigned char)*q >= 0x20 && *q != '"' && *q != '\\' && *q != '%') t[w2++] = *q;
+        while (w2 > 0 && t[w2 - 1] == ' ') w2--;
+        t[w2] = 0;
+        if (w2) snprintf(os, sizeof os, "%s", t);
+    }
     if (os[0]) snprintf(nm, len, "%.90s \u00b7 %.60s", os, me);   /* 153 bytes at most: the name's 160 */
     else snprintf(nm, len, "%s", me);
 }
@@ -1142,6 +1153,7 @@ static double st_ring_ms = 0;             /* this play's ring target (ms), for t
 #define LAT_UP_MIN_MS 150
 #define LAT_PACED_MS 40                   /* an input at the DAC's pace: the ring at most this */
 #define LAT_WAITED_S 0.0003               /* a wait at least this long: the thread did wait */
+#define PACED_RT_PRIO 1                   /* a source at the DAC's pace at normal priority: this level (play()) */
 static int lat_rt_now = 0, lat_rt_want = 0;   /* the level this thread runs at now, this play's (0: normal) */
 static double lat_busy_t = 0;             /* since when this thread has not waited */
 static long lat_drops = 0;                /* naps taken in a burst of work, this play */
@@ -2311,7 +2323,13 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     out_pcm *out = NULL;
     unsigned long outbuf = 0, outper = 0;
 
-    if (paced) src_hold(cur_sub, OUT == OUT_NET ? 4000 : 1500);
+    /* (18/10 evening, the box: the output switched to a receiver not found while Roon played; each try, once a second,
+     * held the card again: Roon's stream stood still 10 s, RAATServer spun at SCHED_FIFO 50, a hard reboot) held at the
+     * first try only: an output that does not open lets the card's own clock go on (the music unheard, the source's
+     * clock never stopped), and the card itself never holds a stream already played (azcard.h AZC_IOC_HOLD) */
+    static int open_fails = 0;                         /* the output's tries that did not open it, in a row */
+    if (paced && !open_fails && !net_busy_tries && !dac_busy_tries) src_hold(cur_sub, OUT == OUT_NET ? 4000 : 1500);
+#define OPEN_FAILED() do { open_fails++; if (paced) src_hold(cur_sub, 0); } while (0)   /* the card's clock at once */
     const double t_hold0 = now_s();                    /* the hold renewed while a UPnP renderer starts (below) */
     double t_hold_last = 0;                            /* renewed at once when the ring is full (the first read ended it) */
     if (OUT == OUT_NET) {                              /* a network receiver : a new stream at this rate, fetched */
@@ -2323,6 +2341,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             snprintf(now_, sizeof now_, "%s %u", net_spec, orate);
             if (strcmp(said, now_)) { snprintf(said, sizeof said, "%s", now_); logf_("network output: %s takes up to %u Hz, this stream is %u Hz: not played", net_spec, m, orate); }
             st_out_why = "rate"; st_out_max = m;
+            OPEN_FAILED();
             write_status("busy", rate, orate, c, 0, 0, 0, 0, 0, 0, 0, -120);
             UP_FREE(); sleep(1); return;
         }
@@ -2334,6 +2353,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                                                        * writer's hold_max */
         if (netout_open(orate)) {
             net_refused();
+            OPEN_FAILED();
             if (netout_busy(NULL, NULL, 0)) st_out_why = "used";   /* another player plays to it (out_why=used) */
             write_status("busy", rate, orate, c, 0, 0, 0, 0, 0, 0, 0, -120);
             UP_FREE(); sleep(1); return;
@@ -2348,6 +2368,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         out = dac_open(orate, period);
         if (!out) {                                        /* the DAC is busy (its own Roon zone plays): try again */
             dac_refused(orate);
+            OPEN_FAILED();
             write_status("busy", rate, orate, c, 0, 0, 0, 0, 0, 0, 0, -120);   /* a play wanted, the DAC refusing */
             UP_FREE(); sleep(1); return;
         }
@@ -2357,6 +2378,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         obits = out_bits(out);                             /* a 24-bit DAC: 24 */
         period = outper;
     }
+    open_fails = 0;                                    /* the output open */
+#undef OPEN_FAILED
 
     unsigned long iper = L > 1 ? period / (unsigned long)L : period;
     if (iper < 64) iper = 64;
@@ -2445,8 +2468,20 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     if (!q.buf || pthread_create(&W.th, NULL, writer_main, &W)) { free(q.buf); output_release(out, 0); if (in) src_close(in); UP_FREE(); return; }
 
     lat_rt_want = rt_priority <= 0 && lat_ring > 0 ? page_lat_rt : 0;
+#ifdef __linux__
+
+    if (!lat_rt_want && paced && rt_priority <= 0) lat_rt_want = PACED_RT_PRIO;
+#endif
     lat_busy_t = now_s();
     if (lat_rt_want) lat_rt_set(lat_rt_want);
+    if (lat_rt_want && !lat_ring) {
+        static int paced_rt_said = -1;
+        if (paced_rt_said != lat_rt_now) {
+            paced_rt_said = lat_rt_now;
+            if (lat_rt_now) logf_("input %d at the DAC's pace: read at SCHED_FIFO %d while it plays (its waits woken on time; a nap of %.1f ms every %.0f ms of work)",
+                                  cur_sub, lat_rt_now, LAT_NAP_S * 1000, LAT_YIELD_S * 1000);
+        }
+    }
     if (lat_ring > 0) {
         char rts[80], lks[48] = "";
         if (lat_rt_now) snprintf(rts, sizeof rts, "at SCHED_FIFO %d (a nap of %.1f ms every %.0f ms of work)", lat_rt_now, LAT_NAP_S * 1000, LAT_YIELD_S * 1000);
@@ -3213,6 +3248,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--voie-name")) VOIE_NAME = argv[i + 1];
         else if (!strcmp(argv[i], "--voie-out")) VOIE_OUT = argv[i + 1];
         else if (!strcmp(argv[i], "--voie-self")) VOIE_SELF = argv[i + 1];
+        else if (!strcmp(argv[i], "--voie-loc")) VOIE_LOC = argv[i + 1];
         else if (!strcmp(argv[i], "--parent-pid")) parent_pid = (pid_t)atol(argv[i + 1]);   /* the app that started it */
         else if (!strcmp(argv[i], "--net-bind")) netout_disc_addr(argv[i + 1]);   /* the AirPlay bridge's discovery there */
         else if (!strcmp(argv[i], "--page")) PAGE_PORT = atoi(argv[i + 1]);
@@ -3363,6 +3399,8 @@ int main(int argc, char **argv) {
         else {                                         /* a voie whose room is no longer bound: done */
             static double unb = 0;
             if (!voie_unbound) unb = 0; else if (!unb) unb = now_s(); else if (now_s() - unb > 10) { logf_("voie %s: its room no longer bound to an output: stopping", VOIE); quit = 1; }
+            static double t_probe = -1e9;              /* its renderer not found yet: its description asked directly */
+            if (VOIE_LOC && now_s() - t_probe >= 5.0 && !out_present(&c)) { t_probe = now_s(); netout_upnp_probe(VOIE_LOC); }
         }
         dac_tick(&c, 0);
         air_channels_tick();                           /* its channels, airplay_channels= (air_channels.h) */

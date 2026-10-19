@@ -57,8 +57,13 @@ struct azc_name {                  /* AZC_IOC_SET_NAME: UTF-8, NUL-terminated (c
 
 /* AZC_IOC_HOLD: the reader opens its output (a network renderer: a second or more): the card's own clock does
  * not stand in for it for up to that many ms (AZC_HOLD_MAX_MS at most) or until its next read; the application's
- * writes wait meanwhile, as for a DAC that starts. 0: no more. */
+ * writes wait meanwhile, as for a DAC that starts. 0: no more.
+ * (18/10 evening, the switch) only at a stream's start: within AZC_HOLD_STREAM_MS of the application starting (or
+ * resuming) it, never beyond. Later (its output switched under it, a receiver not found) the ioctl answers 1, not held:
+ * the application's clock goes on, the card's own clock standing in once AZC_STALE_MS passes unread (Roon's clock never
+ * stopped mid-play). */
 #define AZC_HOLD_MAX_MS 4000
+#define AZC_HOLD_STREAM_MS 9000
 #define AZC_IOC_HOLD       _IOW(AZC_IOC_MAGIC, 7, __u32)
 
 #define AZC_CTL_DEV "/dev/audiolaz-ctl"

@@ -83,6 +83,8 @@ struct azc_st {                     /* one playback stream (substream n) and its
 	u32 rates;                      /* AZC_RATE_* the next streams may take (0: all) */
 	unsigned long last_read;        /* jiffies of the reader's last read (0: none yet) */
 	unsigned long hold_until;       /* AZC_IOC_HOLD: no stand-in before (0: none) */
+	unsigned long run_at;           /* (18/10, the switch) jiffies when the stream last began to run (start, resume; 0 not yet):
+	                                 * AZC_IOC_HOLD within AZC_HOLD_STREAM_MS of it only */
 	ktime_t tick_t;                 /* the stand-in clock: when it last counted */
 	u64 tick_frac;                  /* its frames × NSEC_PER_SEC not yet whole */
 	wait_queue_head_t wq;
@@ -111,6 +113,8 @@ struct azc {
 	int sw;                         /* its switch: 1 on */
 	struct delayed_work tick;
 	struct mutex name_mu;           /* AZC_IOC_SET_NAME: one rename at a time */
+	int name_pend;                  /* (18/10, the switch) a rename asked while a stream was open: done at its close */
+	char pend_nm[32], pend_lnm[80];
 };
 
 static struct platform_device *azc_pdev_of(void);
@@ -253,6 +257,8 @@ static int azc_open(struct snd_pcm_substream *ss)
 	return 0;
 }
 
+static void azc_name_at_close(struct azc *az);
+
 static int azc_close(struct snd_pcm_substream *ss)
 {
 	struct azc_st *st = azc_st_of(ss);
@@ -266,6 +272,7 @@ static int azc_close(struct snd_pcm_substream *ss)
 	st->gen++;
 	spin_unlock_irqrestore(&st->lock, fl);
 	wake_up_interruptible(&st->wq);
+	azc_name_at_close(st->az);      /* a rename asked meanwhile: now that nobody plays */
 	return 0;
 }
 
@@ -287,12 +294,13 @@ static int azc_prepare(struct snd_pcm_substream *ss)
 	st->read = 0;
 	st->stand_in = 0;
 	st->running = 0;
+	st->run_at = 0;
 	st->gen++;
 	rt->delay = st->delay;
 	spin_unlock_irqrestore(&st->lock, fl);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 
-	ss->wait_time = AZC_STALE_MS + AZC_HOLD_MAX_MS + 100 + 2 * (long)div_u64((u64)rt->buffer_size * 1000, rt->rate ? rt->rate : 1);   /* a hold too */
+	ss->wait_time = AZC_STALE_MS + AZC_HOLD_STREAM_MS + 100 + 2 * (long)div_u64((u64)rt->buffer_size * 1000, rt->rate ? rt->rate : 1);   /* a hold too */
 #endif
 	wake_up_interruptible(&st->wq);
 	return 0;
@@ -346,6 +354,7 @@ static int azc_trigger(struct snd_pcm_substream *ss, int cmd)
 		st->gen++;
 		st->tick_t = ktime_get();
 		st->tick_frac = 0;
+		st->run_at = jiffies | 1;
 
 		if (atomic_read(&st->readers))
 			st->last_read = jiffies ? jiffies : 1;
@@ -577,7 +586,7 @@ static __poll_t azc_rd_poll(struct file *f, poll_table *pt)
 	return m;
 }
 
-static void azc_set_name(struct azc *az, const char *nm, const char *lnm);
+static int azc_set_name(struct azc *az, const char *nm, const char *lnm);
 
 static long azc_rd_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -624,14 +633,31 @@ static long azc_rd_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	}
 	case AZC_IOC_HOLD: {            /* azcard.h */
 		u32 ms;
+		int e = 0;
 
 		if (get_user(ms, (u32 __user *)arg))
 			return -EFAULT;
 		ms = min_t(u32, ms, AZC_HOLD_MAX_MS);
 		spin_lock_irqsave(&st->lock, fl);
-		st->hold_until = ms ? (jiffies + msecs_to_jiffies(ms)) | 1 : 0;
+		if (!ms) {
+			st->hold_until = 0;
+		} else if (st->run_at && time_after_eq(jiffies, st->run_at + msecs_to_jiffies(AZC_HOLD_STREAM_MS))) {
+			/* (18/10 evening, the box: the player's output switched while Roon played, the output not found, the hold
+			 * asked again every second: Roon's stream stood still 10 s, its clock 10 s behind, RAATServer spinning at
+			 * SCHED_FIFO 50 until a hard reboot) a stream that has played AZC_HOLD_STREAM_MS since it began to run is
+			 * never held: its application's clock goes on (the card's own clock stands in once AZC_STALE_MS passes
+			 * unread); a hold at its start (the output opening, a renderer starting: renewed) ends there at the latest */
+			st->hold_until = 0;
+			e = 1;
+		} else {
+			unsigned long u = jiffies + msecs_to_jiffies(ms);
+
+			if (st->run_at && time_after(u, st->run_at + msecs_to_jiffies(AZC_HOLD_STREAM_MS)))
+				u = st->run_at + msecs_to_jiffies(AZC_HOLD_STREAM_MS);   /* AZC_HOLD_STREAM_MS from its start at most */
+			st->hold_until = u | 1;
+		}
 		spin_unlock_irqrestore(&st->lock, fl);
-		return 0;
+		return e;
 	}
 	case AZC_IOC_SET_RATES: {
 		u32 v;
@@ -650,8 +676,7 @@ static long azc_rd_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		nm.name[sizeof nm.name - 1] = 0;
 		nm.longname[sizeof nm.longname - 1] = 0;
-		azc_set_name(az, nm.name, nm.longname);
-		return 0;
+		return azc_set_name(az, nm.name, nm.longname);
 	}
 	}
 	return -ENOTTY;
@@ -745,12 +770,26 @@ static void azc_name_put(char *d, size_t n, const char *s)
 	memcpy(d, t, min(n, sizeof t));   /* the whole field: what was after the new name's end zeroed too */
 }
 
-static void azc_set_name(struct azc *az, const char *nm, const char *lnm)
+/* (18/10, the switch) any of the card's streams open by an application (Roon holding it): its names left alone */
+static int azc_any_open(struct azc *az)
+{
+	int i, on = 0;
+
+	for (i = 0; i < az->nst && !on; i++) {
+		unsigned long fl;
+
+		spin_lock_irqsave(&az->st[i].lock, fl);
+		on = az->st[i].ss != NULL;
+		spin_unlock_irqrestore(&az->st[i].lock, fl);
+	}
+	return on;
+}
+
+static void azc_set_name_now(struct azc *az, const char *nm, const char *lnm)   /* under name_mu */
 {
 	struct snd_card *card = az->card;
 	char l[80];
 
-	mutex_lock(&az->name_mu);
 	if (!*nm) {
 		nm = az->name0;
 		lnm = az->lname0;
@@ -766,6 +805,36 @@ static void azc_set_name(struct azc *az, const char *nm, const char *lnm)
 	azc_name_put(card->shortname, sizeof card->shortname, nm);
 	azc_name_put(card->longname, sizeof card->longname, l);
 	azc_name_put(az->pcm->name, sizeof az->pcm->name, nm);
+}
+
+/* 0: renamed now; 1: (18/10, the switch) a stream is open (an application plays, or holds its device): what an
+ * application listed must not change under it (Roon: a device it knows, renamed mid-play), so the rename is kept and
+ * done at that stream's close (azc_name_at_close), the last one asked winning */
+static int azc_set_name(struct azc *az, const char *nm, const char *lnm)
+{
+	int e = 0;
+
+	mutex_lock(&az->name_mu);
+	if (azc_any_open(az)) {
+		strscpy(az->pend_nm, nm, sizeof az->pend_nm);
+		strscpy(az->pend_lnm, lnm, sizeof az->pend_lnm);
+		az->name_pend = 1;
+		e = 1;
+	} else {
+		az->name_pend = 0;
+		azc_set_name_now(az, nm, lnm);
+	}
+	mutex_unlock(&az->name_mu);
+	return e;
+}
+
+static void azc_name_at_close(struct azc *az)
+{
+	mutex_lock(&az->name_mu);
+	if (az->name_pend && !azc_any_open(az)) {
+		az->name_pend = 0;
+		azc_set_name_now(az, az->pend_nm, az->pend_lnm);
+	}
 	mutex_unlock(&az->name_mu);
 }
 

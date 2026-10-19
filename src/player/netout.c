@@ -43,6 +43,11 @@ static void nlog(const char *fmt, ...) {
     fputs("net: ", stderr); vfprintf(stderr, fmt, a); fputc('\n', stderr); fflush(stderr);
     va_end(a);
 }
+static const char *strcasestr_(const char *h, const char *n) {   /* strcasestr, GNU's: not in the portable build */
+    const size_t k = strlen(n);
+    for (; *h; h++) if (!strncasecmp(h, n, k)) return h;
+    return NULL;
+}
 static double mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void put32be(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 static void put16be(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
@@ -119,7 +124,7 @@ static pthread_mutex_t slk = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t scv = PTHREAD_COND_INITIALIZER;
 static unsigned stream_ids = 0;
 static char spec_now[160];                        /* the out= chosen (netout_select), under slk */
-static char why_[200];
+static char why_[600];
 
 static const double BK_STEPS[] = { 2, 5, 15, 30, 60 };
 #define BK_STALE_S 35.0
@@ -1498,8 +1503,12 @@ static void ssdp_search(void) {
     inet_pton(AF_INET, "239.255.255.250", &to.sin_addr);
     static const char MS[] = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n"
                              "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSER-AGENT: Linux UPnP/1.0 audiolaz-roomd\r\n\r\n";
-    for (int k = 0; k < 2; k++) sendto(s, MS, sizeof MS - 1, 0, (struct sockaddr *)&to, sizeof to);
-    char locs[16][256], ips[16][48];
+    /* (18/10, the box: the CXNv2 never seen again once on, the Yamahas were) its AVTransport asked for too: a renderer
+     * answering only for its services is found that way */
+    static const char MS2[] = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n"
+                              "ST: urn:schemas-upnp-org:service:AVTransport:1\r\nUSER-AGENT: Linux UPnP/1.0 audiolaz-roomd\r\n\r\n";
+    for (int k = 0; k < 2; k++) { sendto(s, MS, sizeof MS - 1, 0, (struct sockaddr *)&to, sizeof to); sendto(s, MS2, sizeof MS2 - 1, 0, (struct sockaddr *)&to, sizeof to); }
+    char locs[64][256], ips[64][48];   /* 64 (16 before: a house's TVs and boxes answering first kept the others out) */
     int nl = 0;
     const double t0 = mono();
     while (mono() - t0 < 3.0) {
@@ -1521,7 +1530,7 @@ static void ssdp_search(void) {
         if (!loc[0]) continue;
         int dup = 0;
         for (int i = 0; i < nl; i++) if (!strcmp(locs[i], loc)) dup = 1;
-        if (!dup && nl < 16) { snprintf(locs[nl], sizeof locs[nl], "%s", loc); inet_ntop(AF_INET, &from.sin_addr, ips[nl], sizeof ips[nl]); nl++; }
+        if (!dup && nl < 64) { snprintf(locs[nl], sizeof locs[nl], "%s", loc); inet_ntop(AF_INET, &from.sin_addr, ips[nl], sizeof ips[nl]); nl++; }
     }
     close(s);
     for (int i = 0; i < nl; i++) upnp_add(locs[i], ips[i]);
@@ -1533,9 +1542,95 @@ static void ssdp_search(void) {
         if (R[i].used && R[i].kind == NK_UPNP && mono() - R[i].seen > FORGET_S && i != playing) { nlog("UPnP renderer \"%s\" no longer seen", R[i].name); R[i].used = 0; }
     pthread_mutex_unlock(&rlk);
 }
+/* a renderer by its description's URL, without a search: its announces (NOTIFY ssdp:alive, below), a voie's
+ * output known from before (netout_upnp_probe). upnp_add reads the description again; at most once in 20 s a URL. */
+static void upnp_probe_url(const char *loc) {
+    static char seen[16][256];
+    static double at[16];
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    int k = -1, old = 0;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < 16 && k < 0; i++) if (!strcmp(seen[i], loc)) k = i;
+    if (k >= 0 && mono() - at[k] < 20.0) { pthread_mutex_unlock(&mu); return; }
+    if (k < 0) { for (int i = 1; i < 16; i++) if (at[i] < at[old]) old = i; k = old; snprintf(seen[k], sizeof seen[k], "%s", loc); }
+    at[k] = mono();
+    pthread_mutex_unlock(&mu);
+    char host[64]; const char *path; int port;
+    if (parse_url(loc, host, sizeof host, &port, &path)) return;
+    upnp_add(loc, host);
+}
+static void *upnp_probe_main(void *arg) { char *loc = arg; upnp_probe_url(loc); free(loc); return NULL; }
+void netout_upnp_probe(const char *loc) {
+    if (!loc || strncasecmp(loc, "http://", 7)) return;
+    char *c = strdup(loc);
+    pthread_t th;
+    if (c && !pthread_create(&th, NULL, upnp_probe_main, c)) pthread_detach(th); else free(c);
+}
+void netout_upnp_loc(const char *spec, char *out, size_t len) {   /* a renderer's description's URL, "" none */
+    out[0] = 0;
+    const char *key;
+    if (!spec || spec_kind(spec, &key) != NK_UPNP) return;
+    pthread_mutex_lock(&rlk);
+    const int i = find_rcv(NK_UPNP, key);
+    if (i >= 0) snprintf(out, len, "%s", R[i].loc);
+    pthread_mutex_unlock(&rlk);
+}
+/* the announces: a renderer switched on says so (NOTIFY ssdp:alive, its LOCATION) without waiting for our search */
+static void *ssdp_notify_main(void *arg) {
+    (void)arg;
+    const int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return NULL;
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+#ifdef SO_REUSEPORT
+    setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on);
+#endif
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(1900), .sin_addr.s_addr = htonl(INADDR_ANY) };
+    if (bind(s, (struct sockaddr *)&a, sizeof a)) { close(s); return NULL; }
+    struct ifaddrs *ifs = NULL, *f;                  /* the group joined on every interface */
+    if (!getifaddrs(&ifs)) {
+        for (f = ifs; f; f = f->ifa_next) {
+            if (!f->ifa_addr || f->ifa_addr->sa_family != AF_INET || (f->ifa_flags & IFF_LOOPBACK)) continue;
+            struct ip_mreq m;
+            inet_pton(AF_INET, "239.255.255.250", &m.imr_multiaddr);
+            m.imr_interface = ((struct sockaddr_in *)f->ifa_addr)->sin_addr;
+            setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+        }
+        freeifaddrs(ifs);
+    }
+    for (;;) {
+        char b[2048];
+        const ssize_t r = recv(s, b, sizeof b - 1, 0);
+        if (r <= 0) { usleep(100000); continue; }
+        b[r] = 0;
+        if (strncmp(b, "NOTIFY", 6) || !strcasestr_(b, "ssdp:alive") || !(strcasestr_(b, "MediaRenderer") || strcasestr_(b, "AVTransport"))) continue;
+        char loc[256] = "";
+        for (char *line = b; line && *line; ) {
+            char *e = strstr(line, "\r\n");
+            if (e) *e = 0;
+            if (!strncasecmp(line, "LOCATION:", 9)) { const char *v = line + 9; while (*v == ' ') v++; snprintf(loc, sizeof loc, "%s", v); }
+            line = e ? e + 2 : NULL;
+        }
+        if (!loc[0]) continue;
+        int known = 0;
+        pthread_mutex_lock(&rlk);
+        for (int i = 0; i < NRCV; i++) if (R[i].used && R[i].kind == NK_UPNP && !strcmp(R[i].loc, loc)) { known = 1; R[i].seen = mono(); }
+        pthread_mutex_unlock(&rlk);
+        if (!known) upnp_probe_url(loc);
+    }
+    return NULL;
+}
+static volatile int search_soon = 0;           /* netout_search_soon: the next search in a second */
+void netout_search_soon(void) { search_soon = 1; }
 static void *upnp_main(void *arg) {
     (void)arg;
-    for (;;) { ssdp_search(); sleep((unsigned)SEARCH_S); }
+    pthread_t th;                                  /* the renderers' announces too */
+    if (!pthread_create(&th, NULL, ssdp_notify_main, NULL)) pthread_detach(th);
+    for (;;) {
+        ssdp_search();
+        for (int i = 0; i < (int)SEARCH_S && !search_soon; i++) sleep(1);
+        search_soon = 0;
+    }
     return NULL;
 }
 
@@ -1791,6 +1886,20 @@ static void az_up(const char *host, int port) {
     }
     if (p > 0) { int st; waitpid(p, &st, 0); nlog("audiolaz receiver %s:%d not answering: %s started", host, port, AZ_UP_HOOK); }
 }
+
+int netout_az_unknown(const char *spec, char *heard, size_t hl) {
+    const char *key;
+    if (heard && hl) heard[0] = 0;
+    if (!spec || spec_kind(spec, &key) != NK_AUDIOLAZ) return 0;
+    pthread_mutex_lock(&rlk);
+    const int ri = find_rcv(NK_AUDIOLAZ, key);
+    if (heard && hl) for (int i = 0; i < NRCV; i++) if (R[i].used && R[i].kind == NK_AUDIOLAZ && !R[i].self) {
+        const size_t l = strlen(heard);
+        snprintf(heard + l, hl - l, "%s%s%s%s%s at %s", l ? ", " : "", R[i].id, R[i].model[0] ? " (" : "", R[i].model, R[i].model[0] ? ")" : "", R[i].loc);
+    }
+    pthread_mutex_unlock(&rlk);
+    return ri < 0 && !strchr(key, '.') && !strchr(key, ':');
+}
 static int az_open(const char *spec, const char *key, unsigned rate) {
     char host[256] = ""; int port = ANET_PORT;
     pthread_mutex_lock(&rlk);
@@ -1825,7 +1934,7 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
         anet_identity(uid, me);
     }
     anet_take(take);
-    char why[200];
+    char why[600];
     if (anet_open(host, port, rate, ANET_F_S32, 0, why, sizeof why)) {
         if (anet_busy(by, sizeof by)) {                    /* another player there: never a rate refused, nothing to start */
             pthread_mutex_lock(&azlk);
@@ -1838,6 +1947,13 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
             if (first) nlog("%s: busy, playing from \"%s\": asked again in 2, 5, 10 s, then every 15 s (nothing sent meanwhile)", spec, by);
             set_why("busy: playing from \"%s\"", by);
             return -1;
+        }
+        {   /* a name no receiver answers to: which ones there are */
+            char heard[400];
+            if (strstr(why, "unknown address") && netout_az_unknown(spec, heard, sizeof heard)) {
+                const size_t l = strlen(why);
+                snprintf(why + l, sizeof why - l, " (no receiver of that id or name heard%s%s; out=audiolaz:<its id> or audiolaz:<its address>)", heard[0] ? ": " : "", heard);
+            }
         }
         last_asked = strstr(why, "refused ") != NULL;
         if (!last_asked && (strstr(why, "onnection refused") || strstr(why, "timed out") || strstr(why, "o route") || strstr(why, "no answer"))) az_up(host, port);
