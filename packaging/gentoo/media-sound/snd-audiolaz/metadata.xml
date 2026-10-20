@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>contact@audiolaz.com</email>
+		<name>audiolaz</name>
+	</maintainer>
+	<longdescription lang="en">
+		snd-audiolaz is an ALSA sound card whose clock is the reader's: the
+		audiolaz player reads what applications play to it and plays it to the
+		DAC, paced by the DAC's own clock. Any application that plays to the
+		"audiolaz" card plays into the player.
+	</longdescription>
+	<upstream>
+		<remote-id type="github">audiolaz/audiolaz</remote-id>
+		<bugs-to>https://github.com/audiolaz/audiolaz/issues</bugs-to>
+	</upstream>
+</pkgmetadata>

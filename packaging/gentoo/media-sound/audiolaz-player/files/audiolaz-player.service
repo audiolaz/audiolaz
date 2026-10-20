@@ -1,0 +1,27 @@
+# audiolaz-player: the free audiolaz player as a system service.
+# Not enabled by the package. Set the name and the DAC in a drop-in:
+#   systemctl edit audiolaz-player
+#     [Service]
+#     Environment="NAME=Living room" "DAC=hw:CARD=DAC,DEV=0"
+# then: systemctl enable --now audiolaz-player
+# (OpenRC reads /etc/conf.d/audiolaz-player instead; the variables are the same.)
+# One process per DAC: for a second DAC, copy this unit under another name, with another PAGE.
+[Unit]
+Description=audiolaz player (bit-perfect network audio player)
+Documentation=https://github.com/audiolaz/audiolaz/blob/main/docs/PLAYER.md
+Wants=network-online.target
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+Environment="NAME=audiolaz" "DAC=hw:0,0" "PAGE=8765" "OPTIONS=--loop none --squeeze auto"
+StateDirectory=audiolaz-player
+ExecStart=/usr/bin/audiolaz-player --rooms /var/lib/audiolaz-player --name ${NAME} --dac ${DAC} --page ${PAGE} $OPTIONS
+Restart=on-failure
+RestartSec=3
+# The player asks SCHED_FIFO for its reading and writer threads and locks its memory (--rt, --writer-rt, --mlock).
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

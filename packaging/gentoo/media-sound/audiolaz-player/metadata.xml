@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>contact@audiolaz.com</email>
+		<name>audiolaz</name>
+	</maintainer>
+	<longdescription lang="en">
+		The free and open-source audiolaz player takes music from Roon (as a
+		Squeezebox player), Lyrion/LMS, its own UPnP/DLNA renderer, AirPlay
+		(shairport-sync) and Spotify Connect (librespot), and plays it to an ALSA
+		card, Squeezebox players, UPnP renderers or audiolaz Link receivers,
+		without resampling or processing. While it plays it compares every frame
+		in and out and says on its web page and GET /state whether the stream is
+		bit-perfect. Also installs audiolaz-recv (the audiolaz Link receiver) and
+		the "audiolaz" ALSA output plug-in.
+	</longdescription>
+	<use>
+		<flag name="flac">Pull in <pkg>media-libs/flac</pkg>, which the player opens at run time to play FLAC streams from Roon/LMS and UPnP (its headers are needed to build either way)</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">audiolaz/audiolaz</remote-id>
+		<bugs-to>https://github.com/audiolaz/audiolaz/issues</bugs-to>
+		<doc>https://github.com/audiolaz/audiolaz/blob/main/docs/PLAYER.md</doc>
+	</upstream>
+</pkgmetadata>

@@ -1,0 +1,29 @@
+# /etc/conf.d/audiolaz-player: the settings of the audiolaz player's OpenRC service
+# (/etc/init.d/audiolaz-player). systemd: the same variables, set with `systemctl edit audiolaz-player`.
+# Every option: `audiolaz-player --help` and /usr/share/doc/audiolaz-player-*/PLAYER.md*
+
+# The player's name: Roon's zone, the AirPlay input, the UPnP renderer.
+NAME="audiolaz"
+
+# The DAC: an ALSA device. `audiolaz-player --list-devices` lists them; prefer hw:CARD=<id>,DEV=0
+# (plughw: lets ALSA convert what the card refuses). "null" plays to nowhere (a test).
+DAC="hw:0,0"
+
+# The player's web page and HTTP API: http://<this machine>:8765
+PAGE="8765"
+
+# Other options, split on spaces.
+#   --loop none        no ALSA Loopback (snd-aloop) input: Roon/LMS (Squeezebox) and the UPnP renderer only.
+#                      The player refuses --loop none without --squeeze.
+#   --squeeze auto     the Squeezebox input: Roon (Settings > Extensions > Squeezebox support) or Lyrion/LMS
+#   --upnp on          the built-in UPnP/DLNA renderer
+# For AirPlay (shairport-sync) or Spotify Connect (librespot): load snd-aloop, point their ALSA output at the
+# Loopback's device 1 subdevices and replace "--loop none" by "--loop Loopback" (PLAYER.md).
+OPTIONS="--loop none --squeeze auto"
+
+# The player asks SCHED_FIFO for its reading and writer threads and locks its memory
+# (--rt, --writer-rt, --mlock).
+rc_ulimit="-r 99 -l unlimited"
+
+# The player's messages (stderr) go nowhere unless a log file is named here.
+#error_log="/var/log/audiolaz-player.log"

@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+# Copyright 2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+# The free audiolaz player. Its settings: /etc/conf.d/audiolaz-player.
+# One process per DAC: for a second DAC, link this script under another name
+# (ln -s audiolaz-player /etc/init.d/audiolaz-player.kitchen), with its own
+# /etc/conf.d/audiolaz-player.kitchen and another PAGE.
+
+description="audiolaz player (bit-perfect network audio player)"
+
+supervisor="supervise-daemon"
+command="/usr/bin/audiolaz-player"
+command_args="--rooms /var/lib/${RC_SVCNAME} --name \"${NAME:-audiolaz}\" --dac \"${DAC:-hw:0,0}\" --page ${PAGE:-8765} ${OPTIONS}"
+respawn_delay=3
+respawn_max=0
+
+depend() {
+	need localmount
+	use net alsasound
+	after bootmisc
+}
+
+start_pre() {
+	checkpath -d -m 0755 -o root:root "/var/lib/${RC_SVCNAME}"
+}
