@@ -1,8 +1,29 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/logo-dark.svg">
+    <img src="docs/img/logo-light.svg" alt="audiolaz" width="300">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-18160f"></a>
+  <a href="src/linux/kmod/COPYING"><img alt="Linux kernel module: GPL-2.0" src="https://img.shields.io/badge/kernel%20module-GPL--2.0-736b1e"></a>
+  <img alt="Linux and macOS" src="https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20macOS-da5b1f">
+  <img alt="Bit-perfect, verified" src="https://img.shields.io/badge/bit--perfect-verified-736b1e">
+</p>
+
 # audiolaz — free audio player, audiolaz Link and drivers
 
 A Swiss army knife for audio streams on your network: one small program takes music from the sources you already use,
 sends it to the outputs you already have, and leaves it **exactly as it came**. It tells you so: *bit-perfect,
 verified*.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/player-dark.svg">
+    <img src="docs/img/player-light.svg" alt="What the audiolaz player does: Roon, Lyrion, AirPlay, Spotify Connect, UPnP/DLNA and the apps of a Mac or a Linux computer go into the player, which checks the music while it plays (bit-perfect, verified) and sends it to one output at a time: your DAC, network players (Squeezebox, UPnP/DLNA, AirPlay) or an audiolaz Link receiver beside a DAC." width="100%">
+  </picture>
+</p>
 
 This repository holds the free and open-source parts of [audiolaz](https://audiolaz.com):
 
@@ -36,10 +57,21 @@ at all is done, and said on the page as *a conversion needed for this device*:
   16- or 24-bit source is left untouched);
 - a source of more than two channels to a stereo output: its first two channels (a mono source: on both).
 
+**Your speakers** — left and right swapped, or one speaker's polarity inverted (a cable connected the wrong way round),
+from the player's page or `POST /channels`: every sample moved or negated exactly, nothing recalculated, and the page
+says *lossless* instead of bit-perfect while it is on.
+
 **Bit-perfect, verified** — while it plays, the player fingerprints every frame that comes in and every frame it hands
 to the output, span by span, and compares them (about 0.2 % of one core at 192 kHz). Its page and `GET /state` say
 `"bitPerfect": true` only when every span compared was identical, `false` with the reason otherwise, and the sound's
 path (source, format in, format out, output, DAC). See [docs/BIT-PERFECT.md](docs/BIT-PERFECT.md).
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/player-page-dark.webp">
+    <img src="docs/img/player-page-light.webp" alt="In the audiolaz app, while it plays: the room, the track from Roon at 96 kHz, “Bit-perfect, verified”, and the sound's path from the source to the DAC, intact." width="520">
+  </picture>
+</p>
 
 Also: AirPlay video's lip sync (the player announces its own latency to the sender), the title, artist and cover sent
 to receivers with a screen, and playback of a measurement sweep the app asks for (measuring a room is free).
@@ -58,7 +90,7 @@ receiver for it.
 ## Build
 
 Linux (Debian, Ubuntu, Raspberry Pi OS, Arch…): `gcc`, `make`, the ALSA headers (`libasound2-dev` / `alsa-lib`),
-`python3` for the tests. macOS 13.5 or later: the Xcode command line tools.
+the FLAC headers (`libflac-dev` / `flac`), `python3` for the tests. macOS 13.5 or later: the Xcode command line tools.
 
 ```sh
 ./build.sh              # build/audiolaz-player, build/audiolaz-recv (Linux), build/libasound_module_pcm_audiolaz.so (Linux)

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="120" viewBox="0 0 520 120" role="img" aria-label="audiolaz">
+  <g transform="translate(6 12) scale(2)">
+    <rect x="6" y="6" width="36" height="36" fill="none" stroke="#eeede6" stroke-width="3.4"/>
+    <path d="M24 16l7.2 9-7.2 9-7.2-9z" fill="#eeede6"/>
+  </g>
+  <text x="122" y="84" fill="#eeede6" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="76" font-weight="800" letter-spacing="-2">audiolaz</text>
+</svg>

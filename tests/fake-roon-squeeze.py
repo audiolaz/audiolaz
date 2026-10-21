@@ -42,6 +42,8 @@ ap.add_argument('--skip-at', type=float, default=0, help='strm q then strm s tra
 ap.add_argument('--quiet', action='store_true', help='no STMt heartbeat lines')
 ap.add_argument('--tone', type=float, default=0, help='track 1\'s tone in Hz, a whole number (default 440; each next '
                 'track 1.25 times the one before), at -20 dBFS (10/10, tests/mac-roomd-out.py: 1 kHz resampled)')
+ap.add_argument('--right-tone', type=float, default=0, help='the right channel\'s own tone in Hz, a whole number, at -26 dBFS '
+                '(20/10, the speakers\' channels: left and right told apart); 0 (default): the left\'s on both')
 ap.add_argument('--gapless', action='store_true', help='tracks of the same rate in one HTTP stream, the zone following the '
                 'player\'s elapsed time, one track ahead at most (the real Roon)')
 ap.add_argument('--stuck-after', type=float, default=30, help='--gapless: STUCK once the stream has waited this long for a '
@@ -104,10 +106,14 @@ def second_of(n):
     f = (A.tone or 440.0) * (1.25 ** (n - 1))
     amp = 0.1 * (1 << 23)
     out = bytearray(R * FRAME)
+    fr = A.right_tone * (1.25 ** (n - 1)) if A.right_tone else 0
     for i in range(R):
         v = int(round(amp * math.sin(2 * math.pi * f * i / R))) & 0xffffff
         b = bytes((v & 0xff, v >> 8 & 0xff, v >> 16 & 0xff))
         out[i * FRAME:i * FRAME + 3] = b
+        if fr:
+            v = int(round(amp / 2 * math.sin(2 * math.pi * fr * i / R))) & 0xffffff
+            b = bytes((v & 0xff, v >> 8 & 0xff, v >> 16 & 0xff))
         out[i * FRAME + 3:i * FRAME + 6] = b
     return bytes(out)
 

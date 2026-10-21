@@ -1,0 +1,48 @@
+<svg class="fl fl-wide" viewBox="-24 -24 1228 480" width="1228" height="480" xmlns="http://www.w3.org/2000/svg" role="img" >
+<style>
+.fl text { font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif; }
+.fl-k { font-size: 14px; font-weight: 700; letter-spacing: .14em; fill: #9a988d; }
+.fl-t { font-size: 21px; font-weight: 700; fill: #eeede6; }
+.fl-s { font-size: 16px; font-weight: 500; fill: #9a988d; }
+.fl-tile { fill: #211f19; }
+.fl-dac { fill: none; stroke: #eeede6; stroke-width: 2; }
+.fl-wire path, .fl-head { fill: none; stroke: #89877c; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.fl-core { fill: #eeede6; }
+.fl .fl-on { fill: #151410; opacity: .75; }
+.fl-name { font-size: 32px; font-weight: 800; letter-spacing: -.02em; fill: #151410; }
+.fl-mark rect { fill: none; stroke: #151410; stroke-width: 3.4; }
+.fl-mark path { fill: #151410; }
+.fl-rule { stroke: #151410; stroke-opacity: .25; stroke-width: 1.5; }
+.fl-ok { fill: #736b1e; }
+.fl-okt { font-size: 18px; font-weight: 700; fill: #736b1e; }
+</style>
+<rect x="-24" y="-24" width="1228" height="480" rx="14" fill="#151410"/>
+          <title id="flow-w-t">What the audiolaz player does</title>
+          <desc id="flow-w-d">Sources: Roon, Lyrion, AirPlay, Spotify Connect, UPnP/DLNA and the apps of a Mac or a Linux computer. They go into the audiolaz player, free and open source, which checks the music while it plays: “Bit-perfect, verified”. Outputs, one at a time: your DAC, over USB, HDMI or S/PDIF, or a DAC board; network players: Squeezebox, UPnP/DLNA, AirPlay; an audiolaz Link receiver beside a DAC elsewhere in the house.</desc>
+          <text class="fl-k" x="0" y="18">SOURCES</text>
+          <text class="fl-k" x="790" y="18">OUTPUTS, ONE AT A TIME</text>
+          <rect class="fl-tile" x="0" y="36" width="250" height="48" rx="5"/><text class="fl-t" x="20" y="67">Roon</text>
+          <rect class="fl-tile" x="0" y="102" width="250" height="48" rx="5"/><text class="fl-t" x="20" y="133">Lyrion</text>
+          <rect class="fl-tile" x="0" y="168" width="250" height="48" rx="5"/><text class="fl-t" x="20" y="199">AirPlay</text>
+          <rect class="fl-tile" x="0" y="234" width="250" height="48" rx="5"/><text class="fl-t" x="20" y="265">Spotify Connect</text>
+          <rect class="fl-tile" x="0" y="300" width="250" height="48" rx="5"/><text class="fl-t" x="20" y="331">UPnP/DLNA</text>
+          <rect class="fl-tile" x="0" y="366" width="250" height="48" rx="5"/><text class="fl-t" x="20" y="397">Mac and Linux apps</text>
+          <g class="fl-wire"><path d="M250 60C322 60 318 225 388 225"/><path d="M250 126C322 126 318 225 388 225"/><path d="M250 192C322 192 318 225 388 225"/><path d="M250 258C322 258 318 225 388 225"/><path d="M250 324C322 324 318 225 388 225"/><path d="M250 390C322 390 318 225 388 225"/></g>
+          <path class="fl-head" d="M379 219L388 225L379 231"/>
+          <rect class="fl-core" x="390" y="135" width="270" height="180" rx="5"/>
+          <text class="fl-k fl-on" x="416" y="171">THE PLAYER</text>
+          <g class="fl-mark" transform="translate(412 185) scale(0.75)"><rect x="6" y="6" width="36" height="36"/><path d="M24 16l7.2 9-7.2 9-7.2-9z"/></g>
+          <text class="fl-name" x="456" y="213">audiolaz</text>
+          <text class="fl-s fl-on" x="416" y="241">Free · open source</text>
+          <line class="fl-rule" x1="416" y1="259" x2="634" y2="259"/>
+          <circle class="fl-ok" cx="421" cy="285" r="5"/><text class="fl-okt" x="436" y="291">Bit-perfect, verified</text>
+          <g class="fl-wire"><path d="M660 225C730 225 718 85 788 85"/><path d="M660 225C730 225 718 225 788 225"/><path d="M660 225C730 225 718 365 788 365"/></g>
+          <path class="fl-head" d="M779 79L788 85L779 91"/>
+          <path class="fl-head" d="M779 219L788 225L779 231"/>
+          <path class="fl-head" d="M779 359L788 365L779 371"/>
+          <rect class="fl-tile" x="790" y="36" width="390" height="98" rx="5"/><text class="fl-t" x="810" y="76">Your DAC</text><text class="fl-s" x="810" y="106">USB, HDMI, S/PDIF or a DAC board</text>
+          <rect class="fl-tile" x="790" y="176" width="390" height="98" rx="5"/><text class="fl-t" x="810" y="216">Network players</text><text class="fl-s" x="810" y="246">Squeezebox, UPnP/DLNA, AirPlay</text>
+          <rect class="fl-tile" x="790" y="316" width="290" height="98" rx="5"/><text class="fl-t" x="810" y="356">audiolaz Link receiver</text><text class="fl-s" x="810" y="386">elsewhere in the house</text>
+          <g class="fl-wire"><path d="M1080 365H1108"/></g><path class="fl-head" d="M1099 359L1108 365L1099 371"/>
+          <rect class="fl-dac" x="1110" y="340" width="69" height="50" rx="5"/><text class="fl-t" x="1144.5" y="372" text-anchor="middle">DAC</text>
+        </svg>

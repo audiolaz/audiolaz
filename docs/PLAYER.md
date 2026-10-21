@@ -42,8 +42,20 @@ macOS, the `audiolaz` output (`src/mac/driver`) does the same for every app of t
 | `airplay_mode=` | `auto` (by the sender: an Apple TV is video), `video`, `music` |
 | `airplay_buffered=` | `full` or `declared`: how AirPlay's buffered streams' offset is set |
 | `upnp=` | `1` / `0`: the built-in renderer on or off |
+| `swap.<out>=` | `1`: left and right swapped on that output (`<out>` as `out=` names it, `default` for `--dac`); absent: as they come |
+| `invert_l.<out>=` `invert_r.<out>=` | `1`: the polarity (phase) of the speaker playing the left (right) channel inverted on that output; absent: normal |
 
-The page writes it for you (`POST /output?to=…`, `POST /airplay?m=…`, `POST /upnp?on=…`).
+The page writes it for you (`POST /output?to=…`, `POST /airplay?m=…`, `POST /upnp?on=…`, `POST /channels?…`).
+
+### The speakers' channels
+
+Swapping left and right and inverting a speaker's polarity (`src/player/channels.h`) are the very last step before
+the output, for every kind of output, and each output keeps its own setting. The swap moves the samples as they are;
+an inversion is the exact negation of each sample in the output's format (the most negative value, which has no
+opposite, becomes the largest positive one). Nothing is resampled or rounded: the sound is lossless, though no longer the source channel for channel
+(`bitPerfectWhy` says `swap` or `polarity`, `bitPerfectLossless` true). « Left speaker » is the one playing the music's
+left channel: its inversion follows it when left and right are swapped. A change while music plays is a crossfade of
+5 ms (no click). The output is always one stereo pair: these act on it alone.
 
 ## The page and its API (`--page <port>`)
 
@@ -53,6 +65,7 @@ The page writes it for you (`POST /output?to=…`, `POST /airplay?m=…`, `POST 
 | `GET /state` | everything the page shows, JSON (below) |
 | `GET /clock` | the player's clock (`{"ns":…}`, CLOCK_MONOTONIC) |
 | `POST /output?to=<out=, URL-encoded>` | the output (empty: `--dac`) |
+| `POST /channels?swap=0\|1&invert_l=0\|1&invert_r=0\|1[&out=<out=>]` | the speakers' channels of an output (any of the three; `out=` absent: the one playing, `default`: `--dac`); answers `{"ok":true,"outChannels":{…}}` |
 | `POST /measure?port=<p>&signal=<name>` | plays the measurement track the asking app serves at `/download/measurement-track.wav?signal=<name>` on its port; `POST /measure/stop` |
 | `POST /nowplaying` | what plays (title, artist, album, cover) for receivers with a screen |
 | `POST /take` | the next stream to an audiolaz Link receiver takes it over from the player playing there |
@@ -68,11 +81,15 @@ Any other change asked of the free player is answered `403 {"ok":false,"why":"ro
   "input": "squeeze", "out": "", "outKind": "alsa", "outName": "", "receivers": [ … ], "cards": [ … ],
   "squeeze": true, "format": "flac",
   "variant": "player", "room": false,
-  "bitPerfect": true, "bitPerfectWhy": [], "bitPerfectSpans": 64,
+  "bitPerfect": true, "bitPerfectWhy": [], "bitPerfectSpans": 64, "bitPerfectLossless": null,
+  "outChannels": { "swap": false, "invertL": false, "invertR": false, "now": 0 },
   "soundPath": { "input": "squeeze", "inRate": 44100, "inBits": 24, "channels": 2, "outRate": 44100, "outBits": 32,
                  "deviceRate": null, "dac": "hw:CARD=DAC,DEV=0" },
   "inputLatencyMs": 812, "airplayOffsetMs": null, "link": null
 }
 ```
+
+`outChannels`: the speakers' channels the control keeps for the output playing; `now`: what the output plays with
+(bits: 1 swapped, 2 left inverted, 4 right inverted).
 
 `<rooms>/status` holds the same as `key=value` lines, rewritten once a second.

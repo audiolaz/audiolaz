@@ -22,9 +22,15 @@ The player does not only promise to leave the music alone: it checks it, all the
 | Key | |
 | --- | --- |
 | `bitPerfect` | `true`: spans were compared and every one was identical, nothing changed on purpose; `false`: see `bitPerfectWhy`; `null`: not known yet (not playing, no span compared yet) |
-| `bitPerfectWhy` | the reasons, any of: `channels` (a source of more than two channels to a stereo output: its first two), `bits` (requantized for an output that keeps fewer bits than the source has), `rate` (a rate the device refused, converted by the output layer; `soundPath.deviceRate` says which), `output` (a device that converts by itself: AirPlay is 16 bits at 44.1 kHz), `dropped` (frames lost: the output stalled), `changed` (spans that differ), and in builds that process the music on purpose `correction`, `level`, `volume`, `upsampling`, `dsd`, `limiter` |
+| `bitPerfectWhy` | the reasons, any of: `channels` (a source of more than two channels to a stereo output: its first two), `bits` (requantized for an output that keeps fewer bits than the source has), `rate` (a rate the device refused, converted by the output layer; `soundPath.deviceRate` says which), `output` (a device that converts by itself: AirPlay is 16 bits at 44.1 kHz), `dropped` (frames lost: the output stalled), `changed` (spans that differ), `swap`, `polarity` (left and right swapped, a speaker's polarity inverted: see below), and in builds that process the music on purpose `correction`, `level`, `volume`, `upsampling`, `dsd`, `limiter` |
 | `bitPerfectSpans` | how many spans were found identical this play |
+| `bitPerfectLossless` | `true` when only `swap` or `polarity` keep it from being bit-perfect and the spans compared were identical: lossless, verified; `null` when `bitPerfect` is not `false` |
 | `soundPath` | `input`, `inRate`, `inBits` (the source's significant bits seen), `channels`, `outRate`, `outBits` (what the output keeps), `deviceRate` (when the device plays at another rate), `dac` |
+
+Left and right swapped or a speaker's polarity inverted (`src/player/channels.h`) come after the comparison: the spans
+check the path up to them, and they are exact by construction (the samples moved, or negated in the output's format).
+The output is then no longer the source channel for channel, so the player does not call it bit-perfect; it says
+lossless.
 
 What it cannot see beyond the writer is the output's own path: a sound card's driver, an ALSA `plug` device (the
 player reads its description and reports a rate conversion), a network receiver. audiolaz Link's receiver plays what

@@ -59,6 +59,7 @@ static int mem_lock = 1;                /* --mlock 0|1 : mlockall at start, no p
 #include "out.h"
 #include "src.h"
 #include "bitperfect.h"
+#include "channels.h"     /* the speakers' channels: left and right swapped, a speaker's polarity inverted */
 
 static unsigned st_bp_rate, st_bp_orate, st_bp_dev;
 static int st_bp_obits;
@@ -89,12 +90,14 @@ static const char *VOIE_OUT = NULL;
 static const char *VOIE_SELF = NULL;
 static const char *VOIE_LOC = NULL;            /* --voie-loc: its renderer's description URL, asked directly while not found */           /* --voie-self: the player's own name (its AirPlay input: never an output) */
 static int voie_unbound = 0;                   /* its room bound to no output now (the player stops it) */
+static int voie_page_port = 0;                 /* its own small page (page.c page_start_voie): 127.0.0.1, 0 none */
 static char status_dir_v[700];
 static const char *status_dir(void) {          /* where status (and what this process alone keeps) goes */
     if (!VOIE) return ROOMS;
     if (!status_dir_v[0]) snprintf(status_dir_v, sizeof status_dir_v, "%s/voies/%s", ROOMS, VOIE);
     return status_dir_v;
 }
+enum { RC_LEAD_CARD, RC_LEAD_DIRECT, RC_LEAD_UPNP, RC_LEAD_SQUEEZE, RC_LEAD_AIRPLAY, RC_LEAD_AUDIOLAZ };
 
 #include "../tap/levels.h"
 static lvtap lv_tap;
@@ -119,6 +122,10 @@ static unsigned st_out_max = 0;
 static char net_spec[160];
 #define NET_UP_RESET() ((void)0)
 static uint64_t dither_rng = 0x9E3779B97F4A7C15ull;   /* the output's TPDF dither (pcmclock.h s32_out_q) */
+/* The speakers' channels (channels.h) for the output this process plays to, as the control file says them
+ * (swap.<out>=1, invert_l.<out>=1, invert_r.<out>=1; <out> its out=, "default" the command line's; absent: off): CH_*
+ * bits, read by the writer at each chunk (a change while it plays crossfaded there), the free player as Room's. */
+static _Atomic int chan_want = 0;
 static volatile sig_atomic_t quit = 0;
 static void on_signal(int s) { (void)s; quit = 1; }
 /* --parent-pid <pid> (10/10, the Mac player started by the app, src/player.js, as the Swift player was): the player
@@ -276,6 +283,10 @@ static int read_control(control *c, stamp *seen) {
     static int cx_v[CTX_LINES];
     static double cal_v[OUT_LAT_MAX];
     int cx_n = 0, cal_n = 0;
+    /* the speakers' channels, every output's lines (swap., invert_l., invert_r.): this output's kept below */
+    static char chan_o[OUT_LAT_MAX][160];
+    static int chan_b[OUT_LAT_MAX];
+    int chan_n = 0;
     n.ctx_n = 0; n.cal_ms = NAN; n.meta_log = 0; n.meta_log_v[0] = 0; n.air_buf_full = 1;
     char line[512];
     while (fgets(line, sizeof line, f)) {
@@ -322,6 +333,14 @@ static int read_control(control *c, stamp *seen) {
                 cal_v[cal_n++] = atof(eq + 1);
             }
         }
+        else if ((!strncmp(line, "swap.", 5) || !strncmp(line, "invert_l.", 9) || !strncmp(line, "invert_r.", 9)) && chan_n < OUT_LAT_MAX) {
+            const int sw = line[0] == 's', k = sw ? 5 : 9;
+            char *eq = strrchr(line + k, '=');
+            if (eq && eq > line + k && eq - (line + k) < 160 && atoi(eq + 1) == 1) {
+                snprintf(chan_o[chan_n], sizeof chan_o[chan_n], "%.*s", (int)(eq - (line + k)), line + k);
+                chan_b[chan_n++] = sw ? CH_SWAP : line[7] == 'l' ? CH_INV_L : CH_INV_R;
+            }
+        }
         else if (!strncmp(line, "airplay_buffered=", 17)) n.air_buf_full = strcmp(line + 17, "declared") != 0;   /* (10/10 evening; 11/10: full again, tvOS does not honour it in Buffered) */
         else if (!strncmp(line, "airplay_meta_log=", 17)) {             /* the capture: 1 or 2[.<stamp>] */
             n.meta_log = atoi(line + 17);
@@ -346,6 +365,14 @@ static int read_control(control *c, stamp *seen) {
         int v = cx_v[i];
         if (v < OUT_LAT_MIN) v = OUT_LAT_MIN; else if (v > OUT_LAT_TOP) v = OUT_LAT_TOP;
         snprintf(n.ctx_k[n.ctx_n], CTX_KEY, "%.*s", CTX_KEY - 1, cx_k[i]); n.ctx_v[n.ctx_n++] = v;
+    }
+    {
+        int ch = 0;
+        for (int i = 0; i < chan_n; i++) if (!strcmp(chan_o[i], n.out[0] ? n.out : "default")) ch |= chan_b[i];
+        if (ch != atomic_load(&chan_want)) logf_("output's channels: %s%s%s%s", ch & CH_SWAP ? "left and right swapped" : "", ch & CH_SWAP && ch & (CH_INV_L | CH_INV_R) ? ", " : "",
+                                                 ch & (CH_INV_L | CH_INV_R) ? (ch & CH_INV_L && ch & CH_INV_R ? "both speakers' polarity inverted" : ch & CH_INV_L ? "the left speaker's polarity inverted" : "the right speaker's polarity inverted") : "",
+                                                 ch ? "" : "as they come (nothing swapped nor inverted)");
+        atomic_store(&chan_want, ch);
     }
     for (int i = 0; i < cal_n; i++) if (!strcmp(cal_o[i], n.out[0] ? n.out : "default") && cal_v[i] >= CAL_MS_MIN && cal_v[i] <= CAL_MS_MAX) n.cal_ms = cal_v[i];
     fclose(f);
@@ -1564,6 +1591,8 @@ static void write_status(const char *state, unsigned rate, unsigned orate, const
         static time_t since = 0;
         if (!strcmp(state, "idle")) since = 0; else if (!since) since = time(NULL);
         fprintf(f, "voie=%s\nvoie_name=%s\nvoie_pid=%d\nvoie_unbound=%d\nsince=%ld\n", VOIE, VOIE_NAME ? VOIE_NAME : "", (int)getpid(), voie_unbound, (long)since);
+
+        if (voie_page_port > 0) fprintf(f, "page_port=%d\n", voie_page_port);
     }
     fprintf(f, "version=%s\nlang=%s\nsqueeze=%d\nformat=%s\n", ROOMD_VERSION, ROOMD_LANG, SQ_SERVER ? sq_connected() : 0, SQ_SERVER ? sq_format() : "");
     /* the output : the control's out= (empty: the command line's), and its kind */
@@ -1641,6 +1670,9 @@ static void write_status(const char *state, unsigned rate, unsigned orate, const
         const int bpv = live ? bp_state(why, sizeof why) : -1;
         fprintf(f, "bit_perfect=%d\nbit_perfect_why=%s\nbit_perfect_spans=%ld\nbit_perfect_bad=%ld\n", bpv, live ? why : "",
                 live ? atomic_load(&bp.ok) : 0, live ? atomic_load(&bp.bad) : 0);
+        /* not bit-perfect by the speakers' channels alone (swapped, inverted: exact): lossless, verified; and
+         * the channels this output plays with now (channels.h CH_* bits) */
+        fprintf(f, "bit_perfect_lossless=%d\nchannels_now=%d\n", live && bpv == 0 ? bp_lossless() : 0, atomic_load(&chan_want));
         fprintf(f, "path_in_rate=%u\npath_in_bits=%d\npath_out_rate=%u\npath_out_bits=%d\npath_dev_rate=%u\npath_dac=%s\n",
                 live ? st_bp_rate : 0, live ? atomic_load(&bp.bits_in) : 0, live ? st_bp_orate : 0, live ? st_bp_obits : 0,
                 live ? st_bp_dev : 0, live ? st_bp_dac : "");
@@ -1799,6 +1831,8 @@ typedef struct {
     const char *what;
     int vgate;                        /* and a Squeezebox player or the AirPlay bridge (not UPnP): its start on top of the ring */
     int L;                            /* the DAC's frames per stream frame */
+    int obits, chk;                   /* the output's bits (its PCM's grid) and its words' kind (channels.h CH_PCM,
+                                       * CH_DOP, CH_DSD), for the speakers' channels */
     _Atomic int full;                 /* a network receiver from a Loopback source: the music started (it was full;
                                        * AirPlay video: the receiver heard playing) */
     _Atomic long hold;                /* AirPlay video to a network receiver: what it may hold unplayed (hold_max) */
@@ -1964,6 +1998,9 @@ static void *writer_main(void *arg) {
     int32_t *pcm = malloc(sizeof(int32_t) * 2 * P), *zero = calloc(2 * P, sizeof(int32_t)), *zrest = zero;
     for (unsigned long i = 0; i < 2 * P; i++) zero[i] = W->idle;
     uint64_t dopn = 0;                               /* DoP: frames marked so far */
+    /* the speakers' channels (channels.h), as asked when the play starts (no crossfade into them then) */
+    chan_stage chs;
+    chan_init(&chs, atomic_load(&chan_want));
     if (W->dop) {                                    /* what the DAC is given again after a stop: marked already */
         zrest = malloc(sizeof(int32_t) * 2 * P);
         for (unsigned long i = 0; i < P; i++) { const int32_t m = (int32_t)((i & 1 ? 0xFAu : 0x05u) << 24); zrest[2 * i] = W->idle | m; zrest[2 * i + 1] = W->idle | m; }
@@ -2069,6 +2106,15 @@ static void *writer_main(void *arg) {
             if (primed && have >= P && !v_wait) {
                 chunk_r0 = atomic_load(&W->q->r); ring_pop(W->q, pcm, P); off = 0; len = P;
                 if (W->L == 1) bp_out(chunk_r0, pcm, P);   /* bitperfect.h: compared as it goes out */
+                /* the speakers' channels, the last stage, after the comparison (it is exact: said, bitperfect.h)
+                 * and before DoP's markers; the music only, never the silence the writer makes */
+                {
+                    const int cw = atomic_load_explicit(&chan_want, memory_order_relaxed);
+                    if (chan_run(&chs, cw, pcm, P, W->chk, W->obits, W->rate) && cw) {
+                        const unsigned said = (cw & CH_SWAP ? BP_SWAP : 0) | (cw & (CH_INV_L | CH_INV_R) ? BP_POLARITY : 0);
+                        if ((atomic_load_explicit(&bp.why, memory_order_relaxed) & said) != said) bp_say(said);
+                    }
+                }
                 /* (13/10, bug 10) started on a little of it: when the ring reached its level, and its lowest until then */
                 if (W->start && !fill_said) {
                     if (!t_music) { t_music = now_s(); low = have; }
@@ -2437,6 +2483,10 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     const int ap_short = net_loop && !video && netout_is_airplay(c->out);   /* music to an AirPlay device */
     /* music to a UPnP renderer (11/10, NET_UPNP_MUSIC_HOLD_MS): held, its ring NET_UPNP_RING_MS */
     const int upnp_short = net_loop && !video && !strncmp(out_asked, "upnp:", 5) && net_upnp_hold_ms > 0;
+
+    const int lead_kind = OUT == OUT_NET ? (!strncmp(out_asked, "upnp:", 5) ? RC_LEAD_UPNP : !strncmp(out_asked, "audiolaz:", 9) ? RC_LEAD_AUDIOLAZ
+                                            : netout_is_airplay(out_asked) ? RC_LEAD_AIRPLAY : RC_LEAD_SQUEEZE) : OUT == OUT_DIRECT ? RC_LEAD_DIRECT : RC_LEAD_CARD;
+    (void)lead_kind;
     const int az_out = OUT == OUT_NET && !strncmp(out_asked, "audiolaz:", 9);   /* an audiolaz receiver */
     const double drv_learn_s = paced ? drv_paced_learned(now_s()) : drv_ring_learned_s;   /* */
     long ring_target = ctx_adj + (long)(orate * (video ? air_video_ring_ms / 1000.0 : upnp_short ? NET_UPNP_RING_MS / 1000.0 :
@@ -2461,6 +2511,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                  .upnp = upnp_short || (net_loop && video && !strncmp(out_asked, "upnp:", 5)),   /* video too */
                  .step_s = upnp_short ? NET_UPNP_START_STEP_S : 1.5,
                  .what = video ? "AirPlay video" : upnp_short ? "a UPnP renderer's music" : "an AirPlay device", .t0 = t_enter };
+    W.obits = obits;                                    /* the PCM's grid, for an inverted speaker (channels.h) */
 
     if (sq && OUT != OUT_NET) W.start = (uint64_t)(orate * RING_START_S);
     if (lat_ring > 0 && W.start > (uint64_t)ring_target) W.start = (uint64_t)ring_target;   /* all of it at once */
@@ -2980,22 +3031,25 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             }
 
             const int settled = t - t_play0 >= 15.0 && (sq || in) && !atomic_load(&W.pause) && (!W.net || sq || net_anchor == 2);
+
+            double oq;
+            if (W.net) oq = (double)netout_held();
+            else if (OUT == OUT_DIRECT) oq = (double)atomic_load(&W.fill);
+            else {                                          /* the card's delay when last written, less what played since */
+                const int64_t ns = atomic_load(&W.delay_ns);
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                const int64_t now_ns = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+                oq = ns ? (double)atomic_load(&W.delay) - (double)(now_ns - ns) / 1e9 * orate : (double)atomic_load(&W.fill);
+                if (oq < 0) oq = 0;
+            }
+            const filt *pf = next && warm <= 0 ? next : cur;
+            double proc_late = (pf ? pf->lat : 0) + (lim ? lim_latency(lim) : 0) + UP_LAT(0);
             if (settled) {
-                double cap = 0, oq;
+                double cap = 0;
                 long d;
                 /* negative from an input whose source writes early by contract (src.h: macOS's AirPlay) */
                 if (in && src_delay(in, &d) == 0 && d > -(long)rate) cap = (double)d;
-                const filt *pf = next && warm <= 0 ? next : cur;
-                double proc = (double)la + (pf ? pf->lat : 0) + (lim ? lim_latency(lim) : 0) + UP_LAT(0);
-                if (W.net) oq = (double)netout_held();
-                else if (OUT == OUT_DIRECT) oq = (double)atomic_load(&W.fill);
-                else {                                      /* the card's delay when last written, less what played since */
-                    const int64_t ns = atomic_load(&W.delay_ns);
-                    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                    const int64_t now_ns = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-                    oq = ns ? (double)atomic_load(&W.delay) - (double)(now_ns - ns) / 1e9 * orate : (double)atomic_load(&W.fill);
-                    if (oq < 0) oq = 0;
-                }
+                const double proc = (double)la + proc_late;
                 const double hand = (double)atomic_load(&W.hand);
                 lat_sum += (cap + proc) / rate + ((double)f + hand + oq) / orate;
                 lat_part[0] += cap / rate; lat_part[1] += proc / rate; lat_part[2] += (double)f / orate;

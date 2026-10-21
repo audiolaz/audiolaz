@@ -30,7 +30,20 @@ int main(void) {
     printf("bit-perfect check: %.3f ms per second of 192 kHz stereo (%.3f %% of a core)\n", per_s * 1000, per_s * 100);
     const int a = run(x, 400000, 0), b = run(x, 400000, 1), c = run(x, 400000, 2), d = run(x, 400000, 3);
     printf("intact: %d spans different (of %ld equal); a sample ±1 LSB: %d; a frame dropped: %d; two frames swapped: %d\n", a, atomic_load(&bp.ok), b, c, d);
-    const int ok = a == 0 && b >= 1 && c >= 1 && d >= 1 && per_s < 0.005;
+    /* the speakers' channels (channels.h, after the comparison): not bit-perfect, lossless; another reason: not */
+    char why[200];
+    run(x, 400000, 0);
+    const int st0 = bp_state(why, sizeof why), l0 = bp_lossless();
+    bp_say(BP_SWAP | BP_POLARITY);
+    const int st1 = bp_state(why, sizeof why), l1 = bp_lossless();
+    const int named = !strcmp(why, "swap,polarity");
+    bp_say(BP_VOLUME);
+    const int l2 = bp_lossless();
+    run(x, 400000, 1); bp_say(BP_SWAP);
+    const int l3 = bp_lossless();
+    printf("the speakers' channels: intact %d (lossless %d), swapped and inverted %d (lossless %d, \"%s\"), with a volume: lossless %d, a sample changed: lossless %d\n",
+           st0, l0, st1, l1, named ? "swap,polarity" : why, l2, l3);
+    const int ok = a == 0 && b >= 1 && c >= 1 && d >= 1 && per_s < 0.005 && st0 == 1 && !l0 && st1 == 0 && l1 && named && !l2 && !l3;
     puts(ok ? "BITPERFECT OK" : "BITPERFECT FAIL");
     return ok ? 0 : 1;
 }

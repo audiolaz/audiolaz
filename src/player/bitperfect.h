@@ -10,10 +10,14 @@
 #define BP_Q 256                        /* spans queued (≥ 23 s at 44.1 kHz: more than any ring) */
 enum {                                  /* why it is not intact (bits of bp.why) */
     BP_CORRECTION = 1, BP_LEVEL = 2, BP_VOLUME = 4, BP_UPSAMPLING = 8, BP_DSD = 16, BP_CHANNELS = 32, BP_BITS = 64,
-    BP_RATE = 128, BP_DROPPED = 256, BP_CHANGED = 512, BP_LIMITER = 1024, BP_OUTPUT = 2048
+    BP_RATE = 128, BP_DROPPED = 256, BP_CHANGED = 512, BP_LIMITER = 1024, BP_OUTPUT = 2048,
+    BP_NIGHT = 4096,
+    BP_SWAP = 8192, BP_POLARITY = 16384 /* the speakers' channels (channels.h): exact, after the comparison */
 };
+#define BP_EXACT (BP_SWAP | BP_POLARITY) /* what changes no sample's value: lossless */
 static const char *const BP_WHY_NAME[] = { "correction", "level", "volume", "upsampling", "dsd", "channels", "bits",
-                                           "rate", "dropped", "changed", "limiter", "output" };
+                                           "rate", "dropped", "changed", "limiter", "output", "night",
+                                           "swap", "polarity" };
 typedef struct {
     _Atomic int on;                     /* the writer compares (the offset below known) */
     _Atomic int checked;
@@ -119,5 +123,11 @@ static inline int bp_state(char *why, size_t wl) {
     if (w) return 0;
     if (!atomic_load(&bp.checked) || !atomic_load(&bp.ok)) return -1;
     return 1;
+}
+/* 1: not bit-perfect only by the speakers' channels (swapped, a polarity inverted: exact), the spans compared
+ * equal: lossless, verified; 0 otherwise. */
+static inline int bp_lossless(void) {
+    const unsigned w = atomic_load(&bp.why) | (atomic_load(&bp.bad) ? BP_CHANGED : 0);
+    return w && !(w & ~(unsigned)BP_EXACT) && atomic_load(&bp.checked) && atomic_load(&bp.ok) > 0;
 }
 #endif

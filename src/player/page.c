@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
@@ -321,6 +322,37 @@ static int channels_json(char *b, size_t bn, int n) {
     b[n - 1] = '}'; b[n] = 0;
     return n;
 }
+/* The speakers' channels (roomd.c, channels.h), added to /state: outChannels { swap (left and right swapped),
+ * invertL, invertR (that speaker's polarity inverted: the one playing the music's left, or right), as the control keeps
+ * them for out (swap.<out>=1, invert_l.<out>=1, invert_r.<out>=1; <out> "default" for the command line's; absent: off),
+ * now (what the output plays with, the player's status: CH_* bits, swap 1, left 2, right 4) }. */
+static void spk_keys(const char *out, char k[3][200]) {
+    snprintf(k[0], sizeof k[0], "swap.%s", out[0] ? out : "default");
+    snprintf(k[1], sizeof k[1], "invert_l.%s", out[0] ? out : "default");
+    snprintf(k[2], sizeof k[2], "invert_r.%s", out[0] ? out : "default");
+}
+static int spk_get(const char *out) {
+    char k[3][200], v[8];
+    spk_keys(out, k);
+    int b = 0;
+    for (int i = 0; i < 3; i++) if (control_get(k[i], v, sizeof v) && atoi(v) == 1) b |= 1 << i;
+    return b;
+}
+static int spk_obj(char *b, size_t bn, int ch, int now) {
+    return snprintf(b, bn, "{\"swap\":%s,\"invertL\":%s,\"invertR\":%s,\"now\":%d}", ch & 1 ? "true" : "false", ch & 2 ? "true" : "false",
+                    ch & 4 ? "true" : "false", now);
+}
+static int spk_json(char *b, size_t bn, int n) {
+    if (n < 1 || b[n - 1] != '}') return n;
+    char out[180] = "", nw[8] = "", o[120];
+    control_get("out", out, sizeof out);
+    status_get("channels_now", nw, sizeof nw);
+    spk_obj(o, sizeof o, spk_get(out), atoi(nw) & 7);
+    const int m = snprintf(b + n - 1, bn - (size_t)n + 1, ",\"outChannels\":%s}", o);
+    if (m > 0 && (size_t)m < bn - (size_t)n + 1) return n - 1 + m;
+    b[n - 1] = '}'; b[n] = 0;
+    return n;
+}
 
 static int upnp_json(char *b, size_t bn, int n) {
     if (n < 1 || b[n - 1] != '}') return n;
@@ -359,6 +391,11 @@ void page_conf_follow(const char *rooms) {
     const struct timespec t = st.st_mtim;
 #endif
     if (have && t.tv_sec == seen.tv_sec && t.tv_nsec == seen.tv_nsec) return;
+    /* a file written this very moment (the player's page rewrites it whole, save_conf; its time the same to the
+     * kernel's tick before and after): read once it has been left alone for 50 ms */
+    struct timespec nw;
+    clock_gettime(CLOCK_REALTIME, &nw);
+    if ((double)(nw.tv_sec - t.tv_sec) + (nw.tv_nsec - t.tv_nsec) / 1e9 < 0.05) return;
     seen = t; have = 1;
     load_conf();
 }
@@ -498,6 +535,24 @@ CURVE_CSS \
 ".acting{color:var(--orange)}\n" \
 ".sy{flex:1;min-height:40px;border:0;border-radius:var(--r);background:var(--tile);color:var(--ink);font-family:inherit;font-size:13px;font-weight:700;cursor:pointer}.sy:hover{background:var(--tile2)}.sy:active{transform:translateY(1px)}#syb{gap:8px}\n"
 
+/* The speakers' channels (POST /channels, /state outChannels), on every page: its three switches sent together,
+ * shown as /state says them (not while one has the focus: the one just pressed). */
+#define SPK_HTML_EN \
+"<div id=\"spk\" hidden><div class=\"label\">Channels</div><div class=\"panel\">\n" \
+"<div class=\"row\"><span>Swap left and right</span><span><input type=\"checkbox\" id=\"cws\" onchange=\"spk()\"></span></div>\n" \
+"<div class=\"row\"><span>Invert polarity</span><span><label>left speaker <input type=\"checkbox\" id=\"cil\" onchange=\"spk()\"></label> <label>right speaker <input type=\"checkbox\" id=\"cir\" onchange=\"spk()\"></label></span></div>\n" \
+"<div class=\"row note\"><span>For this output. Every sample kept exactly: lossless.</span></div>\n" \
+"</div></div>\n"
+#define SPK_HTML_FR \
+"<div id=\"spk\" hidden><div class=\"label\">Canaux</div><div class=\"panel\">\n" \
+"<div class=\"row\"><span>Inverser gauche et droite</span><span><input type=\"checkbox\" id=\"cws\" onchange=\"spk()\"></span></div>\n" \
+"<div class=\"row\"><span>Inverser la phase</span><span><label>enceinte gauche <input type=\"checkbox\" id=\"cil\" onchange=\"spk()\"></label> <label>enceinte droite <input type=\"checkbox\" id=\"cir\" onchange=\"spk()\"></label></span></div>\n" \
+"<div class=\"row note\"><span>Pour cette sortie. Chaque échantillon gardé à l’identique : sans perte.</span></div>\n" \
+"</div></div>\n"
+#define SPK_JS \
+"function spk(){post('/channels?swap='+($('cws').checked?1:0)+'&invert_l='+($('cil').checked?1:0)+'&invert_r='+($('cir').checked?1:0))}\n" \
+"function spks(s){const c=s.outChannels;$('spk').hidden=!c;if(!c)return;for(const[i,k]of[['cws','swap'],['cil','invertL'],['cir','invertR']]){const x=$(i);if(document.activeElement!==x)x.checked=!!c[k]}}\n"
+
 #define PLAYER_JS \
 "const $=id=>document.getElementById(id);function post(u){return fetch(u,{method:'POST'})}\n" \
 "const e=x=>String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;');\n" \
@@ -509,8 +564,8 @@ CURVE_CSS \
 "async function tick(){try{const s=await(await fetch('/state')).json();document.title=s.name||document.title;$('nm').textContent=s.name||'audiolaz';\n" \
 "const on=s.state==='playing';$('st').classList.toggle('on',on);$('stt').textContent=on?T.playing:s.state==='busy'?T.busy:T.idle;\n" \
 "$('rt').textContent=on&&s.rate>0?(s.rate/1000).toFixed(s.rate%1000?1:0):'–';$('in').textContent=s.input==='squeeze'?'Roon':s.input||'–';\n" \
-"$('ch').textContent=s.inputChannels>2?T.first2(s.inputChannels):'';$('ch').hidden=!(s.inputChannels>2);outs(s);\n" \
-"const P=s.soundPath;$('bp').textContent=s.bitPerfect===true?T.bp:s.bitPerfect===false?T.nbp+(s.bitPerfectWhy||[]).map(w=>T.why[w]||w).join(', '):T.ubp;$('bp').classList.toggle('acting',s.bitPerfect===true);\n" \
+"$('ch').textContent=s.inputChannels>2?T.first2(s.inputChannels):'';$('ch').hidden=!(s.inputChannels>2);outs(s);spks(s);\n" \
+"const P=s.soundPath,LL=s.bitPerfect===false&&s.bitPerfectLossless===true;$('bp').textContent=s.bitPerfect===true?T.bp:s.bitPerfect===false?(LL?T.lbp:T.nbp)+(s.bitPerfectWhy||[]).map(w=>T.why[w]||w).join(', '):T.ubp;$('bp').classList.toggle('acting',s.bitPerfect===true||LL);\n" \
 "$('path').textContent=P?(P.inRate/1000)+' kHz'+(P.inBits?' · '+P.inBits+' bits':'')+' → '+((P.deviceRate||P.outRate)/1000)+' kHz · '+P.outBits+' bits'+(P.dac?' · '+P.dac:''):'';\n" \
 "const a=$('logo');if(s.appUrl){a.href=s.appUrl}else a.removeAttribute('href');$('room').hidden=!s.appUrl;if(s.appUrl)$('room').href=s.appUrl}catch(x){}setTimeout(tick,1000)}tick();\n"
 static const char PAGE[] =
@@ -533,8 +588,9 @@ PAGE_CSS
 "<div class=\"row\"><span>To</span><span><select id=\"outs\" onchange=\"outp(this.value)\" hidden></select><span id=\"out\">…</span></span></div>\n"
 "<div class=\"row note\"><span>The music goes to the output as it came, bit for bit. Room correction: audiolaz Room, in the app.</span></div>\n"
 "</div><p><a class=\"logo\" id=\"room\" hidden>audiolaz Room ›</a></p>\n"
+SPK_HTML_EN
 "<script>const T={playing:'playing',busy:'output busy',idle:'waiting',first2:n=>'A source of '+n+' channels: its first two (needed for this output)',\n"
-"bp:'Bit-perfect, verified',nbp:'Not intact: ',ubp:'Bit-perfect: not known yet',why:{channels:'channels (needed for this output)',bits:'word length (needed for this output)',rate:'rate (needed for this device)',output:'converted by the AirPlay device',dropped:'frames dropped',changed:'samples changed'}};\n"
+"bp:'Bit-perfect, verified',nbp:'Not intact: ',lbp:'Lossless, verified: ',ubp:'Bit-perfect: not known yet',why:{swap:'left and right swapped',polarity:'polarity inverted',channels:'channels (needed for this output)',bits:'word length (needed for this output)',rate:'rate (needed for this device)',output:'converted by the AirPlay device',dropped:'frames dropped',changed:'samples changed'}};\n"
 #else
 "<div class=\"label\">Lecture</div><div class=\"panel\">\n"
 "<div class=\"row\"><span>Depuis</span><span id=\"in\">–</span></div>\n"
@@ -543,10 +599,12 @@ PAGE_CSS
 "<div class=\"row\"><span>Vers</span><span><select id=\"outs\" onchange=\"outp(this.value)\" hidden></select><span id=\"out\">…</span></span></div>\n"
 "<div class=\"row note\"><span>La musique va à la sortie telle qu’elle arrive, au bit près. La correction de la pièce : audiolaz Room, dans l’app.</span></div>\n"
 "</div><p><a class=\"logo\" id=\"room\" hidden>audiolaz Room ›</a></p>\n"
+SPK_HTML_FR
 "<script>const T={playing:'en lecture',busy:'sortie occupée',idle:'en attente',first2:n=>'Une source de '+n+' voies : ses deux premières (conversion nécessaire pour cette sortie)',\n"
-"bp:'Bit-perfect, vérifié',nbp:'Pas intact : ',ubp:'Bit-perfect : pas encore vérifié',why:{channels:'voies (conversion nécessaire pour cette sortie)',bits:'résolution (conversion nécessaire pour cette sortie)',rate:'fréquence (conversion nécessaire pour cet appareil)',output:'converti par l’appareil AirPlay',dropped:'échantillons perdus',changed:'échantillons modifiés'}};\n"
+"bp:'Bit-perfect, vérifié',nbp:'Pas intact : ',lbp:'Sans perte, vérifié : ',ubp:'Bit-perfect : pas encore vérifié',why:{swap:'gauche et droite inversées',polarity:'phase inversée',channels:'voies (conversion nécessaire pour cette sortie)',bits:'résolution (conversion nécessaire pour cette sortie)',rate:'fréquence (conversion nécessaire pour cet appareil)',output:'converti par l’appareil AirPlay',dropped:'échantillons perdus',changed:'échantillons modifiés'}};\n"
 #endif
 PLAYER_JS
+SPK_JS
 "</script></main></body></html>\n";
 
 static void reply_code(int c, const char *code, const char *type, const char *body, size_t len) {
@@ -653,8 +711,9 @@ static void hosted_json(char *out, size_t len) {
 
 static int bitperfect_json(char *b, size_t bn, int n) {
     if (n < 1 || b[n - 1] != '}') return n;
-    char v[8] = "", why[200] = "", sp[24] = "", ir[16], ib[8], orr[16], ob[8], dr[16], dac[160], inp[64], ch[8];
+    char v[8] = "", why[200] = "", sp[24] = "", ir[16], ib[8], orr[16], ob[8], dr[16], dac[160], inp[64], ch[8], ll[8] = "";
     status_get("bit_perfect", v, sizeof v); status_get("bit_perfect_why", why, sizeof why); status_get("bit_perfect_spans", sp, sizeof sp);
+    status_get("bit_perfect_lossless", ll, sizeof ll);
     status_get("path_in_rate", ir, sizeof ir); status_get("path_in_bits", ib, sizeof ib); status_get("path_out_rate", orr, sizeof orr);
     status_get("path_out_bits", ob, sizeof ob); status_get("path_dev_rate", dr, sizeof dr); status_get("path_dac", dac, sizeof dac);
     status_get("input_channels", ch, sizeof ch);
@@ -671,8 +730,10 @@ static int bitperfect_json(char *b, size_t bn, int n) {
     char path[600] = "null";
     if (playing) snprintf(path, sizeof path, "{\"input\":\"%s\",\"inRate\":%d,\"inBits\":%d,\"channels\":%d,\"outRate\":%d,\"outBits\":%d,\"deviceRate\":%s,\"dac\":\"%s\"}",
                           inp, atoi(ir), atoi(ib), atoi(ch) > 0 ? atoi(ch) : 2, atoi(orr), atoi(ob), atoi(dr) > 0 ? dr : "null", dac);
-    const int m = snprintf(b + n - 1, bn - (size_t)n + 1, ",\"bitPerfect\":%s,\"bitPerfectWhy\":%s,\"bitPerfectSpans\":%ld,\"soundPath\":%s}",
-                           !playing || !v[0] || bv < 0 ? "null" : bv ? "true" : "false", wj, atol(sp), path);
+
+    const int m = snprintf(b + n - 1, bn - (size_t)n + 1, ",\"bitPerfect\":%s,\"bitPerfectWhy\":%s,\"bitPerfectSpans\":%ld,\"bitPerfectLossless\":%s,\"soundPath\":%s}",
+                           !playing || !v[0] || bv < 0 ? "null" : bv ? "true" : "false", wj, atol(sp),
+                           !playing || !v[0] || bv < 0 || bv ? "null" : atoi(ll) == 1 ? "true" : "false", path);
     if (m > 0 && (size_t)m < bn - (size_t)n + 1) return n - 1 + m;
     b[n - 1] = '}'; b[n] = 0;
     return n;
@@ -848,6 +909,7 @@ static void state_json(int c) {
         );
     lim_now.frames = 0; lim_now.limited = 0; lim_now.min_gain = 1; lim_now.peak = 0; page_in_peak = 0;
     if (n > 0 && (size_t)n < sizeof b) n = channels_json(b, sizeof b, n);   /* */
+    if (n > 0 && (size_t)n < sizeof b) n = spk_json(b, sizeof b, n);        /* the speakers' channels */
     if (n > 0 && (size_t)n < sizeof b) n = upnp_json(b, sizeof b, n);   /* */
     if (n > 0 && (size_t)n < sizeof b) n = link_json(b, sizeof b, n, outc0);   /* */
     if (n > 0 && (size_t)n < sizeof b) n = variant_json(b, sizeof b, n);       /* the free player or Room's */
@@ -873,7 +935,7 @@ static void handle(int c) {
 
     if (!strcmp(method, "POST")) {
         static const char *const FREE[] = { "/measure", "/measure/stop", "/airplay-buffered", "/airplay-meta-log", "/app", "/output",
-                                            "/take", "/upnp", "/airplay", "/latency", "/nowplaying", "/nowplaying/cover" };
+                                            "/take", "/upnp", "/airplay", "/latency", "/nowplaying", "/nowplaying/cover", "/channels" };
         int free_ = !strcmp(path, "/listen") && q && !strcmp(q, "to=0");
         for (size_t i = 0; !free_ && i < sizeof FREE / sizeof *FREE; i++) free_ = !strcmp(path, FREE[i]);
         if (!free_) {
@@ -1007,6 +1069,38 @@ static void handle(int c) {
         if (good) { const char *k[] = { "out" }, *vv[] = { to }; control_set(k, vv, 1); }
         if (good) reply(c, "application/json", "{\"ok\":true}", 11);
         else { static const char BAD[] = "{\"ok\":false,\"why\":\"bad\"}"; reply(c, "application/json", BAD, sizeof BAD - 1); }
+        return;
+    }
+    /* The speakers' channels (roomd.c, channels.h; the free player too: nothing resampled nor rounded, every
+     * sample exact, moved or negated): POST /channels?[swap=0|1][&invert_l=0|1][&invert_r=0|1][&out=<the output, URL-encoded;
+     * "default" the command line's; absent: the control's out=, the one playing>]: each one given set for that output
+     * (1 its line, 0 its line taken off), the others kept; the player follows at once (a crossfade of a few ms).
+     * {"ok":true,"outChannels":{swap, invertL, invertR, now}} as /state says it, or {"ok":false,"why":"bad"}. */
+    if (!strcmp(method, "POST") && !strcmp(path, "/channels")) {
+        static const char *const K[] = { "swap=", "invert_l=", "invert_r=" };
+        const char *o = q ? strstr(q, "out=") : NULL;
+        char to[200] = "", k[3][200];
+        if (o && (o == q || o[-1] == '&')) url_decode(o + 4, to, sizeof to);
+        else control_get("out", to, sizeof to);
+        if (!strcmp(to, "default")) to[0] = 0;
+        const char *kk[3], *vv[3];
+        int nk = 0, good = out_ok(to);
+        spk_keys(to, k);
+        for (int i = 0; i < 3 && q && good; i++) {
+            const char *v = strstr(q, K[i]);
+            while (v && v != q && v[-1] != '&') v = strstr(v + 1, K[i]);
+            if (!v) continue;
+            const char *x = v + strlen(K[i]);
+            if ((x[0] != '0' && x[0] != '1') || (x[1] && x[1] != '&')) { good = 0; break; }
+            kk[nk] = k[i]; vv[nk++] = x[0] == '1' ? "1" : NULL;
+        }
+        if (!good || !nk) { static const char BAD[] = "{\"ok\":false,\"why\":\"bad\"}"; reply(c, "application/json", BAD, sizeof BAD - 1); return; }
+        control_set(kk, vv, nk);
+        char nw[8] = "", ob[120], b[200];
+        status_get("channels_now", nw, sizeof nw);
+        spk_obj(ob, sizeof ob, spk_get(to), atoi(nw) & 7);
+        const int n2 = snprintf(b, sizeof b, "{\"ok\":true,\"outChannels\":%s}", ob);
+        reply(c, "application/json", b, (size_t)n2);
         return;
     }
 
