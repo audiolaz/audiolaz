@@ -2,7 +2,7 @@
 
 pkgbase=audiolaz
 pkgname=(audiolaz-player snd-audiolaz-dkms)
-pkgver=1.3.0
+pkgver=1.3.1
 pkgrel=1
 pkgdesc='Free bit-perfect network audio player: Roon/LMS, UPnP, AirPlay and Spotify Connect in, ALSA, Squeezebox, UPnP and audiolaz Link out'
 arch=(x86_64 aarch64)
@@ -13,7 +13,7 @@ source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         audiolaz-player.service
         audiolaz-player.conf
         50-audiolaz.conf)
-sha256sums=('4fc4d8833f63c74a3f59dcbfa181a6fad29126170f2f86e658b672d9565f6853'
+sha256sums=('f3a8048ed9edf4f6afc52d0f00de70dfa644a1c25116ef32d84ce440f41147aa'
             '2d0acb504f39627fb3a46b8007b61d265415c292aba328013c364cfc8459a647'
             '16d6ed94872d3c2fd1ef89af808666dfb52221e0f3945784ebcd242bd3bd248b'
             'dfbebfd8ccc5d783db8f54421422827c4172f227c127eeb95a343d726ff9c4d4')
