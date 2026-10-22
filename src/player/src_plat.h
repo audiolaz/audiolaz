@@ -14,6 +14,7 @@
 #define src_closed plat_src_closed
 #define src_paced plat_src_paced
 #define src_io_ended plat_src_io_ended
+#define src_keeps plat_src_keeps
 #define src_event_fds plat_src_event_fds
 #define src_drain plat_src_drain
 #define src_shift plat_src_shift
@@ -49,6 +50,7 @@
 #undef src_closed
 #undef src_paced
 #undef src_io_ended
+#undef src_keeps
 #undef src_event_fds
 #undef src_drain
 #undef src_shift

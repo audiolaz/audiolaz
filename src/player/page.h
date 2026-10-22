@@ -22,6 +22,13 @@ void page_sound_label(const char *key, char *sound, size_t sl, char *room, size_
 /* The acoustic calibration (10/10, roomd.c): clicks at at[0, n) ms of the app's next short track marked as it plays
  * (0, or −1: refused); its state and the clicks' times leaving the output as JSON (the bytes, −1: too long); the
  * player's clock (CLOCK_MONOTONIC, ns), the one those times are on. */
+
+int page_vol_for(const char *out, const char *place, double *db, int *mute);
+double page_vol_src(int src, double want, int mute, int fresh, int try_);
+void roomd_vol_now(double *db, int *active);
+/* upnp.c: the renderer's Volume and Mute told the level the player applies (its GetVolume, its events); db NAN:
+ * the option off, its mute taken off (nothing left silent) */
+void upnp_vol_follow(double db, int mute);
 /* GET /levels (engine/tap/levels.h): the connection handed to the levels' stream, 0 (it closes it), or −1 (the
  * caller keeps it: too many clients) */
 int roomd_levels_client(int fd);

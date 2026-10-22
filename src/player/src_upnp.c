@@ -261,6 +261,7 @@ double src_started(int k) {
 int src_closed(int k) { return is_up(k) ? !src_active(k) : plat_k(k) ? plat_src_closed(k) : 1; }
 int src_paced(int k) { return !is_up(k) && plat_k(k) && plat_src_paced(k); }
 int src_io_ended(int k) { return !is_up(k) && plat_k(k) && plat_src_io_ended(k); }   /* */
+int src_keeps(int k) { return !is_up(k) && plat_k(k) && plat_src_keeps(k); }          /* */
 int src_event_fds(struct pollfd *fds, int max) {
     int n = plat_on ? plat_src_event_fds(fds, max) : 0;
     if (up_on() && evp[0] >= 0 && n < max) { fds[n].fd = evp[0]; fds[n].events = POLLIN; fds[n].revents = 0; n++; }

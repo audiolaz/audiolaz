@@ -75,6 +75,12 @@ static struct {
     unsigned stop_why; char stop_text[160];    /* anet_stop_reason: why the next close */
     unsigned meta_sent;                 /* the meta's serial told */
     int r_stopped;                      /* the receiver stopped the stream itself (ANET_R_STOPPED) */
+    double after;                       /* heard after the receiver's DAC (its reports' after: frames at our rate) */
+    double pull;                        /* the ring's pull on the pace now (ppm/1e6: + faster), the DAC's being k */
+    uint64_t left_over, put_back;       /* live: zeros left out above the receiver's target, put in below the anchor */
+    double n_avg, t_navg;               /* the nominal ring averaged over about 2 s (frames): what over and under weigh;
+                                         * since when (it plays: weighed from 3 s after) */
+    double k_sum, pull_sum; long kp_n;  /* the DAC's clock and the pull, summed each tick while playing (their means said) */
     /* the timer thread's delays (AS_LATE_S and more): kept here by it, journaled by the control's thread */
     int rt_err, rt_said;                /* its priority refused (errno), said */
     unsigned long late_n[4]; double late_max[4];   /* by cause (AS_L_*): how many, the worst (s) */
@@ -90,6 +96,7 @@ static const char *const as_late_text[4] = {
 static unsigned as_ids = 0;
 static int as_rt_prio = 60;             /* anet_rt */
 static int as_live_next = 0;            /* anet_live: the source's kind (read at each tick) */
+static int as_paced_next = 0;           /* anet_paced: the source read at our pace (a card: Roon follows it) */
 static unsigned as_caps_offer = ANET_CAP_ALL;   /* anet_caps: what anet_open offers */
 /* who we are (anet_identity), the next open a take-over (anet_take), the last open refused: who plays there */
 static char as_uid[40], as_name[96] = "audiolaz";
@@ -115,12 +122,25 @@ static double as_hpct(double p) {
 
 static void as_setwhy(const char *f, ...) { va_list a; va_start(a, f); vsnprintf(AS.why, sizeof AS.why, f, a); va_end(a); }
 const char *anet_why(void) { return AS.why; }
+/* the stream now lost within s seconds of its opening: 1 (the reason in anet_why; the receiver's own, if it
+ * said one, in *rwhy: ANET_WHY_*, 0 none) */
+int anet_lost_early(double s, unsigned *rwhy) {
+    pthread_mutex_lock(&as_lk);
+    const int q = AS.on && AS.lost && as_mono() - AS.t_open < s;
+    if (rwhy) *rwhy = AS.r_stopped || AS.rstate == ANET_RS_DAC_FAILED ? AS.rwhy : 0;
+    pthread_mutex_unlock(&as_lk);
+    return q;
+}
 int anet_active(void) { pthread_mutex_lock(&as_lk); const int on = AS.on; pthread_mutex_unlock(&as_lk); return on; }
 void anet_live(int on) { pthread_mutex_lock(&as_lk); as_live_next = !!on; pthread_mutex_unlock(&as_lk); }
+void anet_paced(int on) { pthread_mutex_lock(&as_lk); as_paced_next = !!on; pthread_mutex_unlock(&as_lk); }
 
 static volatile int as_fifo_ms = ANET_FIFO_MS;
 void anet_fifo_ms(int ms) { as_fifo_ms = ms <= 0 ? ANET_FIFO_MS : ms < 10 ? 10 : ms > ANET_FIFO_MS ? ANET_FIFO_MS : ms; }
-void anet_caps(unsigned caps) { pthread_mutex_lock(&as_lk); as_caps_offer = caps & ANET_CAP_ALL; pthread_mutex_unlock(&as_lk); }
+void anet_caps(unsigned caps) { pthread_mutex_lock(&as_lk); as_caps_offer = caps & (ANET_CAP_ALL | ANET_CAP_RATES); pthread_mutex_unlock(&as_lk); }
+void anet_convert(int on) { pthread_mutex_lock(&as_lk); as_caps_offer = on ? as_caps_offer | ANET_CAP_RATES : as_caps_offer & ~(unsigned)ANET_CAP_RATES; pthread_mutex_unlock(&as_lk); }
+static unsigned as_refused_e = 0;     /* the last anet_open's refusal (ANET_E_*) */
+unsigned anet_refused(void) { pthread_mutex_lock(&as_lk); const unsigned e = as_refused_e; pthread_mutex_unlock(&as_lk); return e; }
 void anet_rt(int prio) { pthread_mutex_lock(&as_lk); as_rt_prio = prio > 0 ? prio : 0; pthread_mutex_unlock(&as_lk); }
 /* as_lk priority-inheriting (Linux) before anything takes it: the timer thread shares it with the writer, the
  * control's thread and the page's (anet_get_state) */
@@ -204,13 +224,17 @@ static void as_on_report(const anet_rep *r, double t) {   /* under as_lk */
         }
         AS.late_us = r->late_us; AS.peak_us = r->peak_us; AS.r_underruns = r->underruns; AS.r_adjusts = r->adjusts;
         AS.r_min = r->ring_min; AS.r_max = r->ring_max; AS.rstate = r->state; AS.rwhy = r->why;
+        AS.after = (double)r->after_us * AS.rate / 1e6;   /* another player behind it: its latency */
         as_known_note();
     }
     if (r->flags & ANET_R_STOPPED) {    /* it ended the stream itself: its reason */
         if (!AS.lost) { AS.lost = 1; AS.r_stopped = 1; as_setwhy("the receiver stopped the stream: %s", anet_why_text(r->why)); }
         return;
     }
-    if (r->flags & ANET_R_FAILED) { if (!AS.lost) { AS.lost = 1; as_setwhy("the receiver's DAC failed"); } return; }
+    if (r->flags & ANET_R_FAILED) {
+        if (!AS.lost) { AS.lost = 1; if (r->v3 && r->why) { AS.rwhy = r->why; as_setwhy("the receiver's DAC failed: %s", anet_why_text(r->why)); } else as_setwhy("the receiver's DAC failed"); }
+        return;
+    }
     const int playing = !!(r->flags & ANET_R_PLAYING);
     AS.rep_played = r->played; AS.rep_ring = r->ring;
     AS.rep_read = r->received > r->ring ? r->received - r->ring : 0;
@@ -250,6 +274,22 @@ static int as_send_why(uint32_t type, unsigned why) {   /* END / STOP: with its 
     if (!st) return as_send_msg(type);
     uint8_t w[4]; anet_p32(w, why);
     return as_send_msg2(type, w, 4);
+}
+
+/* What plays (anet_meta) sent now, its serial noted: by the control's thread when it changes, and once as the
+ * stream opens, before its first packet (the Mac's uplink says its volume there: the room's corrector applies it from
+ * the stream's first frame, never a first moment at full volume) */
+static void as_meta_now(int fd) {
+    char m[ANET_META_MAX]; unsigned ser;
+    pthread_mutex_lock(&as_metalk); memcpy(m, as_meta_lines, sizeof m); ser = as_meta_serial; pthread_mutex_unlock(&as_metalk);
+    char *self = strstr(m, "{self}");          /* our address as the receiver reaches it (this connection's own) */
+    if (self) {
+        struct sockaddr_in me; socklen_t ml = sizeof me; char ip[INET_ADDRSTRLEN] = "", rest[ANET_META_MAX];
+        if (!getsockname(fd, (struct sockaddr *)&me, &ml)) inet_ntop(AF_INET, &me.sin_addr, ip, sizeof ip);
+        snprintf(rest, sizeof rest, "%s", self + 6);
+        snprintf(self, sizeof m - (size_t)(self - m), "%s%s", ip, rest);
+    }
+    if (!as_send_msg2(ANET_M_META, m, (uint32_t)strlen(m))) { pthread_mutex_lock(&as_lk); AS.meta_sent = ser; pthread_mutex_unlock(&as_lk); }
 }
 
 /* The control's own thread: the receiver's reports; (protocol 3) the pings, the questions, what plays */
@@ -312,18 +352,7 @@ static void *as_rx_main(void *arg) {
             ANET_LOG("audiolaz: the packets %.0f ms late: %s%s", said_s[i] * 1000, as_late_text[said_kind[i]], ring);
         }
         if (ping) as_send_msg2(ANET_M_PING, pb, 8);
-        if (meta) {
-            char m[ANET_META_MAX]; unsigned ser;
-            pthread_mutex_lock(&as_metalk); memcpy(m, as_meta_lines, sizeof m); ser = as_meta_serial; pthread_mutex_unlock(&as_metalk);
-            char *self = strstr(m, "{self}");          /* our address as the receiver reaches it (this connection's own) */
-            if (self) {
-                struct sockaddr_in me; socklen_t ml = sizeof me; char ip[INET_ADDRSTRLEN] = "", rest[ANET_META_MAX];
-                if (!getsockname(fd, (struct sockaddr *)&me, &ml)) inet_ntop(AF_INET, &me.sin_addr, ip, sizeof ip);
-                snprintf(rest, sizeof rest, "%s", self + 6);
-                snprintf(self, sizeof m - (size_t)(self - m), "%s%s", ip, rest);
-            }
-            if (!as_send_msg2(ANET_M_META, m, (uint32_t)strlen(m))) { pthread_mutex_lock(&as_lk); AS.meta_sent = ser; pthread_mutex_unlock(&as_lk); }
-        }
+        if (meta) as_meta_now(fd);
         if (pr <= 0) continue;
         const ssize_t n = recv(fd, b + have, sizeof b - have, 0);
         if (n <= 0) {
@@ -372,6 +401,9 @@ static int as_q_zero(uint64_t from, uint64_t n) {
 }
 static void *as_tx_main(void *arg) {
     (void)arg;
+#if defined(__linux__) && defined(_GNU_SOURCE)
+    pthread_setname_np(pthread_self(), "az-link-tx");  /* named in the journal's real-time lines, ps -L */
+#endif
     static uint8_t pkt[ANET_DHDR + ANET_PKT_FRAMES * 8];
     static const int32_t zero2[2] = { 0, 0 };
     pthread_mutex_lock(&as_lk);
@@ -385,8 +417,13 @@ static void *as_tx_main(void *arg) {
     const uint64_t look = (uint64_t)(rate * AS_LOOK_MS / 1000.0);
     double next = as_mono(), acc = 0, t_sent = 0, prev_lag = 0, t_short = 0, dry_s = 0;
     int burst = 0;
+    rt_guard tg = { 0 };                                /* (21/10, rt_thread.h) never a core held at real time */
+    double tspin_for = 0, tspin_at = rt_test_spin("tx", &tspin_for);   /* the tests' (test/rt-safety.sh) */
+    const double t_tspin0 = as_mono();
     memset(&AS_H, 0, sizeof AS_H);
     for (;;) {
+        if (prio > 0) rt_guard_step(&tg, 0.005, 0.0002);
+        if (tspin_at > 0 && as_mono() - t_tspin0 >= tspin_at) { tspin_at = 0; rt_test_spin_now(tspin_for); next = as_mono(); }
         next += T;
         /* behind (woken late): the ticks due run back to back, a tick's pause every AS_BURST of them */
         if (as_mono() < next) { burst = 0; as_sleep_until(next); }
@@ -409,11 +446,18 @@ static void *as_tx_main(void *arg) {
         if (adapt) {
             N = (double)AS.sw - as_read_est(t);
             if (AS.playing) {
+                /* (22/10, the FOCALE voie: its card at −267 ppm from Roon's clock, the receiver's ring ~450 ms above
+                 * where it was kept: this pull at its ±300 ppm limit for half an hour) a source read at our pace (a
+                 * card: the app that plays to it follows its clock, nothing resampled) pulled up to ±1000 ppm; the rest
+                 * taken out, or put back, in silences (below) */
+                const double cmax = as_paced_next ? 1000e-6 : 300e-6;
                 double c = (AS.anchor - N) / rate / 400.0;
-                if (c > 300e-6) c = 300e-6;
-                if (c < -300e-6) c = -300e-6;
+                if (c > cmax) c = cmax;
+                if (c < -cmax) c = -cmax;
                 ratio += c;
-            }
+                AS.pull = c;
+                if (AS.locked && t - AS.t_open > 10.0) { AS.k_sum += AS.k; AS.pull_sum += c; AS.kp_n++; }
+            } else AS.pull = 0;
         } else if (AS.playing && AS.ring_target) {
             double c = -((double)AS.rep_ring - (double)AS.ring_target) / rate / 400.0;
             if (c > 300e-6) c = 300e-6;
@@ -458,13 +502,31 @@ static void *as_tx_main(void *arg) {
                  * silence put in would have: taken as such up to the target, not pulled back at the clock's pace */
                 if (N > AS.anchor + dead && AS.anchor < G) { AS.anchor += fmin(N - AS.anchor, G - AS.anchor); }
                 const double want = G - AS.anchor;
-                if (want > dead || (want < -dead && AS.ins > 0)) {
+                /* the ring above what the receiver asks (its gaps, a DAC's buffer grown and given back: never
+                 * drained but by the pull before, ±300 ppm), or short of its anchor (the source late: a hole, the pull
+                 * alone to fill it), by more than AS_DEFICIT_MS either way: zeros left out, or put in, in silences too */
+                if (!AS.playing) { AS.n_avg = 0; AS.t_navg = 0; }
+                else if (AS.t_navg == 0) { AS.n_avg = N; AS.t_navg = t; }   /* from its start playing, not from nothing sent */
+                else AS.n_avg += (N - AS.n_avg) * fmin(1.0, T / 2.0);   /* a burst or a late report: not a level */
+                const int weighed = AS.t_navg > 0 && t - AS.t_navg >= 3.0;
+                /* far from it only (40 ms, a fifth of the target): a loaded machine's own swings left alone */
+                const double far = fmax(2.0 * deficit, 0.2 * (double)G);
+                const double over = weighed ? AS.n_avg - (G > AS.anchor ? (double)G : AS.anchor) : 0, under = weighed ? AS.anchor - AS.n_avg : 0;
+                if (want > dead || (want < -dead && AS.ins > 0) || (AS.playing && (over > far || under > far))) {
                     const uint64_t span = (uint64_t)n + look < have ? (uint64_t)n + look : have;
                     const int silent = !AS.music || (AS.last_zero && as_q_zero(AS.qr, span));
-                    if (silent && want > dead) { zeros_in = (long)fmin(want, AS_INSERT * tick); AS.anchor += zeros_in; AS.ins += zeros_in; AS.put_in += (uint64_t)zeros_in; }
-                    else if (silent && want < -dead && AS.music) {
+                    /* n_avg moved at once by what is put in or left out (a step its average would take 2 s to
+                     * follow: put back again meanwhile, then left out, the bench's ring swinging 0 to 990 ms) */
+                    if (silent && want > dead) { zeros_in = (long)fmin(want, AS_INSERT * tick); AS.anchor += zeros_in; AS.ins += zeros_in; AS.put_in += (uint64_t)zeros_in; AS.n_avg += zeros_in; }
+                    else if (silent && want < -dead && AS.music && AS.ins > 0) {
                         skip = (long)fmin(fmin(-want, (double)AS.ins), fmin((double)n, AS_GROW * tick));
-                        if (skip > 0) { AS.anchor -= skip; AS.ins -= skip; AS.left_out += (uint64_t)skip; } else skip = 0;
+                        if (skip > 0) { AS.anchor -= skip; AS.ins -= skip; AS.left_out += (uint64_t)skip; AS.n_avg -= skip; } else skip = 0;
+                    }
+                    /* (sw = qr + ins always: what is held unheard, anet_held, counts them) */
+                    else if (silent && AS.playing && AS.music && under > far) { zeros_in = (long)fmin(under, AS_INSERT * tick); AS.ins += zeros_in; AS.put_in += (uint64_t)zeros_in; AS.put_back += (uint64_t)zeros_in; AS.n_avg += zeros_in; }
+                    else if (silent && AS.playing && AS.music && over > far) {
+                        skip = (long)fmin(over, fmin((double)n, AS_GROW * tick));
+                        if (skip > 0) { AS.ins -= skip; AS.left_out += (uint64_t)skip; AS.left_over += (uint64_t)skip; AS.n_avg -= skip; } else skip = 0;
                     }
                 }
             }
@@ -508,10 +570,14 @@ static void *as_tx_main(void *arg) {
         }
         if (send_end) as_send_why(ANET_M_END, ANET_WHY_END);
     }
+    rt_unregister();
     return NULL;
 }
 
+static _Thread_local int as_errno;   /* the last connection's errno (anet_errno: EHOSTUNREACH, EPERM…) */
+int anet_errno(void) { return as_errno; }
 static int as_connect(const char *host, int port, struct sockaddr_in *sa, char *why, size_t wl) {
+    as_errno = 0;
     char ps[16]; snprintf(ps, sizeof ps, "%d", port);
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *ai = NULL;
     if (getaddrinfo(host, ps, &hints, &ai) || !ai) { snprintf(why, wl, "audiolaz receiver %s: unknown address", host); return -1; }
@@ -527,18 +593,21 @@ static int as_connect(const char *host, int port, struct sockaddr_in *sa, char *
     memcpy(sa, ai->ai_addr, sizeof *sa);
     const int c = connect(fd, ai->ai_addr, ai->ai_addrlen);
     freeaddrinfo(ai);
-    if (c) { close(fd); snprintf(why, wl, "audiolaz receiver %s:%d: %s", host, port, strerror(errno)); return -1; }
+    if (c) { const int e = errno; close(fd); as_errno = e; snprintf(why, wl, "audiolaz receiver %s:%d: %s", host, port, strerror(e)); return -1; }
     return fd;
 }
 
-int anet_info(const char *host, int port, anet_peer *p, int ms) {
+int anet_info(const char *host, int port, anet_peer *p, int ms) { return anet_info_as(host, port, p, ms, 0); }
+/* as: what this asker says of itself, in the INFO request's reserved word (ANET_IQ_*: the Mac's uplink, its
+ * state); 0 nothing (every receiver before reads nothing there) */
+int anet_info_as(const char *host, int port, anet_peer *p, int ms, unsigned as) {
     char why[200];
     struct sockaddr_in sa;
     const int fd = as_connect(host, port, &sa, why, sizeof why);
     if (fd < 0) return -1;
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    anet_hdr h = { .id = 0, .rate = 0, .ch = 2, .fmt = ANET_F_S32 };
+    anet_hdr h = { .id = 0, .rate = 0, .ch = 2, .fmt = ANET_F_S32, .caps = as };
     uint8_t b[ANET_INFO + 1];
     anet_hdr_pack(b, &h);
     size_t have = 0;
@@ -555,6 +624,9 @@ int anet_info(const char *host, int port, anet_peer *p, int ms) {
         else if (!strncmp(s, "dac=", 4)) snprintf(p->dac, sizeof p->dac, "%.95s", s + 4);
         else if (!strncmp(s, "max=", 4)) p->max_rate = (unsigned)strtoul(s + 4, NULL, 10);
         else if (!strncmp(s, "hw=", 3)) snprintf(p->hw, sizeof p->hw, "%.95s", s + 3);
+        else if (!strncmp(s, "rates=", 6)) snprintf(p->rates, sizeof p->rates, "%.95s", s + 6);   /* */
+        else if (!strncmp(s, "err=", 4)) snprintf(p->err, sizeof p->err, "%.23s", s + 4);
+        else if (!strncmp(s, "room=", 5)) snprintf(p->room, sizeof p->room, "%.79s", s + 5);   /* an uplink's receiver */
         if (!c) break;
     }
     snprintf(p->addr, sizeof p->addr, "%.47s", inet_ntoa(sa.sin_addr));
@@ -576,7 +648,7 @@ int anet_open(const char *host, int port, unsigned rate, int fmt, unsigned hold_
     (void)hold_ms;
     anet_close(0);
     pthread_mutex_lock(&as_lk);
-    as_busy = 0; as_busy_by[0] = 0;
+    as_busy = 0; as_busy_by[0] = 0; as_refused_e = 0;
     pthread_mutex_unlock(&as_lk);
     struct sockaddr_in sa;
     const int fd = as_connect(host, port, &sa, why, wl);
@@ -630,7 +702,11 @@ int anet_open(const char *host, int port, unsigned rate, int fmt, unsigned hold_
             return -1;
         }
         close(fd);
-        snprintf(why, wl, "audiolaz receiver refused %u Hz (%s)", rate, r.reason == ANET_E_RATE ? "above its DAC's rates" : r.reason == ANET_E_DAC ? "its DAC did not open: busy, or the rate refused" : "header");
+        pthread_mutex_lock(&as_lk); as_refused_e = r.reason; pthread_mutex_unlock(&as_lk);
+        snprintf(why, wl, "audiolaz receiver refused %u Hz (%s)", rate,
+                 r.reason == ANET_E_RATE ? ((offer & ANET_CAP_RATES) ? "not a rate its DAC takes as it is" : "above its DAC's rates")
+                 : r.reason == ANET_E_DAC ? "its DAC did not open: busy, or the rate refused"
+                 : r.reason == ANET_E_DAC_START ? "its DAC refuses to start: unplug it and plug it in again" : "header");
         return -1;
     }
     pthread_mutex_lock(&as_lk);
@@ -658,8 +734,9 @@ int anet_open(const char *host, int port, unsigned rate, int fmt, unsigned hold_
     AS.caps = caps; AS.music = 0; AS.last_zero = 1; AS.sw = 0; AS.rep_read = 0; AS.ins = 0;
     AS.start = AS.goal = r.reason; AS.anchor = r.reason; AS.goal_lo = AS.goal_hi = r.reason;
     AS.late_us = AS.peak_us = AS.r_underruns = AS.r_adjusts = AS.r_min = AS.r_max = 0; AS.rstate = ANET_RS_FILLING; AS.rwhy = 0;
+    AS.pull = 0; AS.left_over = AS.put_back = 0; AS.n_avg = 0; AS.t_navg = 0; AS.k_sum = AS.pull_sum = 0; AS.kp_n = 0;   /* */
     AS.put_in = AS.left_out = AS.sped = AS.slowed = 0; AS.ping_seq = 0; AS.t_ping = 0; AS.r_stopped = 0;
-    AS.stop_why = ANET_WHY_NONE; AS.stop_text[0] = 0; AS.meta_sent = 0;
+    AS.stop_why = ANET_WHY_NONE; AS.stop_text[0] = 0; AS.meta_sent = 0; AS.after = 0;
     AS.rt_err = AS.rt_said = 0; memset(AS.late_n, 0, sizeof AS.late_n); memset(AS.late_max, 0, sizeof AS.late_max); AS.late_w = AS.late_r = 0;
     snprintf(AS.hp, sizeof AS.hp, "%s:%d", host, port);
     as_known_note();
@@ -667,6 +744,13 @@ int anet_open(const char *host, int port, unsigned rate, int fmt, unsigned hold_
     ANET_LOG("audiolaz: stream %u to %s:%d at %u Hz, %s%s", h.id, host, port, rate,
              !caps ? "a version-2 receiver (its ring fixed, no state exchanged)" : (caps & ANET_CAP_P3) == ANET_CAP_P3 ? "protocol 3 (its ring sized by the network, the state exchanged)" : "protocol 3 in part",
              !caps ? "" : caps & ANET_CAP_WHO ? "; one player at a time on its DAC" : "; a receiver before 14/10: the newest player takes its DAC");
+    /* what plays, before the first packet (as_meta_now) */
+    if (caps & ANET_CAP_STATE) {
+        pthread_mutex_lock(&as_metalk);
+        const unsigned ser = as_meta_serial;
+        pthread_mutex_unlock(&as_metalk);
+        if (ser) as_meta_now(fd);
+    }
     if (pthread_create(&AS.th, NULL, as_rx_main, (void *)(intptr_t)fd)) { close(ufd); close(fd); AS.on = 0; AS.fd = AS.ufd = -1; snprintf(why, wl, "thread"); return -1; }
     if (pthread_create(&AS.tx, NULL, as_tx_main, NULL)) { anet_close(0); snprintf(why, wl, "thread"); return -1; }
     return 0;
@@ -701,13 +785,15 @@ void anet_wait(int ms) {
 }
 uint64_t anet_sent(void) { pthread_mutex_lock(&as_lk); const uint64_t s = AS.qw; pthread_mutex_unlock(&as_lk); return s; }
 /* all not heard yet: the queue, and what was sent less what was played (the silence put in counted: it is heard
- * before the music behind it, latency as any frame) */
+ * before the music behind it, latency as any frame); and what the receiver says is heard after its DAC (another
+ * player behind it: 0 for a receiver beside its DAC) */
 long anet_held(void) {
     pthread_mutex_lock(&as_lk);
-    const long h = AS.on ? (long)((double)AS.qw + (double)AS.ins - as_est_played(as_mono())) : 0;
+    const long h = AS.on ? (long)((double)AS.qw + (double)AS.ins - as_est_played(as_mono()) + AS.after) : 0;
     pthread_mutex_unlock(&as_lk);
     return h < 0 ? 0 : h;
 }
+long anet_queued(void) { pthread_mutex_lock(&as_lk); const long q = AS.on ? (long)(AS.qw - AS.qr) : 0; pthread_mutex_unlock(&as_lk); return q; }
 int anet_started(void) { pthread_mutex_lock(&as_lk); const int s = AS.on && !AS.lost && AS.playing; pthread_mutex_unlock(&as_lk); return s; }
 int anet_was_full(void) { pthread_mutex_lock(&as_lk); const int s = AS.full_once; pthread_mutex_unlock(&as_lk); return s; }
 void anet_pause(int on) {
@@ -745,7 +831,10 @@ int anet_get_state(const char *hostport, anet_state *s) {
         s->rate = AS.rate;
         s->ring_ms = s->adapt ? ((double)AS.sw - as_read_est(t)) * ms : AS.rep_ring * ms;
         s->anchor_ms = AS.anchor * ms; s->ins_ms = (double)AS.ins * ms;
-        s->held_ms = ((double)AS.qw + (double)AS.ins - as_est_played(t)) * ms;
+        s->held_ms = ((double)AS.qw + (double)AS.ins - as_est_played(t) + AS.after) * ms;
+        s->after_ms = AS.after * ms;
+        s->dac_ppm = AS.locked ? (AS.k - 1.0) * 1e6 : 0; s->pull_ppm = AS.pull * 1e6;   /* */
+        s->over_ms = (double)AS.left_over * ms; s->back_ms = (double)AS.put_back * ms;
         for (int i = 0; i < 4; i++) { s->tx_late += AS.late_n[i]; if (AS.late_max[i] * 1000 > s->tx_late_ms) s->tx_late_ms = AS.late_max[i] * 1000; }
         if (!s->adapt) { s->target_ms = AS.ring_target * ms; s->start_ms = s->target_ms; }
     }
@@ -775,13 +864,20 @@ void anet_close(int finish) {
     pthread_mutex_lock(&as_lk);
     {
         const double ms = 1000.0 / (AS.rate ? AS.rate : 1);
-        char said[480], fig[600] = "";
+        char said[480], fig[800] = "";
         if (lost) snprintf(said, sizeof said, "%s by the receiver: %s", r_stopped ? "stopped" : "lost", AS.why);
         else snprintf(said, sizeof said, "%s by the player: %s", finish ? "ended" : "stopped", text);
         if (AS.caps & ANET_CAP_ADAPT)
             snprintf(fig, sizeof fig, "; its ring %.0f ms at the start, target %.0f–%.0f ms (%.0f at the end), %u changes; jitter %.1f ms, peak %.1f; silence put in %.0f ms, left out %.0f; sent ahead %.0f ms, held back %.0f; its underruns %u",
                      AS.start * ms, AS.goal_lo * ms, AS.goal_hi * ms, AS.goal * ms, AS.r_adjusts, AS.late_us / 1000.0, AS.peak_us / 1000.0,
                      AS.put_in * ms, AS.left_out * ms, AS.sped * ms, AS.slowed * ms, AS.r_underruns);
+        /* the pace: the DAC's clock as its reports said it, the ring's pull at the end; live, what was left out
+         * above its target and put back below its anchor */
+        if (AS.caps & ANET_CAP_ADAPT) {
+            const size_t fl = strlen(fig);
+            if (AS.kp_n) snprintf(fig + fl, sizeof fig - fl, "; its DAC's clock %+.0f ppm against ours on average, the ring's pull %+.0f ppm on average", (AS.k_sum / AS.kp_n - 1) * 1e6, AS.pull_sum / AS.kp_n * 1e6);
+            if (AS.left_over || AS.put_back) { const size_t f2 = strlen(fig); snprintf(fig + f2, sizeof fig - f2, " (silence left out above its target %.0f ms, put back below %.0f)", AS.left_over * ms, AS.put_back * ms); }
+        }
         /* the sender's own delays this stream, by cause */
         const unsigned long ln = AS.late_n[0] + AS.late_n[1] + AS.late_n[2] + AS.late_n[3];
         if (ln) {

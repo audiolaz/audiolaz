@@ -12,3 +12,7 @@ long az_strtol_old(const char *, char **, int);
 unsigned long az_strtoul_old(const char *, char **, int);
 long __isoc23_strtol(const char *s, char **e, int b) { return az_strtol_old(s, e, b); }
 unsigned long __isoc23_strtoul(const char *s, char **e, int b) { return az_strtoul_old(s, e, b); }
+/* strtoull too (rt_watch.h: a thread's schedstat, nanoseconds: 64 bits on a 32-bit ARM as well) */
+__asm__(".symver az_strtoull_old,strtoull@" AZ_GLIBC_BASE);
+unsigned long long az_strtoull_old(const char *, char **, int);
+unsigned long long __isoc23_strtoull(const char *s, char **e, int b) { return az_strtoull_old(s, e, b); }

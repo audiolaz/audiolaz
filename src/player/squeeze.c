@@ -24,6 +24,7 @@
 #endif
 #include <FLAC/stream_decoder.h>
 #include "squeeze.h"
+#include "vol.h"
 #include "rt_thread.h"
 
 #if defined(ROOM_PORTABLE) && !defined(ROOM_FLAC_BUILTIN)   /* ROOM_FLAC_BUILTIN: engine/mac/flac.c linked in (macOS) */
@@ -88,6 +89,10 @@ static _Atomic int stmu_sent = 1;
 static _Atomic uint64_t bytes_in = 0;
 static _Atomic long elapsed_ms = 0;
 static volatile double volume = 1.0;
+
+double page_vol_src(int src, double want, int mute, int fresh, int try_);   /* page.h's */
+static double audg_last = NAN;
+static int audg_any = 0;
 /* What the status and the page say : the server's 3483 connected, and the last stream's format. */
 enum { FMT_NONE, FMT_PCM, FMT_FLAC, FMT_FLAC_REFUSED };
 static _Atomic int connected = 0;
@@ -667,7 +672,17 @@ static void handle(const char *op, const uint8_t *d, size_t n) {
         }
     } else if (!memcmp(op, "audg", 4)) {
         /* old gains, digital volume, preamp, new gains (16.16 fixed point, 65536 = unity) */
-        if (n >= 18) { double l = get32(d + 10), r = get32(d + 14), g = (l > r ? l : r) / 65536.0; volume = g > 1 ? 1 : g; }
+        if (n >= 18) {
+            double l = get32(d + 10), r = get32(d + 14), g = (l > r ? l : r) / 65536.0;
+            volume = g > 1 ? 1 : g;
+            const double gv = volume;
+            if (!(gv == audg_last)) {                  /* a change: the player's own volume's, when on */
+                const double lv = page_vol_src(VS_ROON, gv > 0 ? 20.0 * log10(gv) : NAN, gv <= 0, !audg_any, 0);
+                if (lv == lv) sq_log("Roon's volume %.1f dB%s: the player's volume %.1f dB", gv > 0 ? 20.0 * log10(gv) : -INFINITY, audg_any ? "" : " (its first)", lv);
+                audg_last = gv;
+            }
+            audg_any = 1;
+        }
     } else if (!memcmp(op, "cont", 4)) atomic_store(&cont_seen, 1);
 }
 
@@ -727,6 +742,7 @@ static void *slim_main(void *arg) {
         helo();
         sq_log("connected to %s: \"%s\" is in Roon → Settings → Audio (Squeezebox)", host, player);
         atomic_store(&connected, 1);
+        audg_any = 0; audg_last = NAN;                 /* Roon's next audg: its first */
         uint8_t h[2], *buf = malloc(65536);
         while (buf && read_all(h, 2)) {
             size_t n = (size_t)h[0] << 8 | h[1];

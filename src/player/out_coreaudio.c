@@ -15,8 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "out.h"
+#include "azgrow.h"
 
 static void olog(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(stderr, fmt, a); va_end(a); fputc('\n', stderr); fflush(stderr);
@@ -33,6 +35,18 @@ static int opt_exclusive = 1;          /* hog mode while open (the app ran the S
 static int opt_integer = 0;            /* --integer on: non-mixable 32-bit integers when held and offered */
 static unsigned refused_test[16];      /* --test-refuse-rates 48000,96000: as if the device did not list them (tests) */
 static int n_refused_test = 0;
+static int test_start_fail = 0;        /* --test-start-fail N: the next N starts fail as the Flex 8 DL's did ('what') */
+static int test_stick = 0;             /* --test-stick on: the device stays at its rate whatever it is asked (the Flex at 48) */
+static int opt_native_only = 0;        /* out_native_only: a rate it does not take as it is refused, never resampled */
+static _Atomic int last_refusal = 0;   /* out_last_refusal: why the last out_open or start failed (OUT_REF_*) */
+static const char *fourcc(OSStatus e, char *b) {   /* 'what' for kAudioHardwareUnspecifiedError, else the number */
+    const uint32_t u = (uint32_t)e;
+    const char c[4] = { (char)(u >> 24), (char)(u >> 16), (char)(u >> 8), (char)u };
+    int ok = 1;
+    for (int i = 0; i < 4; i++) if (c[i] < 32 || c[i] > 126) ok = 0;
+    if (ok) snprintf(b, 16, "'%c%c%c%c'", c[0], c[1], c[2], c[3]); else snprintf(b, 16, "%d", (int)e);
+    return b;
+}
 
 /* ── Core Audio's properties ────────────────────────────────────────────────────────────────────── */
 static AudioObjectPropertyAddress pa(AudioObjectPropertySelector s, AudioObjectPropertyScope sc) {
@@ -138,9 +152,21 @@ static void dev_refuse(const char *uid, unsigned r, double now_rate) {
     if (n_refusals < 32) { refusal *x = &refusals[n_refusals++]; snprintf(x->uid, sizeof x->uid, "%s", uid); x->rate = r; x->at = now_rate; }
     pthread_mutex_unlock(&refusals_lk);
 }
+/* (21/10, the Flex 8 DL that evening: it listed 44.1 to 192 kHz and stayed at 48) a device that refused a rate it lists,
+ * found still at the rate it stayed at: taken to play that one only, until it is found at another (its own setting
+ * changed: the refusals forgotten) — one refusal, not one per rate tried (each a second and a half of waiting) */
+static int dev_stuck(const char *uid, double now_rate) {
+    int hit = 0;
+    pthread_mutex_lock(&refusals_lk);
+    for (int i = 0; i < n_refusals && !hit; i++) if (!strcmp(refusals[i].uid, uid) && fabs(refusals[i].at - now_rate) < 1) hit = 1;
+    pthread_mutex_unlock(&refusals_lk);
+    return hit;
+}
 /* Whether it plays r itself: listed, not refused before, not refused by the tests. */
 static int dev_offers(AudioObjectID d, const char *uid, unsigned r) {
-    return !test_refused(r) && dev_lists(d, r) && !dev_refused(uid, r, dev_rate(d));
+    const double now = dev_rate(d);
+    if (fabs(now - r) >= 1 && dev_stuck(uid, now)) return 0;
+    return !test_refused(r) && dev_lists(d, r) && !dev_refused(uid, r, now);
 }
 static const unsigned STD_RATES[] = { 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000 };
 #define N_STD (sizeof STD_RATES / sizeof *STD_RATES)
@@ -156,6 +182,7 @@ static int rate_candidates(AudioObjectID d, const char *uid, unsigned want, unsi
 /* The device set to r and the rate applied (it takes a moment): squeeze.swift setDeviceRate, 1.5 s at most. */
 static int dev_set_rate(AudioObjectID d, unsigned r) {
     if (fabs(dev_rate(d) - r) < 1) return 1;
+    if (test_stick) return 0;                          /* the tests': it stays where it is */
     Float64 want = r;
     const int e = pset(d, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, &want, sizeof want);
     for (int i = 0; i < (e ? 4 : 60); i++) { if (fabs(dev_rate(d) - r) < 1) return 1; usleep(25000); }
@@ -241,8 +268,21 @@ struct out_pcm {
     _Atomic uint32_t t_n;
     _Atomic uint64_t last_cb;          /* host time of the last callback */
     _Atomic int started, ever_full, waiting;
-    _Atomic long underruns;
+    _Atomic long underruns;            /* callbacks short with music after them: gaps heard (ring_push counts them) */
+    _Atomic long short_since;          /* callbacks short since the last frames pushed (gaps once music follows) */
+    _Atomic long tail;                 /* callbacks short after out_drain: the play-out, not gaps */
+    _Atomic int draining;              /* out_drain: no more music this stream (until the next push) */
+    _Atomic uint64_t low_min;          /* the ring's lowest level a callback left since the writer's last look */
+    long gaps, gaps_seen;              /* gap episodes (out_gaps): a run of short callbacks, then music */
+    uint64_t cap_max, cap0;            /* the ring's ceiling, its start (device frames) */
+    azgrow g;                          /* its size (azgrow.h), in device frames */
+    double t_look;
+    size_t ring_locked;
     semaphore_t sem;
+    /* the device's health, looked at by ca_watch (its own thread): its verdict for the writer */
+    pthread_t watch; _Atomic int watch_on; semaphore_t wsem; double t_hc;
+    _Atomic long dead_async;
+    char say[240]; _Atomic int say_n;  /* the writer's line for the journal, written by ca_watch (never by it) */
     /* The converter (resampling): the stream's frames in as 64-bit floats, the device's out as 32-bit floats. */
     AudioConverterRef conv;
     double *stage;                     /* the frames handed to it this call */
@@ -250,7 +290,6 @@ struct out_pcm {
     unsigned long stage_cap;
     UInt32 stage_n, stage_pos;
     uint64_t fed, produced;            /* stream frames it took, device frames it gave, since the start */
-    double t_check;                    /* the device's health, looked at every 250 ms (mono) */
     long dead;                         /* the error out_write says from now on (0: alive) */
 };
 
@@ -272,10 +311,16 @@ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const Audio
     const uint64_t r = atomic_load_explicit(&o->r, memory_order_relaxed), w = atomic_load_explicit(&o->w, memory_order_acquire);
     const uint64_t have = w - r, k = have < n ? have : n;
     for (uint64_t i = 0; i < k; i++) { const uint64_t j = (r + i) & o->mask; dst[2 * i] = o->ring[2 * j]; dst[2 * i + 1] = o->ring[2 * j + 1]; }
-    if (k < n) {                                       /* ran short: silence (0 is 0.0f too), counted */
-        memset(dst + 2 * k, 0, (size_t)(n - k) * 8);
-        if (atomic_load_explicit(&o->ever_full, memory_order_relaxed)) atomic_fetch_add_explicit(&o->underruns, 1, memory_order_relaxed);
-    }
+    if (atomic_load_explicit(&o->ever_full, memory_order_relaxed)) {
+        const int dr = atomic_load_explicit(&o->draining, memory_order_relaxed);
+        if (k < n) {                                   /* ran short: silence (0 is 0.0f too), counted */
+            memset(dst + 2 * k, 0, (size_t)(n - k) * 8);
+            /* after the last frame (out_drain): the play-out; else a gap once music follows (ring_push) */
+            atomic_fetch_add_explicit(dr ? &o->tail : &o->short_since, 1, memory_order_relaxed);
+        }
+        /* how low it came: the writer's look grows it at the first sign (azgrow.h) */
+        if (!dr && have - k < atomic_load_explicit(&o->low_min, memory_order_relaxed)) atomic_store_explicit(&o->low_min, have - k, memory_order_relaxed);
+    } else if (k < n) memset(dst + 2 * k, 0, (size_t)(n - k) * 8);
     const uint64_t s = atomic_load_explicit(&o->seq, memory_order_relaxed);
     atomic_store_explicit(&o->seq, s + 1, memory_order_release);
     atomic_thread_fence(memory_order_release);
@@ -290,18 +335,71 @@ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const Audio
 
 static void ca_free(out_pcm *o) {
     if (!o) return;
+    if (o->watch_on) { o->watch_on = 0; semaphore_signal(o->wsem); pthread_join(o->watch, NULL); }   /* */
+    if (o->wsem) semaphore_destroy(mach_task_self(), o->wsem);
     if (o->au) { AudioOutputUnitStop(o->au); AudioUnitUninitialize(o->au); AudioComponentInstanceDispose(o->au); }
     if (o->fmt_set && o->stream) pset(o->stream, kAudioStreamPropertyPhysicalFormat, kAudioObjectPropertyScopeGlobal, &o->fmt_was, sizeof o->fmt_was);
     if (o->hogged) { pid_t p = -1; pset(o->dev, kAudioDevicePropertyHogMode, kAudioObjectPropertyScopeGlobal, &p, sizeof p); }
     if (o->conv) AudioConverterDispose(o->conv);
     if (o->sem) semaphore_destroy(mach_task_self(), o->sem);
+    if (o->ring_locked) munlock(o->ring, o->ring_locked);
     free(o->ring); free(o->stage); free(o->outb);
     free(o);
 }
 
+/* What a device's ring learnt (azgrow.h), kept from one stream to the next (each stream opens it again): its
+ * UID, its size (ms: the same at any rate, a writer's lateness is time), its last sign and step down (mono). */
+#define CA_MAX_MS 500
+static struct { char uid[160]; double size_ms, t_sign, t_down; } ca_mem;
+static void ca_mem_take(out_pcm *o) {
+    if (!o->uid[0] || strcmp(ca_mem.uid, o->uid) || ca_mem.size_ms <= 0) return;
+    double f = ca_mem.size_ms * o->drate / 1000.0;
+    if (f > o->g.max) f = o->g.max;
+    if (f > o->g.size) o->g.size = f;
+    o->g.t_sign = ca_mem.t_sign; o->g.t_down = ca_mem.t_down;
+}
+static void ca_mem_keep(out_pcm *o) {
+    if (o->null || !o->uid[0] || !o->drate) return;
+    snprintf(ca_mem.uid, sizeof ca_mem.uid, "%s", o->uid);
+    ca_mem.size_ms = o->g.size * 1000.0 / o->drate; ca_mem.t_sign = o->g.t_sign; ca_mem.t_down = o->g.t_down;
+}
+
+/* The AUHAL on o->dev, given the ring's frames at the device's rate (never its own converter's rate change): 0, or
+ * the OSStatus (said by the caller). Its own function: made again when the device refuses to start. */
+static OSStatus au_make(out_pcm *o) {
+    AudioComponentDescription cd = { kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple, 0, 0 };
+    AudioComponent comp = AudioComponentFindNext(NULL, &cd);
+    OSStatus e = comp ? AudioComponentInstanceNew(comp, &o->au) : -1;
+    if (e) o->au = NULL;
+    AudioStreamBasicDescription f = { (Float64)o->drate, kAudioFormatLinearPCM,
+                                      (o->resample ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger) | kAudioFormatFlagIsPacked,
+                                      8, 1, 8, 2, 32, 0 };
+    AURenderCallbackStruct cb = { render, o };
+    if (!e) e = AudioUnitSetProperty(o->au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &o->dev, sizeof o->dev);
+    if (!e) e = AudioUnitSetProperty(o->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
+    if (!e) e = AudioUnitSetProperty(o->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
+    if (!e) e = AudioUnitInitialize(o->au);
+    return e;
+}
+
+static int au_again(out_pcm *o) {
+    if (o->au) { AudioOutputUnitStop(o->au); AudioUnitUninitialize(o->au); AudioComponentInstanceDispose(o->au); o->au = NULL; }
+    if (o->hogged) { pid_t p = -1; pset(o->dev, kAudioDevicePropertyHogMode, kAudioObjectPropertyScopeGlobal, &p, sizeof p); o->hogged = 0; }
+    const AudioObjectID d = dev_find(o->uid);
+    if (d == kAudioObjectUnknown) return -1;
+    o->dev = d;
+    if (opt_exclusive) {
+        pid_t p = getpid();
+        pset(d, kAudioDevicePropertyHogMode, kAudioObjectPropertyScopeGlobal, &p, sizeof p);
+        if (dev_hog(d) == getpid()) o->hogged = 1;
+    }
+    if (!dev_set_rate(d, o->drate)) return -1;
+    return au_make(o) ? -1 : 0;
+}
 /* "null", or "null:<file>" (10/10, the tests) */
 static int is_null(const char *dev) { return dev && (!strcmp(dev, "null") || !strncmp(dev, "null:", 5)); }
 out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period, unsigned periods, int quiet) {
+    atomic_store(&last_refusal, OUT_REF_NONE);
     if (is_null(dev)) {
         if (fmt != OUTF_S32 && fmt != OUTF_DSD_U32_LE) { if (!quiet) olog("null: format refused"); return NULL; }
         out_pcm *o = calloc(1, sizeof *o);
@@ -325,6 +423,7 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
     char who[300];
     if (h > 0 && h != me) {                            /* held by another program: busy (roomd.c tries again) */
         if (!quiet) { proc_label(h, who, sizeof who); olog("%s: held exclusively by %s", o->name, who); }
+        atomic_store(&last_refusal, OUT_REF_BUSY);
         free(o); return NULL;
     }
     if (opt_exclusive && h != me) {
@@ -343,6 +442,13 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
             if (!quiet) olog("%s refuses %u Hz: it lists it, stays at %.0f Hz", o->name, rate, at);
             dev_refuse(o->uid, rate, at);
         }
+    }
+    /* the sender converts (anet.h ANET_CAP_RATES): a rate it does not take as it is refused, said, never
+     * resampled here (Core Audio's converter: the corrector's own is better, and bit for bit after it) */
+    if (!o->drate && opt_native_only) {
+        if (!quiet) olog("%s: not at %u Hz as it is: refused (the sender converts to a rate it takes)", o->name, rate);
+        atomic_store(&last_refusal, OUT_REF_RATE);
+        ca_free(o); return NULL;
     }
     if (!o->drate) {
         unsigned c[N_STD];
@@ -380,24 +486,25 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
         } else if (!quiet) olog("%s: no 32-bit integer format at %u Hz: its own (32-bit floats)", o->name, o->drate);
     }
     /* The AUHAL on it, given the ring's frames at the device's rate (never its own converter's rate change) */
-    AudioComponentDescription cd = { kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple, 0, 0 };
-    AudioComponent comp = AudioComponentFindNext(NULL, &cd);
-    OSStatus e = comp ? AudioComponentInstanceNew(comp, &o->au) : -1;
-    AudioStreamBasicDescription f = { (Float64)o->drate, kAudioFormatLinearPCM,
-                                      (o->resample ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger) | kAudioFormatFlagIsPacked,
-                                      8, 1, 8, 2, 32, 0 };
-    AURenderCallbackStruct cb = { render, o };
-    if (!e) e = AudioUnitSetProperty(o->au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &o->dev, sizeof o->dev);
-    if (!e) e = AudioUnitSetProperty(o->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
-    if (!e) e = AudioUnitSetProperty(o->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
-    if (!e) e = AudioUnitInitialize(o->au);
+    const OSStatus e = au_make(o);
     if (e) { if (!quiet) olog("%s: its output unit refused (OSStatus %d)", o->name, (int)e); ca_free(o); return NULL; }
-    /* The ring: the buffer asked, in device frames */
-    o->cap = (uint64_t)ceil((double)o->buffer * o->ratio);
+    /* The ring: the buffer asked, in device frames; at least four of its IO cycles and its safety offset, what
+     * this device learnt before (ca_mem), room for it to grow to CA_MAX_MS (azgrow.h) */
+    pget(d, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, &o->bufsz, sizeof o->bufsz);
+    pget(d, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, &o->safety, sizeof o->safety);
+    o->cap0 = (uint64_t)ceil((double)o->buffer * o->ratio);
+    if (o->bufsz && o->cap0 < 4ull * o->bufsz + o->safety) o->cap0 = 4ull * o->bufsz + o->safety;
+    o->cap_max = (uint64_t)o->drate * CA_MAX_MS / 1000;
+    if (o->cap_max < 2 * o->cap0) o->cap_max = 2 * o->cap0;
+    azg_init(&o->g, (double)o->cap0, (double)o->cap_max, o->drate, mono());
+    ca_mem_take(o);
+    o->cap = (uint64_t)o->g.size;
+    atomic_store(&o->low_min, UINT64_MAX);
     uint64_t c = 1;
-    while (c < o->cap + 8192) c <<= 1;
+    while (c < o->cap_max + 8192) c <<= 1;
     o->mask = c - 1;
     o->ring = calloc(2 * c, sizeof(int32_t));
+    if (o->ring && !mlock(o->ring, 2 * c * sizeof(int32_t))) o->ring_locked = 2 * c * sizeof(int32_t);
     if (!o->ring || semaphore_create(mach_task_self(), &o->sem, SYNC_POLICY_FIFO, 0) != KERN_SUCCESS) { o->sem = 0; ca_free(o); return NULL; }
     if (o->resample) {                                 /* Apple's converter at its best (squeeze.swift's Resampler) */
         AudioStreamBasicDescription in = { (Float64)rate, kAudioFormatLinearPCM, kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, 16, 1, 16, 2, 64, 0 };
@@ -410,7 +517,7 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
         AudioConverterSetProperty(o->conv, kAudioConverterSampleRateConverterQuality, sizeof v, &v);
         o->stage_cap = 4096;
         o->stage = malloc(sizeof(double) * 2 * o->stage_cap);
-        o->outb = malloc(sizeof(float) * 2 * (size_t)(o->cap + 64));
+        o->outb = malloc(sizeof(float) * 2 * (size_t)(o->cap_max + 64));
         if (!o->stage || !o->outb) { ca_free(o); return NULL; }
     }
     /* what the device keeps of the 32-bit words (out_bits): its physical format's bits, at most the 24 its
@@ -427,12 +534,12 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
     UInt32 lat = 0, slat = 0;
     pget(d, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, &lat, sizeof lat);
     if (o->stream) pget(o->stream, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal, &slat, sizeof slat);
-    pget(d, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, &o->bufsz, sizeof o->bufsz);
-    pget(d, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, &o->safety, sizeof o->safety);
     o->lat_dev = (double)lat + slat;
-    o->t_check = mono();
     if (!quiet) olog("%s: open at %u Hz%s%s, 32-bit %s, buffer %lu frames, %d bits kept by the device", o->name, o->drate, o->hogged ? ", exclusive" : ", shared",
                      o->fmt_set ? ", integer mode" : "", o->resample ? "floats (resampled)" : "integers", o->buffer, o->bits);
+    o->buffer = (unsigned long)llround((double)o->cap / o->ratio);   /* out_params: the ring as it starts */
+    olog("%s: its ring %.0f ms to start%s, up to %.0f ms (IO cycles of %u frames, safety offset %u)", o->name, o->cap * 1000.0 / o->drate,
+         o->cap > o->cap0 ? " (what it needed before)" : "", o->cap_max * 1000.0 / o->drate, (unsigned)o->bufsz, (unsigned)o->safety);
     static int at_exit = 0;
     if (!at_exit++) atexit(release_at_exit);
     atomic_store(&open_dev, o);
@@ -461,42 +568,112 @@ static void writer_rt(out_pcm *o) {
         olog("%s: the writer stays at normal priority (Mach time constraint refused)", o->name);
 }
 
-/* The device's health (every 250 ms from the writer): gone, taken, its rate changed behind us, or no longer calling. */
-static long health(out_pcm *o) {
-    if (o->dead) return o->dead;
-    const double t = mono();
-    if (t - o->t_check < 0.25) return 0;
-    o->t_check = t;
+/* The device's health: gone, taken, its rate changed behind us, or no longer calling (0: alive). Asked by
+ * ca_watch every 250 ms once it plays, never by the writer (each question is coreaudiod's to answer). */
+static long health_check(out_pcm *o) {
     UInt32 alive = 0;
     char who[300];
     if (pget(o->dev, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, &alive, sizeof alive) || !alive) {
-        olog("%s: gone", o->name); return o->dead = -ENODEV;
+        olog("%s: gone", o->name); return -ENODEV;
     }
     const pid_t h = dev_hog(o->dev);
-    if (h > 0 && h != getpid()) { proc_label(h, who, sizeof who); olog("%s: taken exclusively by %s", o->name, who); return o->dead = -EBUSY; }
-    if (o->hogged && h != getpid()) { olog("%s: no longer held exclusively", o->name); return o->dead = -EIO; }
+    if (h > 0 && h != getpid()) { proc_label(h, who, sizeof who); olog("%s: taken exclusively by %s", o->name, who); return -EBUSY; }
+    if (o->hogged && h != getpid()) { olog("%s: no longer held exclusively", o->name); return -EIO; }
     const double r = dev_rate(o->dev);
-    if (fabs(r - o->drate) >= 1) { olog("%s: set to %.0f Hz behind us (it played at %u Hz)", o->name, r, o->drate); return o->dead = -EIO; }
-    if (atomic_load(&o->started)) {
-        const uint64_t last = atomic_load(&o->last_cb), now = mach_absolute_time();
-        if (last && host_ns(now - last) > 1000000000ull) { olog("%s: stopped asking for its music", o->name); return o->dead = -EIO; }
-    }
+    if (fabs(r - o->drate) >= 1) { olog("%s: set to %.0f Hz behind us (it played at %u Hz)", o->name, r, o->drate); return -EIO; }
+    const uint64_t last = atomic_load(&o->last_cb), now = mach_absolute_time();
+    if (last && host_ns(now - last) > 1000000000ull) { olog("%s: stopped asking for its music", o->name); return -EIO; }
     return 0;
 }
+static void *ca_watch(void *arg) {
+    out_pcm *o = arg;
+    pthread_setname_np("az-ca-watch");
+    while (o->watch_on) {
+        const mach_timespec_t t = { 0, 250000000 };
+        semaphore_timedwait(o->wsem, t);
+        if (!o->watch_on) break;
+        if (atomic_load(&o->say_n)) { olog("%s", o->say); atomic_store(&o->say_n, 0); }
+        const long b = health_check(o);
+        if (b) { atomic_store(&o->dead_async, b); break; }
+    }
+    return NULL;
+}
+/* The writer's view of it: the watch's verdict, once said. */
+static long health(out_pcm *o) {
+    if (o->dead) return o->dead;
+    if (!atomic_load(&o->watch_on) && atomic_load(&o->started)) {   /* no watch (its thread refused): the writer looks */
+        const double t = mono();
+        if (t - o->t_hc >= 0.25) { o->t_hc = t; const long b = health_check(o); if (b) return o->dead = b; }
+        return 0;
+    }
+    const long b = atomic_load(&o->dead_async);
+    return b ? (o->dead = b) : 0;
+}
 static uint64_t ring_fill(out_pcm *o) { return atomic_load_explicit(&o->w, memory_order_relaxed) - atomic_load_explicit(&o->r, memory_order_acquire); }
+
+#define START_TRIES 3
+static const int START_WAIT_MS[START_TRIES] = { 100, 300, 800 };
+static OSStatus au_start(out_pcm *o) {
+    if (test_start_fail > 0) { test_start_fail--; return (OSStatus)0x77686174; }   /* 'what', the tests' */
+    return AudioOutputUnitStart(o->au);
+}
 static void start_if_ready(out_pcm *o) {
     if (atomic_load(&o->started) || ring_fill(o) < o->cap / 2) return;
     atomic_store(&o->ever_full, 1);
     atomic_store(&o->last_cb, mach_absolute_time());
-    const OSStatus e = AudioOutputUnitStart(o->au);
-    if (e) { olog("%s: would not start (OSStatus %d)", o->name, (int)e); o->dead = -EIO; return; }
+    OSStatus e = au_start(o);
+    char b[16];
+    for (int k = 0; e && k < START_TRIES; k++) {
+        olog("%s: would not start (OSStatus %s): a new output unit in %d ms, the device found again by its UID%s", o->name, fourcc(e, b), START_WAIT_MS[k],
+             opt_exclusive ? " and held again" : "");
+        usleep((useconds_t)START_WAIT_MS[k] * 1000);
+        if (au_again(o)) { olog("%s: not there any more (unplugged?)", o->name); o->dead = -ENODEV; return; }
+        e = au_start(o);
+        if (!e) olog("%s: started at the %s try", o->name, k == 0 ? "second" : k == 1 ? "third" : "fourth");
+    }
+    if (e) {
+        olog("%s refuses to start (OSStatus %s at each try, a new output unit each time): unplug it and plug it in again (USB), or switch it off and on", o->name, fourcc(e, b));
+        atomic_store(&last_refusal, OUT_REF_START);
+        o->dead = -EIO; return;
+    }
+    atomic_store(&last_refusal, OUT_REF_NONE);
     atomic_store(&o->started, 1);
+    /* its health looked at from now on by a thread of its own (ca_watch) */
+    if (!o->watch_on && semaphore_create(mach_task_self(), &o->wsem, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS) {
+        o->watch_on = 1;
+        if (pthread_create(&o->watch, NULL, ca_watch, o)) { o->watch_on = 0; olog("%s: no thread to watch it: looked at by the writer", o->name); }
+    }
+    o->t_look = mono();
 }
 static void ring_push(out_pcm *o, const int32_t *src, uint64_t n) {
+    if (!n) return;
+    /* short callbacks, then music: a gap heard (those after the last frame, before out_drain, the same) */
+    atomic_store_explicit(&o->draining, 0, memory_order_relaxed);
+    const long sh = atomic_exchange_explicit(&o->short_since, 0, memory_order_relaxed);
+    if (sh) { atomic_fetch_add(&o->underruns, sh); o->gaps++; }
     const uint64_t w = atomic_load_explicit(&o->w, memory_order_relaxed);
     for (uint64_t i = 0; i < n; i++) { const uint64_t j = (w + i) & o->mask; o->ring[2 * j] = src[2 * i]; o->ring[2 * j + 1] = src[2 * i + 1]; }
     atomic_store_explicit(&o->w, w + n, memory_order_release);
 }
+/* The writer's look (every 20 ms at most, once it plays): how low the callback found the ring since, and the
+ * gaps since; its size from them (azgrow.h), said when it changes. */
+static void ca_look(out_pcm *o) {
+    if (!atomic_load(&o->started)) return;
+    const double t = mono();
+    if (t - o->t_look < 0.02) return;
+    o->t_look = t;
+    const uint64_t low = atomic_exchange(&o->low_min, UINT64_MAX);
+    const long gp = o->gaps - o->gaps_seen;
+    o->gaps_seen = o->gaps;
+    if (low == UINT64_MAX && !gp) return;
+    char why[200];
+    const int c = azg_look(&o->g, low == UINT64_MAX ? o->g.size : (double)low, gp > 0 ? (unsigned)gp : 0, t, why, sizeof why);
+    if (!c) return;
+    o->cap = (uint64_t)o->g.size;
+    if (o->cap > o->cap_max) o->cap = o->cap_max;
+    if (!atomic_load(&o->say_n)) { snprintf(o->say, sizeof o->say, "%s: its ring %s", o->name, why); atomic_store(&o->say_n, 1); }
+}
+
 /* The converter's input: this call's frames, once ('nodt' after them: the converter keeps its state for the next). */
 #define NO_DATA ((OSStatus)0x6e6f6474)
 static OSStatus conv_in(AudioConverterRef c, UInt32 *np, AudioBufferList *d, AudioStreamPacketDescription **pd, void *u) {
@@ -540,6 +717,7 @@ long out_write(out_pcm *o, const int32_t *pcm, unsigned long n) {
     writer_rt(o);
     const long bad = health(o);
     if (bad) return bad;
+    ca_look(o);
     long room = room_in(o);
     if (room <= 0) { start_if_ready(o); return o->dead ? o->dead : OUT_AGAIN; }
     unsigned long k = n < (unsigned long)room ? n : (unsigned long)room;
@@ -595,14 +773,29 @@ int out_delay(out_pcm *o, long *frames) {
     return 0;
 }
 void out_params(out_pcm *o, unsigned long *buffer, unsigned long *period) { *buffer = o->buffer; *period = o->period; }
+/* out.h */
+void out_drain(out_pcm *o) { if (o && !o->null) atomic_store(&o->draining, 1); }
+int out_said(out_pcm *o, char *buf, size_t len) { (void)o; (void)buf; (void)len; return 0; }   /* its watch writes them */
+long out_gaps(out_pcm *o) { return !o || o->null ? 0 : o->gaps; }
+double out_grown_ms(out_pcm *o) { return !o || o->null || !o->drate ? 0 : ((double)o->cap - (double)o->cap0) * 1000.0 / o->drate; }
 void out_close(out_pcm *o) {
     if (!o) return;
     if (o->dump) { fclose(o->dump); o->dump = NULL; }
     if (!o->null) {
         out_pcm *x = o;
         atomic_compare_exchange_strong(&open_dev, &x, NULL);
-        const long u = atomic_load(&o->underruns);
-        if (u) olog("%s: ran short %ld time%s while it played (silence)", o->name, u, u > 1 ? "s" : "");
+        /* told apart: short callbacks music came after (gaps heard) and those after its last frame (its
+         * play-out, while the receiver waits for its last frames to be heard: silence after the music, not a gap) */
+        if (o->watch_on) { o->watch_on = 0; semaphore_signal(o->wsem); pthread_join(o->watch, NULL); }
+        if (atomic_load(&o->say_n)) { olog("%s", o->say); atomic_store(&o->say_n, 0); }
+        const long u = atomic_load(&o->underruns), tl = atomic_load(&o->tail) + atomic_load(&o->short_since);
+        if (u) olog("%s: ran short %ld time%s while it played, in %ld gap%s heard (silence in the music)%s", o->name, u, u > 1 ? "s" : "", o->gaps, o->gaps > 1 ? "s" : "",
+                    tl ? "" : "; none after its last frame");
+        if (tl) olog("%s: %ld callback%s after its last frame, its play-out (silence after the music, not a gap)%s", o->name, tl, tl > 1 ? "s" : "", u ? "" : "; no gap while it played");
+        if (o->g.grows || o->g.shrinks)
+            olog("%s: its ring %.0f ms at the end (it started at %.0f; grown %u time%s, walked back %u; at its lowest %.1f ms)", o->name, o->g.size * 1000.0 / o->drate,
+                 o->cap0 * 1000.0 / o->drate, o->g.grows, o->g.grows == 1 ? "" : "s", o->g.shrinks, o->g.low_ms);
+        ca_mem_keep(o);
     }
     ca_free(o);
 }
@@ -628,9 +821,37 @@ const char *out_device_name(out_pcm *o) { return !o ? "" : o->null ? "null" : o-
 const char *out_device_maker(out_pcm *o) { return !o || o->null ? "" : o->maker; }
 const char *out_device_model(out_pcm *o) { return !o || o->null ? "" : o->model; }
 const char *out_default_dev(void) { return "default"; }
+int out_dev_info(const char *dev, char *uid, size_t ul, char *name, size_t nl) {   /* out.h */
+    if (uid && ul) uid[0] = 0;
+    if (name && nl) name[0] = 0;
+    if (!dev || is_null(dev)) return -1;
+    const AudioObjectID d = dev_find(dev);
+    if (d == kAudioObjectUnknown) return -1;
+    if (uid && ul) pstr(d, kAudioDevicePropertyDeviceUID, uid, ul);
+    if (name && nl) pstr(d, kAudioObjectPropertyName, name, nl);
+    return 0;
+}
 int out_dev_present(const char *dev) {
     if (!dev || !*dev || is_null(dev)) return 1;
     return dev_find(dev) != kAudioObjectUnknown;
+}
+void out_native_only(int on) { opt_native_only = on; }   /* out.h */
+int out_last_refusal(void) { return atomic_load(&last_refusal); }
+unsigned long out_dev_serial(const char *dev) {        /* the device's object now (a new one once replugged); 0 absent */
+    if (!dev || !*dev || is_null(dev)) return 1;
+    return (unsigned long)dev_find(dev);
+}
+int out_rates_text(const char *dev, char *out, size_t len) {   /* out.h: the rates it takes as it is, now */
+    if (len) out[0] = 0;
+    if (!dev || is_null(dev)) return -1;
+    const AudioObjectID d = dev_find(dev);
+    if (d == kAudioObjectUnknown) return -1;
+    if (dev_hog(d) > 0 && dev_hog(d) != getpid()) return -1;   /* held by another program: not known now */
+    char uid[160];
+    pstr(d, kAudioDevicePropertyDeviceUID, uid, sizeof uid);
+    size_t w = 0;
+    for (size_t i = 0; i < N_STD && w + 12 < len; i++) if (dev_offers(d, uid, STD_RATES[i])) w += (size_t)snprintf(out + w, len - w, "%s%u", w ? "," : "", STD_RATES[i]);
+    return (int)w;
 }
 /* A Core Audio UID: printable, nothing the control file or the page's JSON cannot hold. */
 int out_card_ok(const char *v) {
@@ -728,6 +949,8 @@ int out_option(const char *name, const char *value) {
     if (!strcmp(name, "--exclusive")) { opt_exclusive = on; return 1; }
     if (!strcmp(name, "--shared")) { opt_exclusive = !on; return 1; }
     if (!strcmp(name, "--integer")) { opt_integer = on; return 1; }
+    if (!strcmp(name, "--test-start-fail")) { test_start_fail = value ? atoi(value) : 0; return 1; }   /* the tests' */
+    if (!strcmp(name, "--test-stick")) { test_stick = on; return 1; }
     if (!strcmp(name, "--test-refuse-rates")) {
         n_refused_test = 0;
         for (const char *p = value ? value : ""; *p && n_refused_test < 16;) {

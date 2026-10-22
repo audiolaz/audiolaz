@@ -52,6 +52,7 @@ static int mem_lock = 1;                /* --mlock 0|1 : mlockall at start, no p
 #include "pcmclock.h"
 #include "memlock.h"     /* the player kept in memory */
 #include "rt_thread.h"    /* the audio's threads' priority, macOS and Linux */
+#include "rt_watch.h"     /* who held the cores, said after a wake late by seconds (Linux) */
 #include "page.h"
 #include "version.h"
 #include "netout.h"
@@ -60,6 +61,7 @@ static int mem_lock = 1;                /* --mlock 0|1 : mlockall at start, no p
 #include "src.h"
 #include "bitperfect.h"
 #include "channels.h"     /* the speakers' channels: left and right swapped, a speaker's polarity inverted */
+#include "vol.h"
 
 static unsigned st_bp_rate, st_bp_orate, st_bp_dev;
 static int st_bp_obits;
@@ -79,6 +81,15 @@ static int LOOP_SUBS = 2;                      /* macOS: input 1 is the AirPlay 
 static int LOOP_SUBS = 1;
 #endif
 static int cur_sub = 0;                        /* the subdevice playing, or to play */
+
+static vol_ramp vr;
+static int vol_on_now = 0, vol_mute_now = 0;
+static double vol_db_now = VOL_ON_DB;
+static _Atomic long vol_cdb_st = 0;
+static _Atomic int vol_act_st = 0;
+static _Atomic int air_vol_live = 0;           /* AirPlay's sender's volume to the stage (shairport-sync ignores it) */
+static _Atomic int air_vol_fresh = 1;          /* … its first word of the session next ('conn') */
+void roomd_vol_now(double *db, int *active) { *db = (double)atomic_load(&vol_cdb_st) / 100.0; *active = atomic_load(&vol_act_st); }
 
 static int st_input = -1;
 static const char *DAC = NULL;
@@ -627,9 +638,10 @@ static int out_present(const control *c) {
     return out_dev_present(d);                         /* out.h : macOS's Core Audio device by its UID too */
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__CYGWIN__)
 /* macOS: a Core Audio device by its UID, named as the page lists it (out_list_json's "name"); "" when it is not
- * there (unplugged: the player's name alone, below), and for "null" and "default" (no device of its own to name). */
+ * there (unplugged: the player's name alone, below), and for "null" and "default" (no device of its own to name).
+ * Windows the same: a WASAPI endpoint by its id (engine/win/out_wasapi.c). */
 static void card_label(const char *uid, char *b, size_t bl) {
     static char list[16384];
     char id[200];
@@ -647,7 +659,7 @@ static void card_label(const char *uid, char *b, size_t bl) {
 static void out_short(const control *c, char *o, size_t ol) {
     char b[200] = "";
     if (netout_is_net(c->out)) netout_out_name(c->out, b, sizeof b);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__CYGWIN__)
     else if (!strncmp(c->out, OUT_CARD_PREFIX, OUT_CARD_PREFIX_LEN) && c->out[OUT_CARD_PREFIX_LEN]) card_label(c->out + OUT_CARD_PREFIX_LEN, b, sizeof b);
     else if (OUT_LABEL) snprintf(b, sizeof b, "%s", OUT_LABEL);
     else card_label(DAC_ARG ? DAC_ARG : "", b, sizeof b);
@@ -715,10 +727,15 @@ static void dac_tick(const control *c, int playing) {
     }
     src_dac(b, NULL, NULL, 0);
 }
+
+static void inputs_conf_path(char *path, size_t n) {
+    if (VOIE) snprintf(path, n, "%s/voies/%s/inputs.conf", ROOMS, VOIE);
+    else snprintf(path, n, "%s/inputs.conf", ROOMS);
+}
 /* The Loopback subdevice inputs.conf names airplay (install.sh: "1=airplay"), or −1. */
 static int airplay_sub(void) {
     char path[600], line[128];
-    snprintf(path, sizeof path, "%s/inputs.conf", ROOMS);
+    inputs_conf_path(path, sizeof path);
     FILE *f = fopen(path, "r");
     if (!f) return -1;
     int k = -1;
@@ -734,7 +751,7 @@ static int airplay_sub(void) {
 static void sub_input_name(int k, char *out, size_t len) {
     char path[600], line[128];
     out[0] = 0;
-    snprintf(path, sizeof path, "%s/inputs.conf", ROOMS);
+    inputs_conf_path(path, sizeof path);
     FILE *f = fopen(path, "r");
     if (!f) return;
     while (fgets(line, sizeof line, f)) {
@@ -975,7 +992,17 @@ static void airplay_tick(const control *c) {
     const int net_out = NET_ON && netout_is_net(c->out);
     const int dev_want = net_out && c->air_dev && netout_dev_volume_kind(c->out);
     netout_dev_volume_max(c->air_dev_max);              /* the ceiling (NAN: the session's start volume) */
-    const int civ = dev_want ? 2 : c->air_iv >= 0 ? c->air_iv : ivf == 2 ? 0 : -1;
+
+    static int vol_air = 0, vol_air_was = 0;
+    {
+        double vd = 0;
+        int vm = 0;
+        const int vo = page_vol_for(c->out, c->noroom ? "" : c->place, &vd, &vm);
+        if (vo >= 0) vol_air = vo && !dev_want;
+    }
+    if (vol_air) vol_air_was = 1;
+    atomic_store(&air_vol_live, vol_air && ivf == 2);
+    const int civ = dev_want || vol_air ? 2 : c->air_iv >= 0 ? c->air_iv : ivf == 2 ? 0 : -1;
     {
         const int live = dev_want && ivf == 2;
         double pv = NAN;
@@ -990,7 +1017,7 @@ static void airplay_tick(const control *c) {
     const int ivmove = civ >= 0 && ivf != civ;
     const long tnow = (long)time(NULL);
     /* the output back to a card with the player's "yes" : at once, in a session too (full level to the amp) */
-    const int force = ivmove && ((c->air_iv_now > 0 && c->air_iv_now != now_done && labs(tnow - c->air_iv_now) < 120) || (ivf == 2 && !net_out));
+    const int force = ivmove && ((c->air_iv_now > 0 && c->air_iv_now != now_done && labs(tnow - c->air_iv_now) < 120) || (ivf == 2 && !net_out && !vol_air_was));
     /* the correction by ear of the last session's context (else the output's), the calibration measured for this
      * output (else AIRPLAY_CAL_MS). each kind of stream its own: the Realtime offset (and the declared
      * latency) from the context as Realtime, the Buffered offset from it as Buffered */
@@ -1090,12 +1117,13 @@ static void airplay_tick(const control *c) {
         return;
     }
     t_restart = t; air_file_s = want; if (civ >= 0) air_iv_file = civ; iv_failed = -1;
+    if (civ != 2) vol_air_was = 0;                     /* the player's volume no longer the sender's */
     if (plmove) atomic_store(&cap_plist, pl_want);       /* the capture's next session: with it from now */
     if (nmmove) { snprintf(air_name_file, sizeof air_name_file, "%s", nmw); air_name_next[0] = 0; netout_set_self2(nmw); }
     char stop[600], dsaid[400] = "";
     snprintf(stop, sizeof stop, "%s/input-stop", ROOMS);
     const int can = src_owns(k) || !access(stop, X_OK);
-    if (ivmove) logf_("AirPlay input: the sender's volume %s (ignore_volume_control \"%s\", %s)%s: %s", civ == 2 ? "set on the device, the music at full level" : civ ? "ignored: the volume is set on the amp or the streamer" : "applied again",
+    if (ivmove) logf_("AirPlay input: the sender's volume %s (ignore_volume_control \"%s\", %s)%s: %s", civ == 2 ? (vol_air ? "applied by the player's own volume (« Mon ampli n'a pas de volume »), the music at full level into it" : "set on the device, the music at full level") : civ ? "ignored: the volume is set on the amp or the streamer" : "applied again",
                       civ ? "yes" : "no", civ == 2 ? c->out : dev_want || ivf == 2 ? "the output has no volume of its own" : "chosen on the page",
                       force ? (ivf == 2 && !net_out ? ", at once (the output is a card now)" : ", at once (the cut said yes to, in the AirPlay session)") : ", no AirPlay session",
                       can ? "the input restarted" : "read at the input's next start (no input-stop)");
@@ -1190,8 +1218,12 @@ static volatile int lat_ring_now = 0;
 static void lat_rt_set(int prio) {
 #ifdef __linux__
     if (prio == lat_rt_now) return;
+    if (prio > 0 && !rt_allowed()) return;             /* within RT_OFF_S of a thread of ours dropped (SIGXCPU) */
     struct sched_param sp = { .sched_priority = prio > 0 ? prio : 0 };
-    if (!sched_setscheduler((pid_t)syscall(SYS_gettid), prio > 0 ? (SCHED_FIFO | SCHED_RESET_ON_FORK) : SCHED_OTHER, &sp)) lat_rt_now = prio > 0 ? prio : 0;
+    if (!sched_setscheduler((pid_t)syscall(SYS_gettid), prio > 0 ? (SCHED_FIFO | SCHED_RESET_ON_FORK) : SCHED_OTHER, &sp)) {
+        lat_rt_now = prio > 0 ? prio : 0;
+        if (prio > 0) rt_register(); else rt_unregister();   /* rt_thread.h: its SIGXCPU drops it */
+    }
     else if (prio > 0) logf_("latency: no real-time priority for the convolution (%s): it plays at normal priority", strerror(errno));
 #elif defined(__APPLE__)
 
@@ -1204,6 +1236,50 @@ static void lat_rt_set(int prio) {
 #else
     (void)prio;
 #endif
+}
+#ifdef __linux__
+/* (21/10, rt_watch.h) the player's watch: an ordinary thread waking every 250 ms; woken RT_WATCH_LATE_S late or more
+ * (the cores held by real-time threads: on a PREEMPT_RT kernel an ordinary thread's timer waits for ktimers/<core>,
+ * SCHED_FIFO 1, which any real-time thread of that core holds off), the real-time threads that ran most meanwhile
+ * said (any program's: Roon's, ours, the kernel's), once a minute at most */
+#define RT_WATCH_LATE_S 1.5
+static void *rt_watch_main(void *arg) {
+    (void)arg;
+#ifdef _GNU_SOURCE
+    pthread_setname_np(pthread_self(), "az-watch");
+#endif
+    static rtw_snap was;
+    rtw_take(&was);
+    double t_prev = rtw_now(), t_said = -1e9;
+    for (;;) {
+        const struct timespec d = { 0, 250000000 };
+        nanosleep(&d, NULL);
+        const double t = rtw_now(), late = t - t_prev - 0.25;
+        t_prev = t;
+        if (late >= RT_WATCH_LATE_S && t - t_said >= 60) {
+            t_said = t;
+            char who[600]; double span = 0;
+            const int n = rtw_late(&was, who, sizeof who, &span);
+            if (n) logf_("real time: this player's watch woke %.1f s late (the cores held); the real-time threads that ran most in the last %.1f s: %s", late, span, who);
+            else logf_("real time: this player's watch woke %.1f s late (the cores held), no real-time thread seen running that long", late);
+        }
+        if (t - was.at >= RTW_EVERY_S) rtw_take(&was);
+    }
+    return NULL;
+}
+static void rt_watch_start(void) {
+    pthread_t th;
+    if (!pthread_create(&th, NULL, rt_watch_main, NULL)) pthread_detach(th);
+}
+#endif
+/* (21/10, rt_thread.h) a real-time thread of ours dropped by its SIGXCPU (200 ms without blocking): said here, from an
+ * ordinary place (the main loop, the play's loop) */
+static void rt_xcpu_tick(void) {
+    static int seen = 0;
+    char nm[48];
+    const int n = rt_xcpu_said(&seen, nm, sizeof nm);
+    if (n) logf_("real time: « %s » ran %d ms without blocking (a loop of ours): dropped to normal priority at once by its SIGXCPU, no real time in this process for %.0f s (%d so far)",
+                 nm, RT_LIMIT_US / 1000, RT_OFF_S, n);
 }
 /* after each wait of the play's loop (t0: before it, t1: after it) */
 static void lat_rt_guard(double t0, double t1) {
@@ -1384,7 +1460,7 @@ static void air_item(uint32_t type, uint32_t code, const unsigned char *d, size_
     if (code == 0x6d64656eu) { if (air_np.in) air_np_commit(); air_np.in = 0; return; }                  /* 'mden' */
     if (code == 0x50494354u) { air_np.t_pict = now_s(); netout_np_cover(NETOUT_NP_AIRPLAY, d, n); return; }   /* 'PICT' */
     if (code == 0x636f706cu) { if (n == n_full) air_plist(d, n); return; }   /* 'copl' : a sender's plist */
-    if (code == 0x636f6e6eu) { memset(&air_np, 0, sizeof air_np); netout_np_clear(NETOUT_NP_AIRPLAY); netout_dev_volume_new(); }  /* 'conn' */
+    if (code == 0x636f6e6eu) { memset(&air_np, 0, sizeof air_np); netout_np_clear(NETOUT_NP_AIRPLAY); netout_dev_volume_new(); atomic_store(&air_vol_fresh, 1); }  /* 'conn' */
     if (code == 0x70766f6cu) {
         char pv[64];
         air_keep(pv, sizeof pv, d, n);
@@ -1397,9 +1473,11 @@ static void air_item(uint32_t type, uint32_t code, const unsigned char *d, size_
             air_pvol = db;
             snprintf(spec, sizeof spec, "%s", dv_spec);
             pthread_mutex_unlock(&air_mu);
-            const int live = atomic_load(&dv_live);
+            const int live = atomic_load(&dv_live), vlive = atomic_load(&air_vol_live);
             if (live) netout_dev_volume(spec, db);
-            if (was) logf_("AirPlay: the sender's volume %.2f dB%s", db, live ? ", set on the device" : "");
+            double lv = NAN;
+            if (vlive) lv = page_vol_src(VS_AIRPLAY, db <= -144 ? NAN : db, db <= -144, atomic_exchange(&air_vol_fresh, 0), 0);
+            if (was) logf_("AirPlay: the sender's volume %.2f dB%s", db, live ? ", set on the device" : lv == lv ? ", the player's volume" : "");
         }
         return;
     }
@@ -1584,7 +1662,8 @@ static void write_status(const char *state, unsigned rate, unsigned orate, const
     if (!f) return;
     fprintf(f, "state=%s\nrate=%u\nroom=%s\nbypass=%d\ngain=%.1f\nclipped=%ld\nxruns=%ld\nroon_slowed_ppm=%.1f\nsteady_ppm=%.1f\ndac_fill=%ld\ndac_delay=%ld\n"
                "dynamic=%s\nshare=%.0f\nlevel=%.1f\nimage=%s\nrate_out=%u\n",
-            state, rate, c->room, c->bypass, c->gain, clipped, xruns, ppm, steady, fill, delay, c->dyn, share * 100, level, c->image, orate);
+            state, rate, c->room, c->bypass, c->gain, clipped, xruns, ppm, steady, fill, delay, c->dyn, share * 100, level, c->image,
+            netout_link_rate() ? netout_link_rate() : orate);   /* a Link receiver's rate, converted here */
     /* what the app reads : which engine, and whether Roon reaches it as a Squeezebox and in which format */
     fprintf(f, "variant=player\n");
     if (VOIE) {
@@ -1601,6 +1680,8 @@ static void write_status(const char *state, unsigned rate, unsigned orate, const
     fprintf(f, "out=%s\nout_kind=%s\n", c->out, !strcmp(state, "idle") ? (netout_is_net(c->out) && NET_ON ? "net" : !strncmp(c->out, OUT_CARD_PREFIX, OUT_CARD_PREFIX_LEN) ? "alsa" : DIRECT_OUT ? "direct" : "alsa")
                                                : OUT == OUT_NET ? "net" : OUT == OUT_DIRECT ? "direct" : "alsa");
     fprintf(f, "out_why=%s\nout_max=%u\n", strcmp(state, "busy") ? "" : st_out_why, strcmp(state, "busy") ? 0 : st_out_max);
+    /* (22/10, point 9) the Link receiver's gaps this stream (its underruns: micro-cuts never silent), a voie's too */
+    if (OUT == OUT_NET && !strcmp(state, "playing")) fprintf(f, "link_gaps=%ld\n", netout_link_gaps());
     {   /* the network output not answering: when it is asked again (netout.c's backoff), its name */
         char rn[96] = "";
         const double rw = OUT == OUT_NET || netout_is_net(c->out) ? netout_retry_in(rn, sizeof rn) : 0;
@@ -1816,6 +1897,8 @@ typedef struct {
     ring *q;
     _Atomic int stop, dead, pause;    /* pause (Squeezebox): silence written, the ring's music kept for after */
     _Atomic long underruns, silences, fill, skip;
+
+    double dry_t0; _Atomic long dry_ms, dry_held_ms;
     int32_t idle;                     /* silence: 0, or DSD's 0x69 pattern */
     int dop;                          /* DoP: the writer marks each frame, 0x05 then 0xFA, in the order they go out */
     int net, sq;                      /* a network receiver ; fed by the Squeezebox input: no silence ever sent */
@@ -1974,6 +2057,9 @@ static void cal_note(uint64_t r_end, double q, unsigned orate) {
 
 static void *writer_main(void *arg) {
     writer *W = arg;
+#if defined(__linux__) && defined(_GNU_SOURCE)
+    pthread_setname_np(pthread_self(), "az-writer");   /* named in the journal's real-time lines, ps -L */
+#endif
 #ifdef __APPLE__
     /* macOS refuses SCHED_FIFO 94 to a user process (EINVAL above 47: this line said so at each play, and the
      * writer stayed at the default priority). A Core Audio card's writer turns Mach real time at its first write
@@ -2006,6 +2092,9 @@ static void *writer_main(void *arg) {
         for (unsigned long i = 0; i < P; i++) { const int32_t m = (int32_t)((i & 1 ? 0xFAu : 0x05u) << 24); zrest[2 * i] = W->idle | m; zrest[2 * i + 1] = W->idle | m; }
     }
     const double ms = 1000.0 / W->rate;
+    rt_guard wg = { 0 };                             /* (21/10, rt_thread.h) never a core held: 5 ms of work, a nap */
+    double spin_for = 0, spin_at = rt_test_spin("writer", &spin_for);   /* the tests' (test/rt-safety.sh) */
+    const double t_spin0 = now_s();
     unsigned long off = 0, len = 0;              /* the chunk being written: pcm[off … len) */
     uint64_t chunk_r0 = UINT64_MAX;                  /* its first frame's place in the ring (UINT64_MAX: silence) */
     int primed = 0, sound_said = 0, ever = 0;   /* ever: primed once this play */
@@ -2034,6 +2123,8 @@ static void *writer_main(void *arg) {
     double last_stop = -1e9, last_line = -1e9;
     long unlogged = 0;                               /* stops since the last line in the log */
     while (!atomic_load(&W->stop)) {
+        if (writer_rt > 0) rt_guard_step(&wg, 0.005, 0.0002);
+        if (spin_at > 0 && now_s() - t_spin0 >= spin_at) { spin_at = 0; logf_("test: the writer spins %.1f s without a wait", spin_for); rt_test_spin_now(spin_for); }
         atomic_store(&W->hand, (long)(len - off));   /* the chunk in hand: on its way, not in the ring, not in the DAC */
         /* an audiolaz receiver's ring grown to what the network needs (anet.h, protocol 3): video may hold that more */
         if (W->az && W->vid && hold_max) { const long hx = (long)(W->rate * (W->hold_ms + netout_link_extra_ms()) / 1000.0); if (hx > hold_max) { hold_max = hx; atomic_store(&W->hold, hold_max); } }
@@ -2104,6 +2195,11 @@ static void *writer_main(void *arg) {
             const int v_wait = W->vid && W->vgate && !v_started && primed &&
                                (start_sil >= 0 ? (long)have < (long)pr + (long)P : (long)have + netout_held() < (long)pr + hold_max);
             if (primed && have >= P && !v_wait) {
+                if (W->dry_t0 > 0) {                     /* the music back: that dry spell said (over 100 ms) */
+                    const double d = now_s() - W->dry_t0;
+                    W->dry_t0 = 0;
+                    if (d >= 0.1) atomic_store(&W->dry_ms, (long)(d * 1000));
+                }
                 chunk_r0 = atomic_load(&W->q->r); ring_pop(W->q, pcm, P); off = 0; len = P;
                 if (W->L == 1) bp_out(chunk_r0, pcm, P);   /* bitperfect.h: compared as it goes out */
                 /* the speakers' channels, the last stage, after the comparison (it is exact: said, bitperfect.h)
@@ -2140,6 +2236,7 @@ static void *writer_main(void *arg) {
             /* an audiolaz receiver still holding music: the source late a moment is no gap there (it plays on from
              * what it holds); silence only once it holds less than NET_AZ_QUIET_MS */
             else if (W->az && primed && !atomic_load(&W->ending) && netout_held() > (long)(W->rate * (NET_AZ_QUIET_MS / 1000.0))) {
+                if (W->dry_t0 == 0) { W->dry_t0 = now_s(); atomic_store(&W->dry_held_ms, (long)(netout_held() * ms)); }   /* */
                 usleep(2000); continue;
             }
             else if (W->net && W->sq) {              /* Roon's music late, or its end: nothing sent , the receiver
@@ -2287,6 +2384,7 @@ static void *writer_main(void *arg) {
     }
     if (zrest != zero) free(zrest);
     free(pcm); free(zero);
+    rt_unregister();                                 /* its slot free (rt_thread.h) */
     return NULL;
 }
 
@@ -2394,6 +2492,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
 
         netout_smooth_position(!sq && !strncmp(c->out, "upnp:", 5) && (video || net_upnp_hold_ms > 0));
         netout_live(!sq || lat_ring > 0);
+        netout_paced(paced);                           /* a card's app follows its clock: the ring pulled harder */
         netout_low_latency(video || (!sq && netout_is_airplay(c->out)));   /* AirPlay video , a Loopback source's
                                                        * music to an AirPlay device : it starts on little, the
                                                        * writer's hold_max */
@@ -2401,6 +2500,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             net_refused();
             OPEN_FAILED();
             if (netout_busy(NULL, NULL, 0)) st_out_why = "used";   /* another player plays to it (out_why=used) */
+            else if (netout_dac_start(c->out)) st_out_why = "dac-start";   /* its DAC refuses to start: unplug, plug in */
             write_status("busy", rate, orate, c, 0, 0, 0, 0, 0, 0, 0, -120);
             UP_FREE(); sleep(1); return;
         }
@@ -2553,6 +2653,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     double t_rd = 0;                                   /* when the source at the DAC's pace was last read (PACED_KEEP_S) */
     long keep_reads = 0;                               /* reads made by it, this play (the journal) */
     long silences_logged = 0;                          /* silences already written to the journal (01/10: their time) */
+    double dry_hold = 0;                               /* this loop's longest turn since the writer's last dry spell said */
     static double steady = 0;                          /* the clocks' steady gap (ppm), kept from one play to the next */
     double ppm = steady, t_adjust = now_s(), t_status = now_s(), t_ctl = now_s(), t_log = now_s(), t_in_log = 0, held = 0, t_fill = 0;
     /* The ring's fill, ten times a second: averaged for the clock (fill_) and for the journal (log_). */
@@ -2594,7 +2695,16 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     long sq_tail = -1;
 
     double sq_t_el = 0, sq_t_end = 0, sq_t_pause = 0, vol = 1.0;
-    (void)vol;                                         /* no volume of the player's own: the music as it came */
+    int vr_first = 1;                                  /* the play's first frames: the stage at its level at once */
+    {   /* the option as the page says it before the first frame (a new player starts with it off here: never a
+         * first block at full because the page was busy that moment); the free player's too */
+        double vdb = 0;
+        int vmu = 0, von = -1;
+        for (int i = 0; i < 400 && (von = page_vol_for(c->out, c->noroom ? "" : c->place, &vdb, &vmu)) < 0; i++) usleep(250);
+        if (von >= 0) { vol_on_now = von; if (von) { vol_db_now = vdb; vol_mute_now = vmu; } }
+    }
+    double dev_last = NAN;                             /* the input's device volume as last told (NAN: not yet this play) */
+    (void)vol;                                         /* the source's own volume never applied: the music as it came */
     double sq_el0 = 0;                                 /* the elapsed time at sq_track0 (0 at a track's first frame) */
     int sq_given = 0;                                  /* what was read and not heard already given back (sq_unread) */
     /* why the play ends (NETOUT_WHY_*), said in the journal and to an audiolaz receiver; 0: from how it ended */
@@ -2617,11 +2727,12 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             logf_("squeeze: playing on in the stream at %.2f s", pos);
         }
     }
+
     logf_("playing: %u Hz, %s%s%s%s%s, room %s", rate, c->bypass ? "bypass" : c->room,
           cur && cur->alt ? " + dynamic " : "", cur && cur->alt ? cur->name : "", cur && cur->xd ? " + image " : "", cur && cur->xd ? cur->image : "",
           c->noroom ? "none for this output" : c->place);
     if (obits < 32) logf_("output: %d bits kept by it, the music requantized to them here with TPDF dither (once; silence and untouched samples as they are)", obits);
-    if (air_play) logf_("AirPlay: as it came, the sender's volume ignored (the free player)");
+    if (air_play) logf_("AirPlay: as it came, the sender's volume %s (the free player)", vol_on_now ? "to the player's own volume" : "ignored");
     if (air_play) logf_("AirPlay: %s (%s), the ring kept at %.0f ms%s", video ? "video" : "music", air_why, st_ring_ms,
                         video ? ", no upsampling, no DSD, until this play ends" : ", until this play ends");
 
@@ -2635,6 +2746,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         if (OUT == OUT_NET && netout_is_airplay(out_asked)) bp_say(BP_OUTPUT);   /* the bridge: 16 bits, 44.1 kHz */
         st_bp_rate = rate; st_bp_orate = orate; st_bp_obits = obits; st_bp_dev = 0;
         if (OUT == OUT_ALSA && out && out_device_rate(out)) { st_bp_dev = out_device_rate(out); bp_say(BP_RATE); }
+        /* a Link receiver whose DAC does not take this rate: converted by netout.c, said (never bit for bit) */
+        if (OUT == OUT_NET && netout_link_rate()) { st_bp_dev = netout_link_rate(); bp_say(BP_RATE); logf_("output: the Link receiver's DAC takes %u Hz, not %u Hz: converted here (the corrector's converter)", netout_link_rate(), orate); }
         if (OUT == OUT_ALSA && out && out_device_name(out)[0]) snprintf(st_bp_dac, sizeof st_bp_dac, "%s", out_device_name(out));
         else dac_of(c, st_bp_dac, sizeof st_bp_dac);
 
@@ -2648,7 +2761,12 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     double vf_sum = 0, t_vf = t_play0, t_vf_said = 0, t_vf_off = -1e9;   /* t_vf_off: the ring last seen above it */
     long vf_n = 0;
     int vf_high = 0;
+    rt_guard pg = { 0 };                                /* (21/10, rt_thread.h) this thread at real time: bounded work */
+    double pspin_for = 0, pspin_at = rt_test_spin("play", &pspin_for);   /* the tests' (test/rt-safety.sh) */
+    const double t_pspin0 = now_s();
     while (!quit && !atomic_load(&W.dead)) {
+        rt_xcpu_tick();                                 /* a thread of ours dropped by its SIGXCPU: said */
+        if (pspin_at > 0 && now_s() - t_pspin0 >= pspin_at) { pspin_at = 0; logf_("test: the play's thread spins %.1f s without a wait (SCHED_FIFO %d now)", pspin_for, lat_rt_now); rt_test_spin_now(pspin_for); }
         /* the writer's news, said here (writer: say_first, say_fill) */
         if (atomic_load_explicit(&W.say_first, memory_order_acquire) == 1) {
             atomic_store(&W.say_first, 2);
@@ -2662,6 +2780,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             double tn = now_s();
             const double hold = tn - t_loop;
             if (hold > wait_max) wait_max = hold;
+            if (hold > dry_hold) dry_hold = hold;      /* the longest turn since a dry spell was said */
             t_loop = tn;
 
             if (drv_play && hold > 0.15) { drv_hold_t = tn; if (hold > drv_hold) drv_hold = hold; }
@@ -2853,6 +2972,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         const double t_read = now_s();
         for (;;) {                                         /* every whole period Roon has written; with the Squeezebox
                                                             * input, as long as the ring wants music (the DAC's pace) */
+            if (lat_rt_now) rt_guard_step(&pg, LAT_YIELD_S, LAT_NAP_S);   /* a long read at real time: its naps */
             long n;
             int sq_first = 0;
             if (sq) {
@@ -2896,7 +3016,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                         if (tk - t_hold_last >= 0.1) { src_hold(cur_sub, 1000); t_hold_last = tk; }   /* well within AZC_STALE_MS */
                         break;
                     }
-                    if (OUT != OUT_NET || av <= 0 || t_rd <= 0 || tk - t_rd < PACED_KEEP_S) break;
+                    /* an uplink's ring keeps its music (src_keeps): never read ahead at its rate, its pace the output's */
+                    if (OUT != OUT_NET || av <= 0 || t_rd <= 0 || tk - t_rd < PACED_KEEP_S || src_keeps(cur_sub)) break;
                     keep = (long)((tk - t_rd) * rate);
                     if (keep > av) keep = av;
                     if (keep > (long)iper) keep = (long)iper;
@@ -2943,7 +3064,31 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             long m = n;
             if (nch == 2) memcpy(pcm, raw, sizeof(int32_t) * 2 * (size_t)n);
             else for (long i = 0; i < n; i++) { pcm[2 * i] = raw[(size_t)i * (size_t)nch]; pcm[2 * i + 1] = raw[(size_t)i * (size_t)nch + (nch > 1)]; }
-            if (obits < 32) for (long i = 0; i < 2 * m; i++) pcm[i] = s32_out_q(s32_in(pcm[i]), obits, &dither_rng);
+            {
+
+                const double vt = sq ? sq_volume() : src_volume(cur_sub);
+                double vdb = 0;
+                int vmu = 0, vdone = 0;
+                const int von = page_vol_for(c->out, c->noroom ? "" : c->place, &vdb, &vmu);
+                if (von >= 0) { vol_on_now = von; if (von) { vol_db_now = vdb; vol_mute_now = vmu; } }
+                if (vol_on_now && !sq && cur_sub != UPNP_K && (dev_last != dev_last || fabs(vt - dev_last) > 1e-6)) {
+                    const double r = page_vol_src(VS_DEVICE, vt > 0 ? 20.0 * log10(vt) : NAN, vt <= 0, dev_last != dev_last, 1);
+                    if (r != -INFINITY) dev_last = vt;            /* the page busy: told at the next period */
+                }
+                if (vol_on_now && !vr.active) vol_ramp_take(&vr, vr_first ? NAN : 1.0, vol_db_now, vol_mute_now);
+                if (vr.active) {
+                    if (vol_on_now) vol_ramp_to(&vr, vol_db_now, vol_mute_now);
+                    else vol_ramp_to(&vr, 0.0, 0);                /* off: back to full, the music as it came */
+                    if (vr_first && vol_on_now) { vr.db = vr.tdb; vr.mg = vr.tmute ? 0.0 : 1.0; }   /* nothing played before it: at the level at once */
+                    vdone = vol_ramp_run_s32(&vr, pcm, a, m, (double)rate * L, obits, &dither_rng);
+                    if (vdone) bp_say(BP_VOLUME);
+                    if (!vol_on_now && vol_ramp_settled(&vr)) vr.active = 0;   /* handed back, at 0 dB */
+                }
+                vr_first = 0;
+                atomic_store_explicit(&vol_cdb_st, vr.active ? lround(vr.db * 100.0) : 0, memory_order_relaxed);
+                atomic_store_explicit(&vol_act_st, vr.active, memory_order_relaxed);
+                if (!vdone && obits < 32) for (long i = 0; i < 2 * m; i++) pcm[i] = s32_out_q(s32_in(pcm[i]), obits, &dither_rng);
+            }
             for (long i = 0; i < 2 * m; i++) { const double x = fabs(s32_in(pcm[i])); if (x > play_out_peak) play_out_peak = x; }
             if (levels_wanted(&lv_tap)) {
                 for (long i = 0; i < 2 * m; i++) a[i] = s32_in(pcm[i]);
@@ -3094,6 +3239,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         }
         if (t - t_ctl > 0.05) {                            /* the control file, 20 times a second (03/10: 4 before) */
             t_ctl = t;
+            if (OUT == OUT_NET) netout_np_tick();
             /* Another source starting (08/10, --loop-subs): the one that started last plays. Played from the Loopback:
              * Roon's Squeezebox stream starting, or a newer subdevice, ends this play (the main loop takes it up). Played
              * from the Squeezebox input: a subdevice starting pauses Roon there (Roon shows it paused), and this play ends
@@ -3167,6 +3313,9 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             if (atomic_load(&W.full)) net_anchor = 1;   /* the music started (full, or never pushing back) */
             fill_sum = 0; fill_n = 0; t_adjust = t;
         }
+        /* an uplink's ring to a network output: its play settled once the receiver took its music (nothing to
+         * steer, no level to keep), so that its latency is measured (src_latency: the Mac's device tells its apps) */
+        if (paced && net_anchor == 1 && src_keeps(cur_sub)) net_anchor = 2;
         if (paced) { fill_sum = 0; fill_n = 0; t_adjust = t; ppm = 0; }   /* nothing to steer */
         if (!sq && fill_n && t - t_adjust >= ADJUST_S) {
             /* Clocks, as CamillaDSP does it: the ring's fill averaged over 10 s, and a PI regulator on its distance to
@@ -3194,8 +3343,18 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             shift_set(100000 + lround(ppm / 11.0));
         }
         if (log_n && t - t_log >= 60.0) {
-            char lat_said[48] = "";
+            char lat_said[300] = "";
             if (st_lat_ms >= 0) snprintf(lat_said, sizeof lat_said, "; input to output %.0f ms", st_lat_ms);
+            /* (22/10, the FOCALE voie at −267 ppm from Roon, unsaid) an audiolaz receiver's pace: its DAC's clock against
+             * this machine's (its reports), the ring's pull on it (the two together: the pace a card's app follows) */
+            {
+                double dp, pp, rg, tg, an;
+                if (OUT == OUT_NET && !netout_link_pace(&dp, &pp, &rg, &tg, &an)) {
+                    const size_t ll = strlen(lat_said);
+                    snprintf(lat_said + ll, sizeof lat_said - ll, "; Link: its DAC %+.0f ppm against this machine's clock, its ring %.0f ms (kept at %.0f, asked %.0f) pulling %+.0f ppm: sent at %+.0f ppm",
+                             dp, rg, an, tg, pp, dp + pp);
+                }
+            }
             logf_("clock: ring %.0f ms on average (%.0f–%.0f, target %.0f), DAC buffer %.0f ms, Roon slowed %.1f ppm (steady %.1f), %ld DAC stops, %ld silences, %ld Loopback overruns; longest wait %.0f ms%s",
                   log_sum / log_n * ms, log_low * ms, log_high * ms, ring_target * ms, (double)atomic_load(&W.fill) * ms, ppm, steady,
                   atomic_load(&W.underruns), atomic_load(&W.silences), xruns_in, wait_max * 1000, lat_said);
@@ -3222,6 +3381,18 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             silences_logged = silences_now;
             logf_("silence: the ring ran dry (%ld this play): the source did not deliver in time; ring now %.0f ms (target %.0f), DAC buffer %.0f ms, Roon slowed %.1f ppm (steady %.1f), %ld Loopback overruns",
                   silences_now, (double)ring_fill(&q) * ms, ring_target * ms, (double)atomic_load(&W.fill) * ms, ppm, steady, xruns_in);
+        }
+
+        {
+            const long dm = atomic_exchange(&W.dry_ms, 0);
+            if (dm > 0) {
+                if (dry_hold * 1000 >= 0.5 * dm)
+                    logf_("network: nothing to send for %ld ms (the receiver played on from the %ld ms it held): this player held up, its longest turn %.0f ms (its convolution, or a call that waited)", dm, atomic_load(&W.dry_held_ms), dry_hold * 1000);
+                else
+                    logf_("network: nothing to send for %ld ms (the receiver played on from the %ld ms it held): the source gave nothing in time (%s late), this player's longest turn %.0f ms", dm, atomic_load(&W.dry_held_ms),
+                          paced ? "its app, writing to the card," : "the source", dry_hold * 1000);
+                dry_hold = 0;
+            }
         }
     }
 
@@ -3415,6 +3586,7 @@ int main(int argc, char **argv) {
     char relay_nm[48];
     snprintf(relay_nm, sizeof relay_nm, "audiolaz-slim-%d", VOIE ? (int)parent_pid : (int)getpid());
     if (VOIE && NET_ON) { netout_relay_use(relay_nm); if (VOIE_SELF) netout_set_self(VOIE_SELF); }
+    netout_state_dir(ROOMS);                            /* the Link receivers' last addresses, by their ids */
     if (NET_ON && !netout_init(NET_PORT, SLIM_PORT)) page_slim_port = SLIM_PORT;   /* the network outputs */
     if (!VOIE && NET_ON && SLIM_PORT > 0 && netout_relay_serve(relay_nm)) logf_("voies: the Squeezebox players and AirPlay devices not lent (%s)", strerror(errno));
     if (SQ_SERVER && sq_start(SQ_SERVER, SQ_NAME)) logf_("the Squeezebox input could not start");
@@ -3422,8 +3594,23 @@ int main(int argc, char **argv) {
     if (PAGE_PORT && page_start(PAGE_PORT, ROOMS, OUT_LABEL ? OUT_LABEL : DAC)) logf_("page: port %d refused", PAGE_PORT);
     else if (PAGE_PORT) logf_("page: http://<this machine>:%d", PAGE_PORT);
     lat_load();                                        /* the latencies known before this start */
+    {
+
+        const int e = rt_limit_install(VOIE || !DIRECT_OUT);
+        if (e) logf_("real time: RLIMIT_RTTIME not set (%s): no limit of our own", strerror(e));
+#ifdef __linux__
+        else if (!VOIE) {
+            char b[32] = ""; FILE *f = fopen("/proc/sys/kernel/sched_rt_runtime_us", "r");
+            if (f) { if (!fgets(b, sizeof b, f)) b[0] = 0; fclose(f); }
+            logf_("real time: each thread of ours at most %d ms without blocking (RLIMIT_RTTIME: dropped to normal priority beyond)%s",
+                  RT_LIMIT_US / 1000, atol(b) < 0 ? "; the kernel's own throttling is off here (sched_rt_runtime_us -1)" : "");
+        }
+        if (!VOIE) rt_watch_start();                   /* who held the cores, said after a wake late by seconds */
+#endif
+    }
     if (!VOIE) voies_start(argc, argv);
     while (!quit) {
+        rt_xcpu_tick();                                /* */
         read_control(&c, &seen);
         static double sq_wait = 0;                     /* since when Roon's stream is awaited */
         if (SQ_SERVER && sq_state() == SQ_PLAYING) {

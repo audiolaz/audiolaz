@@ -43,7 +43,11 @@ enum { ANET_R_ACCEPTED = 1, ANET_R_REFUSED = 2, ANET_R_PLAYING = 4, ANET_R_DRAIN
        ANET_R_STOPPED = 128 };      /* the receiver ends the stream itself (the reason in the report) */
 enum { ANET_CAP_STAMP = 1, ANET_CAP_ADAPT = 2, ANET_CAP_STATE = 4, ANET_CAP_P3 = 7,
        ANET_CAP_WHO = 8,            /* one DAC, one player: its HELLO follows the header */
-       ANET_CAP_ALL = 15 };
+       ANET_CAP_ALL = 15,
+       ANET_CAP_RATES = 16 };       /* the sender converts rates itself (its corrector's converter): a rate the DAC
+                                     * does not take as it is refused (ANET_E_RATE), never resampled at the receiver.
+                                     * Offered apart (anet_convert); an older receiver leaves it aside (it resamples, as
+                                     * before), and says no rates= (the sender then converts nothing) */
 /* the player's state (ANET_M_PING), the receiver's (its reports) */
 enum { ANET_SS_STARTING = 1, ANET_SS_PLAYING = 2, ANET_SS_PAUSED = 3, ANET_SS_ENDING = 4, ANET_SS_LIVE = 0x100 };   /* LIVE: or'ed, a live source */
 enum { ANET_RS_IDLE = 0, ANET_RS_FILLING = 1, ANET_RS_PLAYING = 2, ANET_RS_PAUSED = 3, ANET_RS_DRAINING = 4, ANET_RS_DRAINED = 5,
@@ -51,7 +55,8 @@ enum { ANET_RS_IDLE = 0, ANET_RS_FILLING = 1, ANET_RS_PLAYING = 2, ANET_RS_PAUSE
 /* why a stream stops, either side */
 enum { ANET_WHY_NONE = 0, ANET_WHY_END = 1, ANET_WHY_USER = 2, ANET_WHY_RATE = 3, ANET_WHY_SETTINGS = 4, ANET_WHY_SOURCE = 5,
        ANET_WHY_LOST = 6, ANET_WHY_TAKEN = 7, ANET_WHY_DAC = 8, ANET_WHY_QUIT = 9, ANET_WHY_PAUSE = 10, ANET_WHY_OUTPUT = 11,
-       ANET_WHY_CLOSED = 12, ANET_WHY_AGAIN = 13, ANET_WHY_BACKOFF = 14, ANET_WHY_N = 15 };
+       ANET_WHY_CLOSED = 12, ANET_WHY_AGAIN = 13, ANET_WHY_BACKOFF = 14, ANET_WHY_DAC_START = 15, ANET_WHY_N = 16 };
+
 /* ANET_WHY_BACKOFF: the receiver's guard stopped the stream to keep its machine up (audiolaz-recv.c: a thread
  * of its own looping, or stuck, or the cores starved); the reason at length in the receiver's journal */
 static inline const char *anet_why_text(unsigned w) {
@@ -59,7 +64,7 @@ static inline const char *anet_why_text(unsigned w) {
         "another rate next", "the settings changed", "the source stopped or changed", "the other side silent",
         "taken by another sender", "the DAC failed or refused", "the program ends", "paused too long: let go",
         "another output chosen", "the connection closed without a word", "the same player again",
-        "the receiver backed off: its machine first" };
+        "the receiver backed off: its machine first", "the DAC refuses to start: unplug it and plug it in again" };
     return w < ANET_WHY_N ? T[w] : "an unknown reason";
 }
 static inline const char *anet_rs_text(unsigned s) {
@@ -67,11 +72,13 @@ static inline const char *anet_rs_text(unsigned s) {
     return s < sizeof T / sizeof T[0] ? T[s] : "?";
 }
 enum { ANET_E_NONE = 0, ANET_E_HEADER = 1, ANET_E_RATE = 2, ANET_E_DAC = 3, ANET_E_TAKEN = 4,
-       ANET_E_BUSY = 5 };           /* another player plays (its name after the report: ANET_BMAGIC) */
+       ANET_E_BUSY = 5,             /* another player plays (its name after the report: ANET_BMAGIC) */
+       ANET_E_DAC_START = 6 };      /* its DAC refuses to start (ANET_WHY_DAC_START), a while */
 
 typedef struct { uint32_t id, rate, pkt_frames, pkt_us, caps; uint16_t ch, fmt; } anet_hdr;
 typedef struct { uint32_t id, flags, dac_rate, ring, reason; uint64_t played, received;
-                 uint32_t target, late_us, peak_us, underruns, adjusts, ring_min, ring_max, state, why, seq; int v3; } anet_rep;
+                 uint32_t target, late_us, peak_us, underruns, adjusts, ring_min, ring_max, state, why, seq; int v3;
+                 uint32_t after_us; } anet_rep;   /* heard after `played`, beyond the receiver's DAC (protocol 3) */
 
 static inline void anet_p32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 static inline uint32_t anet_g32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -150,7 +157,7 @@ static inline size_t anet_rep_pack(uint8_t *b, const anet_rep *r) {
     if (!r->v3) return ANET_REP;
     anet_p32(b + 40, r->target); anet_p32(b + 44, r->late_us); anet_p32(b + 48, r->peak_us); anet_p32(b + 52, r->underruns);
     anet_p32(b + 56, r->adjusts); anet_p32(b + 60, r->ring_min); anet_p32(b + 64, r->ring_max);
-    anet_p32(b + 68, (r->state & 0xFFFFu) | (r->why & 0xFFFFu) << 16); anet_p32(b + 72, r->seq); anet_p32(b + 76, 0);
+    anet_p32(b + 68, (r->state & 0xFFFFu) | (r->why & 0xFFFFu) << 16); anet_p32(b + 72, r->seq); anet_p32(b + 76, r->after_us);
     return ANET_REP3;
 }
 /* The report's length from its magic (its first 4 bytes): ANET_REP, ANET_REP3, or 0 (not a report) */
@@ -165,13 +172,14 @@ static inline int anet_rep_parse(const uint8_t *b, anet_rep *r) {
         r->v3 = 1; r->target = anet_g32(b + 40); r->late_us = anet_g32(b + 44); r->peak_us = anet_g32(b + 48); r->underruns = anet_g32(b + 52);
         r->adjusts = anet_g32(b + 56); r->ring_min = anet_g32(b + 60); r->ring_max = anet_g32(b + 64);
         const uint32_t sw = anet_g32(b + 68); r->state = sw & 0xFFFFu; r->why = sw >> 16; r->seq = anet_g32(b + 72);
+        r->after_us = anet_g32(b + 76);                /* 0 from every receiver before */
     }
     return 0;
 }
 
 /* ── mDNS (anet_mdns.c) ── */
 
-typedef struct { char id[64], dac[96], addr[48], hw[96]; int port; unsigned max_rate; double seen; } anet_peer;
+typedef struct { char id[64], dac[96], addr[48], hw[96]; int port; unsigned max_rate; double seen; char rates[96], err[24], room[80]; } anet_peer;
 /* Receiver: answer for this service until the process ends (a thread). */
 int anet_mdns_publish(const char *id, const char *dac, int port, unsigned max_rate);
 
@@ -198,9 +206,27 @@ int anet_busy(char *by, size_t len);
 void anet_live(int on);
 void anet_fifo_ms(int ms);              /* the queue (ms; 0: ANET_FIFO_MS) */
 void anet_caps(unsigned caps);
+/* ANET_CAP_RATES offered from the next anet_open (the corrector converts: netout.c), 0 not (default) */
+void anet_convert(int on);
+/* after an anet_open refused: the receiver's reason (ANET_E_*), 0 none (not reached, no answer) */
+unsigned anet_refused(void);
+
+static inline int anet_rate_in(const char *rates, unsigned rate) {
+    if (!rates || !rates[0]) return -1;
+    for (const char *p = rates; *p;) {
+        unsigned long v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (unsigned long)(*p++ - '0');
+        if (v == rate) return 1;
+        while (*p && (*p < '0' || *p > '9')) p++;
+    }
+    return 0;
+}
 /* the packets' thread's priority from the next anet_open: Linux, SCHED_FIFO at prio (0: normal); macOS, any
  * prio > 0 a Mach time constraint on the packets' period (rt_thread.h), 0 normal. Default 60. */
 void anet_rt(int prio);
+/* the source read at our pace (a card whose app follows its clock: the voie's): the ring's pull up to
+ * ±1000 ppm (±300 otherwise: a source with a clock of its own) */
+void anet_paced(int on);
 /* The stream now (protocol 3 or not): 0 when none. ms: the receiver's ring (nominal: what was sent less what its DAC
  * read), the target it asks for, the anchor held, all held unheard (queue, network, ring, DAC: the output's latency);
  * the jitter it measures (last second, peak remembered); the silence put in / left out (ms, live sources). */
@@ -211,6 +237,10 @@ typedef struct {
     unsigned long underruns, adjusts;
     unsigned long tx_late; double tx_late_ms;   /* this stream: the sender's own delays over 50 ms, the worst (ms) */
     char last_stop[200]; double last_stop_age;   /* the last stream's stop to this receiver, said (who, why), its age (s; <0 none) */
+    double after_ms;                    /* heard after the receiver's DAC (its report's after; in held_ms too) */
+    /* the pace: the DAC's clock against ours as its reports say (ppm), the ring's pull on it now (ppm: + faster);
+     * live: zeros left out above the receiver's target, put in below the anchor, this stream (ms) */
+    double dac_ppm, pull_ppm, over_ms, back_ms;
 } anet_state;
 /* hostport: the receiver (as anet_open had it, "host:port"); NULL: the stream now. 0, or −1 when nothing known. */
 int anet_get_state(const char *hostport, anet_state *s);
@@ -222,6 +252,9 @@ long anet_write(const int32_t *lr, long frames);   /* frames taken; 0 full (wait
 void anet_wait(int ms);
 uint64_t anet_sent(void);
 long anet_held(void);
+/* the frames in the queue alone, not sent yet (the Mac's uplink keeps what it holds of the driver's music, the
+ * queue counted, at its target: audiolaz-uplink.c) */
+long anet_queued(void);
 int anet_started(void);
 int anet_was_full(void);
 int anet_active(void);
@@ -229,6 +262,15 @@ void anet_pause(int on);
 void anet_end(void);
 void anet_close(int finish);
 const char *anet_why(void);
+/* the stream lost within s seconds of its opening (its receiver's reason in *rwhy, ANET_WHY_*): 1 */
+int anet_lost_early(double s, unsigned *rwhy);
 /* INFO (no stream): the receiver at host:port, its id, DAC name and highest rate: 0, or −1 (not there, ms at most). */
 int anet_info(const char *host, int port, anet_peer *p, int ms);
+
+#define ANET_IQ_UPLINK 0x55500000u
+#define ANET_IQ_MASK 0xFFF00000u
+#define ANET_IQ_DEFAULT 1u
+#define ANET_IQ_DEVICE 2u
+int anet_info_as(const char *host, int port, anet_peer *p, int ms, unsigned as);
+int anet_errno(void);
 #endif

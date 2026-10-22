@@ -119,6 +119,19 @@ void netout_np_cover(int src, const void *img, size_t len);
 void netout_np_clear(int src);
 void netout_np_source(int src);
 void netout_np_flash(const char *title, const char *sub);
+
+void netout_np_idle(const char *title, const char *sub);
+void netout_np_tick(void);
+/* an audiolaz receiver whose DAC does not take the stream's rate as it is: the rate it is sent at, converted
+ * here (netout.c, azsrc.h); 0 none (the stream as it is, or another kind of output) */
+unsigned netout_link_rate(void);
+/* the tests': 0, never converted, never offered (a sender before 21/10); 1 the default */
+void netout_link_convert(int on);
+/* the audiolaz receiver spec names: its DAC refuses to start (its INFO said it, it refused a stream for it, or
+ * it stopped one for it), until a stream to it opens again: 1 */
+int netout_dac_start(const char *spec);
+/* where the receivers' last addresses are kept by their ids (<dir>/link-known: roomd's rooms folder) */
+void netout_state_dir(const char *dir);
 void netout_np_cli_port(int port);
 int netout_np_http(int c, const char *req, size_t n, const char *method, const char *path, const char *q);
 /* The sender's volume on the device : the AirPlay input to a network output with a volume of its own.
@@ -146,6 +159,14 @@ void netout_dev_volume_said(char *out, size_t len);
 enum { NETOUT_WHY_END = 1, NETOUT_WHY_USER = 2, NETOUT_WHY_RATE = 3, NETOUT_WHY_SETTINGS = 4, NETOUT_WHY_SOURCE = 5,
        NETOUT_WHY_LOST = 6, NETOUT_WHY_QUIT = 9, NETOUT_WHY_PAUSE = 10, NETOUT_WHY_OUTPUT = 11 };   /* anet.h's ANET_WHY_* */
 void netout_live(int on);
+/* the source read at the output's pace (src_paced: a card, its app on the DAC's clock): an audiolaz receiver's
+ * ring pulled harder (anet_paced). netout_link_pace: the stream to an audiolaz receiver now, its pace said (the voie's
+ * clock line): its DAC's clock against ours and the ring's pull (ppm), the ring, its target and anchor (ms); 0, or −1
+ * none. */
+void netout_paced(int on);
+int netout_link_pace(double *dac_ppm, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms);
+/* the audiolaz receiver's underruns this stream (what it heard missing), 0 none or no such stream */
+long netout_link_gaps(void);
 void netout_fifo_ms(int ms);
 /* the audiolaz Link packets' thread's priority (anet_rt): Linux SCHED_FIFO level, macOS any > 0 a Mach time
  * constraint; 0 normal. Default 60. */

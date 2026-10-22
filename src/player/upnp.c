@@ -30,6 +30,7 @@
 #include "upnp.h"
 #include "netout.h"
 #include "version.h"
+#include "vol.h"
 
 #define UPNP_PORT 49494
 #define ANNOUNCE_S 120.0
@@ -869,6 +870,20 @@ static void avt(int c, const char *a, const char *body) {
     soap_reply(c, 0, a, s.b);
     free(s.b);
 }
+double page_vol_src(int src, double want, int mute, int fresh, int try_);   /* page.h's */
+static int vol_heard = 0;                     /* a SetVolume heard since the start: the next not the first */
+/* the player's own volume: Volume and Mute as its level (page.c's page's thread, after any source's word) */
+void upnp_vol_follow(double db, int mute) {
+    pthread_mutex_lock(&T.m);
+    int ch = 0;
+    if (db == db) {
+        const int x = vol_upnp_of_db(db);
+        if (x != T.vol) { T.vol = x; ch = 1; }
+        if ((mute != 0) != (T.mute != 0)) { T.mute = mute != 0; ch = 1; }
+    } else if (T.mute) { T.mute = 0; ch = 1; }        /* the option off: nothing left silent */
+    if (ch) { T.rc_ev = 1; pthread_cond_broadcast(&ev_cv); }
+    pthread_mutex_unlock(&T.m);
+}
 static void rcs(int c, const char *a, const char *body) {
     sbuf s = { 0 };
     char v[64];
@@ -878,10 +893,14 @@ static void rcs(int c, const char *a, const char *body) {
         arg_to(body, "DesiredVolume", v, sizeof v);
         int x = atoi(v);
         if (!v[0] || x < 0 || x > 100) { soap_error(c, 402, "Invalid Args"); return; }
+        const double lv = page_vol_src(VS_UPNP, vol_db_of_upnp(x), -1, !vol_heard, 0);   /* the player's own, when on */
+        vol_heard = 1;
+        if (lv == lv) x = vol_upnp_of_db(lv);
         pthread_mutex_lock(&T.m); T.vol = x; T.rc_ev = 1; pthread_cond_broadcast(&ev_cv); pthread_mutex_unlock(&T.m);
     } else if (!strcmp(a, "SetMute")) {
         arg_to(body, "DesiredMute", v, sizeof v);
         const int m = !strcmp(v, "1") || !strcasecmp(v, "true") || !strcasecmp(v, "yes");
+        page_vol_src(VS_UPNP, NAN, m, 0, 0);          /* the player's own, when on */
         pthread_mutex_lock(&T.m); if (T.mute != m) ulog("UPnP: %s", m ? "muted" : "unmuted"); T.mute = m; T.rc_ev = 1; pthread_cond_broadcast(&ev_cv); pthread_mutex_unlock(&T.m);
     } else if (!strcmp(a, "GetVolumeDB")) {
         pthread_mutex_lock(&T.m); sb_argi(&s, "CurrentVolume", T.vol <= 0 ? -20480 : lround(256 * 40 * log10(T.vol / 100.0))); pthread_mutex_unlock(&T.m);
@@ -891,6 +910,9 @@ static void rcs(int c, const char *a, const char *body) {
         int x = db <= -80 ? 0 : (int)lround(100 * pow(10, db / 40));
         if (x > 100) x = 100;
         if (x < 0) x = 0;
+        const double lv = page_vol_src(VS_UPNP, db <= -80 ? VOL_MIN_DB : db, -1, !vol_heard, 0);   /* */
+        vol_heard = 1;
+        if (lv == lv) x = vol_upnp_of_db(lv);
         pthread_mutex_lock(&T.m); T.vol = x; T.rc_ev = 1; pthread_cond_broadcast(&ev_cv); pthread_mutex_unlock(&T.m);
     } else if (!strcmp(a, "GetVolumeDBRange")) { sb_argi(&s, "MinValue", -20480); sb_argi(&s, "MaxValue", 0); }
     else if (!strcmp(a, "ListPresets")) sb_arg(&s, "CurrentPresetNameList", "FactoryDefaults");

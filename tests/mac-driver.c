@@ -4,6 +4,8 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -89,6 +91,12 @@ static void *writer(void *arg) {
     static float buf[8192 * 2];
     const double zero_after = getenv("AZ_ZERO_AFTER") ? atof(getenv("AZ_ZERO_AFTER")) : 0;   /* --write: silence from then (s) */
     const int cyc = getenv("AZ_CYCLE") ? atoi(getenv("AZ_CYCLE")) : 128;   /* the HAL's IO cycle (frames) */
+    if (getenv("AZ_RT")) {   /* in Mach real time, as the HAL's own IO thread (test/mac-link.sh: no stall of the stand-in) */
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const double ms = 1e6 * tb.denom / tb.numer;
+        thread_time_constraint_policy_data_t p = { (uint32_t)(1 * ms), (uint32_t)(0.3 * ms), (uint32_t)(1 * ms), 1 };
+        thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    }
     while (w_run) {
         Float64 zs; UInt64 zh, seed;
         (*drv)->GetZeroTimeStamp(drv, 2, 0, &zs, &zh, &seed);
@@ -247,9 +255,50 @@ int main(int argc, char **argv) {
     if (shm == MAP_FAILED) return 1;
     mach_timebase_info_data_t tb; mach_timebase_info(&tb); host_hz = 1e9 * tb.denom / tb.numer;
     if (wmode) {
-        cur_rate = 44100; (*drv)->StartIO(drv, 2, 0); w_run = 1;
+
+        cur_rate = getenv("AZ_RATE") ? (unsigned)atoi(getenv("AZ_RATE")) : 44100;
+        if (cur_rate != 44100) set_rate(cur_rate);
+        if (getenv("AZ_VOL_DB")) set_f32(4, kAudioLevelControlPropertyDecibelValue, (Float32)atof(getenv("AZ_VOL_DB")));
+        (*drv)->StartIO(drv, 2, 0); w_run = 1;
         pthread_t th; pthread_create(&th, NULL, writer, NULL);
-        nap(atof(argv[3])); w_run = 0; pthread_join(th, NULL); (*drv)->StopIO(drv, 2, 0);
+        const double secs = atof(argv[3]), t_w0 = now_s();
+        long long ppb_sum = 0, ppb_n = 0;
+        double g_n = 0, g_t = 0, g_l = 0, g_tt = 0, g_tl = 0;   /* the device's frames against the time, its second half */
+        while (now_s() - t_w0 < secs) {
+            nap(0.002);                                /* many samples: the device writes a whole IO cycle at a time */
+            const double x = now_s() - t_w0;
+            if (x > secs / 2) {
+                ppb_sum += atomic_load(&shm->ppb); ppb_n++;
+                const double y = (double)atomic_load(&shm->w) / cur_rate - x;
+                g_n++; g_t += x; g_l += y; g_tt += x * x; g_tl += x * y;
+            }
+        }
+        const double pace = g_n > 2 ? (g_n * g_tl - g_t * g_l) / (g_n * g_tt - g_t * g_t) * 1e6 : 0;
+        w_run = 0; pthread_join(th, NULL);
+        CFStringRef nm = NULL; char b[160] = "";
+        get(2, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, &nm, sizeof nm);
+        if (nm) { CFStringGetCString(nm, b, sizeof b, kCFStringEncodingUTF8); CFRelease(nm); }
+        UInt32 lat = 0;
+        get(2, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, &lat, sizeof lat);
+        printf("WRITE name=%s latency=%u ppb=%lld pace=%+.1f frames=%llu\n", b, (unsigned)lat, ppb_n ? ppb_sum / ppb_n : 0LL, pace, (unsigned long long)atomic_load(&shm->w));
+        fflush(stdout);
+        (*drv)->StopIO(drv, 2, 0);
+        /* AZ_SECOND=<gap s>:<rate>:<s>: a second play after a pause (the apps' IO stopped that long), at that
+         * rate: the uplink keeps its stream through a pause shorter than its linger, a new one at another rate */
+        if (getenv("AZ_SECOND")) {
+            double gap = 0, s2 = 0; unsigned r2 = 0;
+            if (sscanf(getenv("AZ_SECOND"), "%lf:%u:%lf", &gap, &r2, &s2) == 3 && r2 >= 8000) {
+                nap(gap);
+                if (r2 != cur_rate) { cur_rate = r2; set_rate(r2); }
+                (*drv)->StartIO(drv, 2, 0); w_run = 1;
+                pthread_t t2; pthread_create(&t2, NULL, writer, NULL);
+                nap(s2); w_run = 0; pthread_join(t2, NULL);
+                printf("SECOND rate=%u frames=%llu\n", r2, (unsigned long long)atomic_load(&shm->w));
+                fflush(stdout);
+                (*drv)->StopIO(drv, 2, 0);
+            }
+        }
+        if (getenv("AZ_AFTER_S")) nap(atof(getenv("AZ_AFTER_S")));   /* the uplink's linger, the driver still there */
         return 0;
     }
 
@@ -328,6 +377,11 @@ int main(int argc, char **argv) {
     check(str_is(kAudioObjectPropertyName, "DAC-01 (audiolaz)"), "a name given twice, « (audiolaz) » already there: « DAC-01 (audiolaz) »");
     plat_src_dac("Swiss Electronics Ltd DAC-01 DAC à deux", NULL, NULL, 0);
     check(str_is(kAudioObjectPropertyName, "Swiss Electronics (audiolaz)"), "a long name cut to 31 bytes at a word's end: « Swiss Electronics (audiolaz) »");
+
+    plat_src_dac("audiolaz \xe2\x86\x92 FOCALE", NULL, NULL, 0);
+    check(str_is(kAudioObjectPropertyName, "audiolaz \xe2\x86\x92 FOCALE"), "the uplink's room: « audiolaz → FOCALE », as it is");
+    plat_src_dac("audiolaz \xe2\x86\x92 Salle de musique du premier étage", NULL, NULL, 0);
+    check(str_is(kAudioObjectPropertyName, "audiolaz \xe2\x86\x92 Salle de musique"), "a long room cut to 31 bytes at a word's end");
     plat_src_dac("", NULL, NULL, 0);
     check(str_is(kAudioObjectPropertyName, "audiolaz"), "no DAC known: « audiolaz »");
     plat_src_dac("DAC-01", "Swiss Electronics Ltd", "DAC-01:245F:815", 1);

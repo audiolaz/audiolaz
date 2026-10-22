@@ -52,6 +52,8 @@ static np_t NP[NETOUT_NP_N];
 static const char *const NP_SRC[NETOUT_NP_N] = { "roon", "airplay", "spotify", "upnp" };
 static int np_act = -1;                            /* the source playing (netout_np_source), −1 none */
 static struct { int on, served; double t0; char title[NP_TXT], sub[NP_TXT]; } FL;
+
+static char NPI_t[NP_TXT], NPI_s[NP_TXT];
 static unsigned np_ser = 1;                        /* what is shown, numbered: the cover's URL (/cover/<n>.jpg) */
 static pthread_mutex_t nplk = PTHREAD_MUTEX_INITIALIZER;   /* NP, np_act, FL, np_ser, CV; taken after clk, never before it */
 static pthread_cond_t npcv = PTHREAD_COND_INITIALIZER;
@@ -103,6 +105,9 @@ static void np_view(np_view_t *v, int flash, int pic) {
         if (n->img && n->img_len) {
             if (pic && (v->img = malloc(n->img_len))) { memcpy(v->img, n->img, n->img_len); v->img_len = n->img_len; }
         } else { v->card = 1; snprintf(v->card_t, NP_TXT, "%s", v->title); snprintf(v->card_s, NP_TXT, "%s", n->artist); }
+    } else if (NPI_t[0]) {
+        snprintf(v->title, NP_TXT, "%s", NPI_t); snprintf(v->artist, NP_TXT, "%s", NPI_s);
+        v->card = 1; snprintf(v->card_t, NP_TXT, "%s", NPI_t); snprintf(v->card_s, NP_TXT, "%s", NPI_s);
     } else {
         snprintf(v->title, NP_TXT, "%s", me);
         v->card = 1; snprintf(v->card_t, NP_TXT, "%s", me);
@@ -442,6 +447,16 @@ void netout_np_flash(const char *title, const char *sub) {
     pthread_mutex_unlock(&nplk);
 }
 void netout_np_cli_port(int port) { np_cli = port; }
+
+void netout_np_idle(const char *title, const char *sub) {
+    np_start();
+    pthread_mutex_lock(&nplk);
+    char t[NP_TXT], u[NP_TXT];
+    np_cut(t, sizeof t, title ? title : ""); np_cut(u, sizeof u, sub ? sub : "");
+    if (strcmp(t, NPI_t) || strcmp(u, NPI_s)) { snprintf(NPI_t, sizeof NPI_t, "%s", t); snprintf(NPI_s, sizeof NPI_s, "%s", u); np_bump(); }
+    pthread_mutex_unlock(&nplk);
+}
+void netout_np_tick(void) { pthread_mutex_lock(&nplk); np_flash_tick(); pthread_mutex_unlock(&nplk); }
 
 /* ── The cover, served by the stream server: GET /cover/<n>.jpg (the bridge, a renderer) ─────────────────── */
 /* 1 when it was a cover's request (answered). The picture of what is shown now (a renderer's older number: the latest),

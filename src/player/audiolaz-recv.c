@@ -4,6 +4,7 @@
 #endif
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -16,15 +17,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include "anet.h"
 #include "alsa_hw.h"
+#include "audiolaz_drv.h"                  /* --dac shm: */
+#include "rt_thread.h"                     /* the packets' thread in Mach real time (macOS); rt_guard (both) */
+#include "rt_watch.h"                      /* who held the cores, said with a back-off for it (Linux) */
+#include "azgrow.h"                        /* the DAC's buffer sizing itself (the null DAC's here) */
 #ifndef ANET_NULL_ONLY
 #include "out.h"
 #define OUT_AGAIN_ OUT_AGAIN
@@ -37,8 +44,30 @@
 
 static double mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static double cputime(void) { struct timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static int o_log_time = 0;                /* --log-time: each line dated (a LaunchAgent's log file has no dates) */
 static void lg(const char *f, ...) {
+    if (o_log_time) { char tb[16]; const time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm); strftime(tb, sizeof tb, "%H:%M:%S ", &tm); fputs(tb, stderr); }
     va_list a; va_start(a, f); fprintf(stderr, "audiolaz-recv: "); vfprintf(stderr, f, a); va_end(a); fputc('\n', stderr); fflush(stderr);
+}
+/* What the DAC's thread has to say (a gap and its cause, its ring raised), never written by it (a write to the
+ * journal may wait on the disk: a gap of its own): a few lines kept, written by the notes' thread (notes_main). One
+ * writer (the DAC's thread), one reader. */
+#define NOTES 16
+static char notes[NOTES][240];
+static _Atomic unsigned notes_w, notes_r;
+static _Atomic unsigned long notes_lost;
+__attribute__((format(printf, 1, 2))) static void note(const char *f, ...) {
+    const unsigned w = atomic_load_explicit(&notes_w, memory_order_relaxed), r = atomic_load_explicit(&notes_r, memory_order_acquire);
+    if (w - r >= NOTES) { atomic_fetch_add(&notes_lost, 1); return; }
+    va_list a; va_start(a, f); vsnprintf(notes[w % NOTES], sizeof notes[0], f, a); va_end(a);
+    atomic_store_explicit(&notes_w, w + 1, memory_order_release);
+}
+static void notes_flush(void) {
+    unsigned r = atomic_load_explicit(&notes_r, memory_order_relaxed);
+    const unsigned w = atomic_load_explicit(&notes_w, memory_order_acquire);
+    for (; r != w; r++) { lg("%s", notes[r % NOTES]); atomic_store_explicit(&notes_r, r + 1, memory_order_release); }
+    const unsigned long lost = atomic_exchange(&notes_lost, 0);
+    if (lost) lg("(%lu more such lines not kept)", lost);
 }
 
 /* ── options ── */
@@ -48,10 +77,32 @@ static char o_hw[96] = "";               /* the DAC's identity (alsa_hw.h), said
 static int o_port = ANET_PORT, o_null = 0, o_mdns = 1, o_rt = -1, o_once = 0, o_period_us = 2500, o_periods = 4, o_ring_ms = ANET_RING_MS, o_cpu = -1, o_stats = 0;
 static int o_ring_max_ms = ANET_RING_MAX_MS, o_adapt = 1, o_v2 = 0, o_mem_s = 300;
 static int o_force = 0, o_lock_mb = 32;   /* o_rt / o_cpu −1: auto */
+static int o_ring_given = 0, o_periods_given = 0;   /* --ring-ms, --periods said: as said, at any rate */
+static int o_grow_ms = 500;               /* --grow-ms: the DAC's buffer (Linux, null) grows up to that (azgrow.h); 0 fixed */
 static double o_q = 0.999;
 static unsigned o_max = 0;
+#define MAC_RING_MS 200                   /* a Mac's DAC: the ring's start */
+#define HI_RATE 176400                    /* from here up, the rings start half as long again (the default's) */
 static double o_ppm = 0;
 static char dac_dev[128];
+static char o_rates[100] = "";            /* the rates the DAC takes as it is (INFO rates=; Linux: at the start) */
+
+static const char *o_status = NULL;
+static char o_room[96] = "";              /* --room: the room this receiver feeds (an uplink's), INFO room= */
+static struct { double seen_wall; char addr[48]; int defout, device, playing, streams; double last_wall; } UPS = { .defout = -1, .device = -1 };
+static void ups_write(void) {
+    if (!o_status) return;
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.new", o_status);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "seen=%.0f\naddr=%s\ndefault=%d\ndevice=%d\nplaying=%d\nstreams=%d\nlast=%.0f\n", UPS.seen_wall, UPS.addr, UPS.defout, UPS.device, UPS.playing, UPS.streams, UPS.last_wall);
+    if (fclose(f) || rename(tmp, o_status)) unlink(tmp);
+}
+/* (21/10, the Flex 8 DL refusing every start) its DAC refusing to start (out.h OUT_REF_START): streams refused until
+ * then (ANET_E_DAC_START, INFO err=dac-start), sooner once the device is seen again as a new one (replugged) */
+static double stuck_until = 0; __attribute__((unused)) static unsigned long stuck_serial = 0; __attribute__((unused)) static int stuck_n = 0;
+__attribute__((unused)) static const double STUCK_S[] = { 5, 10, 20, 30, 60 };
 
 /* ── histograms (--stats): cheap counters in the path, printed after ── */
 #define HB 40
@@ -65,7 +116,7 @@ static double h_pct(const hist *h, double p, double step) {
 static hist H_pkt, H_wake, H_work;
 static double step_pkt = 50, step_wake = 100, step_work = 5;
 
-/* ── the device: the DAC (out_alsa.c) or the null clock ── */
+/* ── the device: the DAC (out_alsa.c; out_coreaudio.c on macOS), the null clock, or another player's input ── */
 static struct {
     int open; unsigned rate;
     unsigned long buffer, period;
@@ -74,22 +125,137 @@ static struct {
 #endif
     double t0; uint64_t eaten0, written;
     FILE *dump;
+    az_shm *m;                             /* --dac shm: its ring (below) */
+    uint64_t w, clk, t_open;               /* the next frame written there (its sample time); the host clock's place
+                                            * while it stands in (ns); the stream's start there (ns, CLOCK_MONOTONIC) */
+    int seen;                              /* the reader came this stream (its beat since t_open) */
+    azgrow g; long low; double t_look; unsigned long buf0;   /* the null DAC's buffer sizing itself (as out_alsa.c) */
 } D;
+
+static char o_shm[64] = "";
+static uint64_t ns_mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+/* the object made or opened, mapped; a ring of another kind (or none) made ours, its volume kept; 0 or −1 (errno) */
+static int shm_map(void) {
+    if (D.m) return 0;
+    const mode_t um = umask(0);
+    const int fd = shm_open(o_shm, O_RDWR | O_CREAT, 0666);
+    umask(um);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) || (st.st_size < (off_t)sizeof(az_shm) && ftruncate(fd, sizeof(az_shm)))) { const int e = errno; close(fd); errno = e; return -1; }
+    void *p = mmap(NULL, sizeof(az_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return -1;
+    az_shm *m = p;
+    if (m->magic != AZ_MAGIC) { m->ch = AZ_CH; m->ring = AZ_RING; m->magic = AZ_MAGIC; }
+    atomic_store(&m->running, 0);
+    atomic_store(&m->fmt, AZ_S32);
+    atomic_store(&m->lx, 2);
+    D.m = m;
+    return 0;
+}
+static int shm_open_stream(unsigned rate, unsigned long per) {
+    if (shm_map()) { lg("%s: %s", o_shm, strerror(errno)); return -1; }
+    az_shm *m = D.m;
+    atomic_store(&m->running, 0);
+    D.w = atomic_load(&m->w);                          /* the ring's sample times go on from stream to stream */
+    atomic_store(&m->rd, D.w);
+    atomic_store(&m->fmt, AZ_S32);
+    atomic_store(&m->lx, 2);
+    atomic_store(&m->rate, rate);
+    atomic_fetch_add(&m->gen, 1);                      /* the reader: a new stream (src.h SRC_ENDED, nothing lost) */
+    D.t_open = D.clk = ns_mono();
+    atomic_store(&m->t0, D.t_open);                    /* CLOCK_MONOTONIC (lx 2): compared with the card's start */
+    atomic_store(&m->running, 1);
+    D.rate = rate; D.period = per; D.buffer = per * (unsigned)o_periods; D.written = 0; D.seen = 0; D.open = 1;
+    if (o_dump && !D.dump) D.dump = fopen(o_dump, "ab");
+    lg("%s open at %u Hz (another player's input, at its pace), period %lu, buffer %lu frames", o_shm, rate, D.period, D.buffer);
+    return 0;
+}
+static _Atomic uint64_t rw, rr;            /* (below: the ring's) */
+static _Atomic uint32_t j_goal;
+/* the room in it now: the reader's rd while it beats, else held (a stream's start) or the host clock in its place */
+static long shm_avail(void) {
+    az_shm *m = D.m;
+    const uint64_t now = ns_mono(), beat = atomic_load(&m->beat);
+    uint64_t rd = atomic_load(&m->rd);
+    if (beat && now >= beat && now - beat < AZ_BEAT_LX_NS) { if (beat >= D.t_open) D.seen = 1; D.clk = now; }
+    else if (atomic_load(&m->hold_ns) > now) D.clk = now;   /* held: the reader's output opening */
+    else {                                             /* nobody reading: the host clock stands in (a silent sink) */
+        uint64_t f = (now - D.clk) * D.rate / 1000000000ull;
+        /* the reader never came this stream (the hold over): what the hold kept let go too, the ring back at its
+         * target (else that much more latency for the stream's life, a live source's ring shrinking only in its
+         * silences); a reader that came and stalls: the host clock alone, the ring as it is */
+        if (!D.seen) {
+            const uint64_t ring = atomic_load(&rw) - atomic_load(&rr), goal = atomic_load(&j_goal);
+            if (ring > goal + D.buffer) { const uint64_t x = ring - goal; f += x; D.clk -= x * 1000000000ull / D.rate; }
+        }
+        if (f) {
+            rd += f; D.clk += f * 1000000000ull / D.rate;
+            if (rd >= D.w) { rd = D.w; D.clk = now; }
+            atomic_store(&m->rd, rd);
+        }
+    }
+    if (rd > D.w) rd = D.w;
+    const uint64_t held = D.w - rd;
+    return held >= D.buffer ? 0 : (long)(D.buffer - held);
+}
+static long shm_write(const int32_t *p, unsigned long n, int data) {
+    if (!data) return 0;                               /* never silence of its own (above) */
+    az_shm *m = D.m;
+    for (unsigned long i = 0; i < n; i++) memcpy(m->data + AZ_CH * ((D.w + i) & (AZ_RING - 1)), p + 2 * i, 8);   /* AZ_S32: the words as they came */
+    atomic_store_explicit(&m->w, D.w + n, memory_order_release);
+    D.w += n; D.written += n;
+    if (D.dump) fwrite(p, 8, n, D.dump);
+    return (long)n;
+}
+static long shm_delay(void) { const uint64_t rd = atomic_load(&D.m->rd); return rd < D.w ? (long)(D.w - rd) : 0; }
+static void shm_close(void) { if (D.m) atomic_store(&D.m->running, 0); }
+/* the reader's latency for the reports (µs), 0 for a DAC */
+static uint32_t dev_after_us(void) { return o_shm[0] && D.m ? atomic_load(&D.m->lat_us) : 0; }
+/* the sender's volume (META volume_cdb=), for the reader; a DAC beside us takes none (bit for bit): said only */
+static void dev_volume(long cdb, unsigned id) {
+    const uint32_t c = cdb <= 0 ? 0 : cdb >= (long)AZ_VOL_FLOOR_CDB ? AZ_VOL_FLOOR_CDB : (uint32_t)cdb;
+    static uint32_t last = UINT32_MAX;
+    const int shm = o_shm[0] && !shm_map();
+    const uint32_t was = shm ? atomic_exchange(&D.m->vol_cdb, c) : last;
+    last = c;
+    static double t_said = -1e9; static unsigned id_said = 0;
+    if (was != c && (id != id_said || mono() - t_said > 5)) {
+        t_said = mono(); id_said = id;
+        if (c >= AZ_VOL_FLOOR_CDB) lg("stream %u: the sender's volume at its bottom: silent%s", id, shm ? "" : " (said only: a DAC here takes none)");
+        else lg("stream %u: the sender's volume %.1f dB, %s", id, -(double)c / 100.0, shm ? "applied by the reader" : "said only (a DAC here takes none)");
+    }
+}
+
 static int dev_open(unsigned rate) {
     unsigned long per = (unsigned long)((uint64_t)rate * (unsigned)o_period_us / 1000000);
     if (per < 16) per = 16;
+    /* from 176.4 kHz up, the DAC's buffer half as long again (unless --periods said) */
+    const unsigned np = !o_periods_given && rate >= HI_RATE ? (unsigned)o_periods * 3 / 2 : (unsigned)o_periods;
     if (o_null) {
-        D.rate = rate; D.period = per; D.buffer = per * (unsigned)o_periods; D.t0 = 0; D.eaten0 = 0; D.written = 0; D.open = 1;
+        D.rate = rate; D.period = per; D.buffer = per * np; D.t0 = 0; D.eaten0 = 0; D.written = 0; D.open = 1;
+        /* as a Linux DAC's (out_alsa.c --grow-ms): its level from what was asked, growing at the first sign */
+        D.buf0 = D.buffer; D.low = -1; D.t_look = 0;
+        azg_init(&D.g, (double)D.buffer, o_grow_ms > 0 ? (double)rate * o_grow_ms / 1000.0 : (double)D.buffer, rate, mono());
         if (o_dump && !D.dump) D.dump = fopen(o_dump, "ab");
         return 0;
     }
+    if (o_shm[0]) return shm_open_stream(rate, per);
 #ifndef ANET_NULL_ONLY
 
-    for (int i = 0; i < 50 && !(D.o = out_open(dac_dev, OUTF_S32, rate, per, (unsigned)o_periods, i < 49)); i++) usleep(50000);
+    for (int i = 0; i < 50 && !(D.o = out_open(dac_dev, OUTF_S32, rate, per, np, i < 49)); i++) {
+        if (out_last_refusal() == OUT_REF_RATE) return -2;
+        usleep(50000);
+    }
     if (!D.o) return -1;
     out_params(D.o, &D.buffer, &D.period);
     D.rate = rate; D.open = 1;
     lg("%s open at %u Hz, S32_LE, period %lu, buffer %lu frames", dac_dev, rate, D.period, D.buffer);
+#ifdef __APPLE__
+    /* a rate the device lists and will not go to (the miniDSP Flex 8 DL, 10/10): played at one it takes */
+    if (out_device_rate(D.o)) lg("%s refuses %u Hz: it plays at %u Hz, resampled by Core Audio's converter (not bit for bit)", out_device_name(D.o), rate, out_device_rate(D.o));
+#endif
     return 0;
 #else
     return -1;
@@ -99,15 +265,17 @@ static void dev_close(void) {
     if (!D.open) return;
     D.open = 0;
     if (D.dump) fflush(D.dump);
+    if (o_shm[0]) { shm_close(); return; }
 #ifndef ANET_NULL_ONLY
     if (!o_null) { out_close(D.o); D.o = NULL; }   /* snd_pcm_drop, then close: the DAC given back at once */
 #endif
 }
-static _Atomic unsigned long null_xruns;
+static _Atomic unsigned long null_xruns, null_xr_new;   /* _new: since the DAC's thread last counted them as gaps */
 static double test_xrun_s = 0;   /* AUDIOLAZ_RECV_TEST_XRUN=<s>: the null DAC's buffer run dry every s seconds */
 static uint64_t null_eaten(double t) { return D.t0 == 0 ? D.eaten0 : D.eaten0 + (uint64_t)((t - D.t0) * D.rate * (1.0 + o_ppm * 1e-6)); }
 static long dev_delay(void) {
     if (o_null) { const uint64_t e = null_eaten(mono()); return e >= D.written ? 0 : (long)(D.written - e); }
+    if (o_shm[0]) return shm_delay();
 #ifndef ANET_NULL_ONLY
     long d = 0; if (out_delay(D.o, &d)) return -1; return d;
 #else
@@ -118,9 +286,20 @@ static long dev_avail(void) {
     if (o_null) {
         const double t = mono();
         uint64_t e = null_eaten(t);
-        if (D.t0 > 0 && e > D.written) { D.eaten0 = D.written; D.t0 = t; e = D.written; atomic_fetch_add(&null_xruns, 1); }   /* the clock not fed in time (our thread late): an underrun */
+        if (D.t0 > 0 && e > D.written) { D.eaten0 = D.written; D.t0 = t; e = D.written; atomic_fetch_add(&null_xruns, 1); atomic_fetch_add(&null_xr_new, 1); }   /* the clock not fed in time (our thread late): an underrun */
+        if (D.t0 > 0 && o_grow_ms > 0) {                   /* its level (azgrow.h), as a Linux DAC's */
+            const long fill = (long)(D.written - e);
+            if (D.low < 0 || fill < D.low) D.low = fill;
+            if (t - D.t_look >= 0.02) {
+                D.t_look = t;
+                char why[200];
+                if (azg_look(&D.g, (double)D.low, 0, t, why, sizeof why)) { D.buffer = (unsigned long)D.g.size; note("the DAC's buffer %s", why); }
+                D.low = -1;
+            }
+        }
         return (long)D.buffer - (long)(D.written - e);
     }
+    if (o_shm[0]) return shm_avail();
 #ifndef ANET_NULL_ONLY
     return out_avail(D.o);
 #else
@@ -140,6 +319,7 @@ static long dev_write(const int32_t *p, unsigned long n, int data) {
         D.written += n;
         return (long)n;
     }
+    if (o_shm[0]) return shm_write(p, n, data);
 #ifndef ANET_NULL_ONLY
     (void)data;
     return out_write(D.o, p, n);
@@ -153,6 +333,7 @@ static void dev_wait(void) {   /* until a period's room */
         if (a < (long)D.period) { const double s = (double)((long)D.period - a) / D.rate; usleep((useconds_t)(s * 1e6) + 1); }
         return;
     }
+    if (o_shm[0]) { usleep((useconds_t)(o_period_us / 4 + 1)); return; }   /* the reader says nothing: looked at again */
 #ifndef ANET_NULL_ONLY
     out_wait(D.o, o_period_us / 250 + 20);
 #endif
@@ -167,7 +348,7 @@ static int dev_recover(long e) {
     const double t = mono();
     if (t - t0 > XR_S) { t0 = t; n = 0; }
     if (++n > XR_MAX) return -1;
-    if (o_null) return 0;
+    if (o_null || o_shm[0]) return 0;
 #ifndef ANET_NULL_ONLY
     return out_recover(D.o, e);
 #else
@@ -181,6 +362,8 @@ static uint64_t ring_mask;
 static _Atomic uint64_t rw, rr;            /* frames come (the highest index + frames), frames read */
 static _Atomic unsigned long lost_frames, late_pkts;
 static _Atomic double t_last_pkt;          /* the last packet of the stream taken (the player's sign of life too) */
+static _Atomic uint32_t pkt_gap_us;        /* the longest time between two packets since the DAC's thread last looked */
+static _Atomic uint32_t pkt_late_us;       /* the latest packet's lateness at its most since then (µs: its stamp's) */
 
 /* ── protocol 3: the jitter, measured by the packets' thread, the target from it ──────────────────────────
  * Each packet's one-way delay (its arrival less the time the player stamped it, µs modulo 2^32: an offset between the
@@ -197,13 +380,25 @@ static struct {
     unsigned long bins[JBINS], n;
     float mem[JM]; double mem_t[JM]; int mn, mh;   /* the seconds' quantiles (ms), a ring of them */
     float late_ms;                         /* the last second's */
+    int32_t sk_min, sk_m0; double sk_t, sk_t0;   /* the sender's clock (j_skew_ppm) */
 } J;
+static _Atomic double j_skew_ppm;          /* the sender's clock against ours (ppm, + faster), 0 not known yet */
 static char j_from[48];                    /* the player the memory is of: its id, else its address */
 static _Atomic uint32_t j_late_us, j_peak_us, j_goal;   /* the last second's, the remembered peak (µs); the target (frames) */
 static _Atomic unsigned long j_adjusts;
 static _Atomic int j_live = 1;             /* the player's source live (its pings say it): the narrow margin */
+
+#define J_LOW 0.3
+#define J_UP 1.5
+#define J_STEP_MS 20.0
+#define J_BOOST_S 10.0
+static double j_start_ms = ANET_RING_MS;
+static _Atomic uint32_t j_boost, j_dev_extra;
+static _Atomic double j_t_sign;
+static double j_t_down;
 static void j_reset_stream(void) {
     J.on = 0; J.base = 0; J.wi = 0; J.t_sec = 0; J.cur_min = INT32_MAX; J.n = 0;
+    J.sk_min = INT32_MAX; J.sk_t = 0; J.sk_t0 = 0; J.sk_m0 = 0; atomic_store(&j_skew_ppm, 0);
     for (int i = 0; i < JW; i++) J.win_min[i] = INT32_MAX;
     memset(J.bins, 0, sizeof J.bins);
 }
@@ -214,14 +409,27 @@ static double j_peak_ms(double now) {      /* the largest second's quantile stil
 }
 /* the target from the peak (frames): 1.25 × + 15 ms, between the start and the ceiling; up at once, down with hysteresis */
 static void j_target(unsigned rate, double now) {
-    const double pk = j_peak_ms(now);
+    const double pk = j_peak_ms(now), ms = 1000.0 / (rate ? rate : 1);
     double want = atomic_load(&j_live) ? pk * 1.25 + 15.0 : pk * 2.0 + 30.0;   /* music read ahead: its latency costs nothing */
     if (pk <= 0) want = 0;
-    if (want < o_ring_ms) want = o_ring_ms;
+    if (want < j_start_ms) want = j_start_ms;
+    const double calm = 2.0 * o_mem_s, step = o_mem_s / 10.0;
+    if (now - atomic_load(&j_t_sign) >= calm) atomic_store(&j_boost, 0);   /* long calm: the raise let go (down slowly, below) */
+    const double boost = atomic_load(&j_boost) * ms;
+    if (want < boost) want = boost;
+    want += atomic_load(&j_dev_extra) * ms;                             /* the DAC's buffer grown: taken from here */
     if (want > o_ring_max_ms) want = o_ring_max_ms;
-    const uint32_t cur = atomic_load(&j_goal), w = (uint32_t)((uint64_t)rate * ((uint64_t)(want / 5.0) + ((double)(uint64_t)(want / 5.0) * 5.0 < want)) * 5 / 1000);   /* up to 5 ms */
-    const double cur_ms = cur * 1000.0 / rate;
-    if (w > cur || (cur_ms - want > 10.0 && cur_ms - want > 0.1 * cur_ms)) { atomic_store(&j_goal, w); atomic_fetch_add(&j_adjusts, 1); }
+    const uint32_t cur = atomic_load(&j_goal);
+    uint32_t w = (uint32_t)((uint64_t)rate * ((uint64_t)(want / 5.0) + ((double)(uint64_t)(want / 5.0) * 5.0 < want)) * 5 / 1000);   /* up to 5 ms */
+    const double cur_ms = cur * ms;
+    if (w > cur) { atomic_store(&j_goal, w); atomic_fetch_add(&j_adjusts, 1); atomic_store(&j_t_sign, now); }
+    /* down only after long calm, a tenth at a time (before: at once, as soon as the peak was forgotten) */
+    else if (cur_ms - want > 10.0 && cur_ms - want > 0.1 * cur_ms && now - atomic_load(&j_t_sign) >= calm && now - j_t_down >= step) {
+        const uint32_t tenth = (uint32_t)(cur * 0.9);
+        if (w < tenth) w = tenth;
+        j_t_down = now;
+        atomic_store(&j_goal, w); atomic_fetch_add(&j_adjusts, 1);
+    }
     atomic_store(&j_peak_us, (uint32_t)(pk * 1000));
 }
 static void j_packet(uint32_t stamp, double now, unsigned rate) {   /* the packets' thread */
@@ -232,8 +440,19 @@ static void j_packet(uint32_t stamp, double now, unsigned rate) {   /* the packe
     int32_t mn = J.cur_min;
     for (int i = 0; i < JW; i++) if (J.win_min[i] < mn) mn = J.win_min[i];
     const double late = (rel - mn) / 1000.0;                          /* ms */
+    if (late * 1000 > atomic_load_explicit(&pkt_late_us, memory_order_relaxed)) atomic_store_explicit(&pkt_late_us, (uint32_t)(late * 1000), memory_order_relaxed);   /* */
     int b = (int)late; if (b < 0) b = 0; if (b >= JBINS) b = JBINS - 1;
     J.bins[b]++; J.n++;
+    /* the sender's clock against ours: the least delay of each 10 s, its slope (the delays fall as fast as the
+     * sender's clock runs ahead of ours); said with the stream's gaps (gaps_say) */
+    if (rel < J.sk_min) J.sk_min = rel;
+    if (now - J.sk_t >= 10.0) {
+        if (J.sk_t > 0 && J.sk_min != INT32_MAX) {
+            if (!J.sk_t0) { J.sk_t0 = now; J.sk_m0 = J.sk_min; }
+            else if (now - J.sk_t0 >= 60.0) atomic_store(&j_skew_ppm, -(double)(J.sk_min - J.sk_m0) / (now - J.sk_t0));
+        }
+        J.sk_t = now; J.sk_min = INT32_MAX;
+    }
     if (now - J.t_sec >= 1.0) {                                       /* a second: its quantile kept, the target */
         unsigned long want = (unsigned long)(o_q * J.n), c = 0; int q = 0;
         for (; q < JBINS; q++) { c += J.bins[q]; if (c > want) break; }
@@ -259,6 +478,13 @@ static struct {
     unsigned long xruns;                   /* the DAC's buffer run dry (its thread late), made ready again */
     int dry;
     uint64_t rmin, rmax;                   /* the ring this stream while playing (frames) */
+    /* its gaps told apart: the DAC's own buffer short (a Mac's: out_gaps), the ring run dry (its spells, ms);
+     * the ring raised before running dry (boosts); the clocks measured from clk_t0 (the DAC's frames played, ours) */
+    unsigned long dev_gaps, dry_n, boosts; double dry_ms, t_dry0, t_boost;
+    double clk_t0, clk_p0, clk_ppm;        /* clk_ppm: the last measure while it played (said at its end) */
+    int said;                              /* its gaps said (gaps_say) */
+    int boost_wait;                        /* raised, the ring not up to it yet (ring_watch) */
+    uint64_t prefill;                      /* what the DAC's buffer takes at the start (0 after the last stream's tail) */
     unsigned why, seq;                     /* the last stop's reason, the last ping's seq */
     double t_ping;                         /* the last ping */
     int cfd;                               /* the stream's TCP connection: reports */
@@ -307,6 +533,7 @@ static void report_locked_f(uint32_t extra_flags) {
         r.underruns = (uint32_t)S.underruns; r.adjusts = (uint32_t)atomic_load(&j_adjusts);
         r.ring_min = S.rmin == UINT64_MAX ? 0 : (uint32_t)S.rmin; r.ring_max = (uint32_t)S.rmax;
         r.state = state_locked(); r.why = S.why; r.seq = S.seq;
+        r.after_us = dev_after_us();                   /* another player behind: its latency; 0 a DAC's */
     }
     uint8_t b[ANET_REP3];
     const size_t n = anet_rep_pack(b, &r);
@@ -472,6 +699,17 @@ static void rt_self(int udp) {
 #endif
     atomic_store(udp ? &u_tid : &a_tid, tid);
     const int prio = udp ? (P_prio > 1 ? P_prio - 1 : 0) : P_prio;
+#ifdef __APPLE__
+    /* macOS: real time is a Mach time constraint there, never SCHED_FIFO (refused above 47, and below it a
+     * fixed priority the scheduler keeps under Core Audio's own): the packets' thread on the packets' rhythm, the DAC's
+     * on its period (Core Audio's writer takes its own at its first write too: out_coreaudio.c writer_rt) */
+    if (prio > 0) {
+        const int e = udp ? rt_clock(ANET_PKT_MAX_US / 1e6, 0.1, 0) : rt_clock(o_period_us / 1e6, 0.25, 0);
+        if (e) { if (!udp) lg("no real time (a Mach time constraint refused: %s): the default priority", strerror(e)); }
+        else if (!udp) atomic_store(&rt_now, 1);
+    }
+    return;
+#endif
     const int e = thr_apply(pthread_self(), tid, prio, P_nice);
     if (prio > 0 && e) { if (!udp) lg("no real-time priority (%s): SCHED_OTHER at nice %d", strerror(e), P_nice); }
     else if (prio > 0 && !udp) atomic_store(&rt_now, 1);
@@ -483,7 +721,7 @@ static void rt_self(int udp) {
 #endif
 }
 /* SIGXCPU (RLIMIT_RTTIME): both threads out of real time at once, from the handler (plain system calls) */
-static void on_xcpu(int s) {
+__attribute__((unused)) static void on_xcpu(int s) {   /* unused off Linux */
     (void)s;
 #ifdef __linux__
     const struct sched_param p = { .sched_priority = 0 };
@@ -534,6 +772,9 @@ static void place_init(void) {
         while (f && fgets(b, sizeof b, f)) lines++;
         if (f) fclose(f);
         P_swap = lines > 1;
+#ifdef __APPLE__
+        P_swap = 1;                                    /* macOS swaps (no /proc/swaps to say it): the ring locked */
+#endif
     }
 #ifdef __linux__
     cpu_set_t allow, iso;
@@ -617,7 +858,84 @@ static _Atomic unsigned long a_beat, u_beat;
 static _Atomic int a_parked, a_want_park;
 static _Atomic uint32_t a_gap_us;
 static double test_spin_s = 0; static int test_spin_park = 0;   /* AUDIOLAZ_RECV_TEST_SPIN=<s>[:park] (the guard's test) */
+/* AUDIOLAZ_RECV_TEST_LATE=<ms>:<every s>[:<steps>]: the DAC's thread late that much now and then while it
+ * plays (a loaded machine: the bench of point 9), growing to it over its first <steps> times (4: a quarter, a half…) */
+static double test_late_ms = 0, test_late_every = 0; static int test_late_steps = 4;
 static double t_stream0;
+
+/* the ring dry: what the DAC's buffer must still hold for this thread to leave it be (frames): three periods
+ * (ten on a Mac, 50 ms: its delay counts the device's own latency too, and Core Audio takes an IO cycle, 12 ms at 44.1
+ * kHz, at a time); another player's input none (its reader has its own ring) */
+static long dry_keep(void) {
+    if (o_shm[0]) return LONG_MAX;
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+    if (!o_null) return 10 * (long)D.period;
+#endif
+    return 3 * (long)D.period;
+}
+/* The DAC's thread's own words for its gaps and its ring (under lk; said by notes_main, never written here). */
+static void ring_raise(double t, const char *why);
+static void dry_said(void) {
+    const double t = mono(), d = (t - S.t_dry0) * 1000.0, goal = atomic_load(&j_goal) * 1000.0 / (S.rate ? S.rate : 1);
+    const double pg = atomic_load(&pkt_gap_us) / 1000.0, late = atomic_load(&pkt_late_us) / 1000.0;
+    S.dry_n++; S.dry_ms += d; S.t_dry0 = 0;
+    /* the packets that ended it: stamped long before (late: the network, or the sender's packets' thread) or on time
+     * after none for a while (the sender had nothing: its source late) */
+    if (late >= 0.5 * d) note("stream %u: a gap of %.0f ms: the ring (target %.0f ms) ran dry, the packets up to %.0f ms late (the network, or the sender's machine)", S.id, d, goal, late);
+    else if (pg >= 0.8 * d) note("stream %u: a gap of %.0f ms: the ring (target %.0f ms) ran dry, no packets for %.0f ms, on time when they came (the sender had nothing: its source late)", S.id, d, goal, pg);
+    else note("stream %u: a gap of %.0f ms: the ring (target %.0f ms) ran dry, the packets %.0f ms apart at most, %.0f ms late (its target raised)", S.id, d, goal, pg, late);
+    if (S.caps & ANET_CAP_ADAPT) { S.t_boost = 0; ring_raise(t, "it ran dry"); }
+}
+/* the target × J_UP, J_STEP_MS more at least, at once (j_target keeps it until long calm) */
+static void ring_raise(double t, const char *why) {
+    const unsigned rate = S.rate ? S.rate : 1;
+    const uint32_t g = atomic_load(&j_goal);
+    double w = g * J_UP;
+    if (w < g + rate * J_STEP_MS / 1000.0) w = g + rate * J_STEP_MS / 1000.0;
+    if (w > rate * (double)o_ring_max_ms / 1000.0) w = rate * (double)o_ring_max_ms / 1000.0;
+    if ((uint32_t)w <= g) return;
+    atomic_store(&j_boost, (uint32_t)w); atomic_store(&j_goal, (uint32_t)w); atomic_fetch_add(&j_adjusts, 1);
+    atomic_store(&j_t_sign, t);
+    S.boosts++; S.t_boost = t; S.boost_wait = 1;
+    note("stream %u: %s: the ring's target from %.0f to %.0f ms at once", S.id, why, g * 1000.0 / rate, w * 1000.0 / rate);
+}
+/* the ring under J_LOW of its start while it plays: raised before it runs dry, J_BOOST_S apart at most, and not again
+ * before the ring came up to most of the last raise (a live source grows it only in its silences: music without one,
+ * the uplink's, had it raised every 10 s for nothing, 50 to 365 ms) */
+static void ring_watch(uint64_t h) {
+    const unsigned rate = S.rate ? S.rate : 1;
+    if (S.boost_wait && (double)h >= 0.8 * atomic_load(&j_goal)) S.boost_wait = 0;
+    if ((double)h >= J_LOW * j_start_ms * rate / 1000.0 || S.boost_wait) return;
+    const double t = mono();
+    if (t - S.t_boost < J_BOOST_S) return;
+    char why[80];
+    snprintf(why, sizeof why, "the ring fell to %.0f ms", h * 1000.0 / rate);
+    ring_raise(t, why);
+}
+/* a Mac's DAC (out_coreaudio.c): its gaps (found short, then music) counted as gaps heard; its buffer grown taken from
+ * this ring (j_dev_extra) */
+static void dev_watch(void) {
+    if (o_null && D.open) {                                /* the null DAC's runs dry: gaps, as a card's */
+        const unsigned long x = atomic_exchange(&null_xr_new, 0);
+        if (x && S.started && !S.paused) { S.xruns += x; S.underruns += x; S.gaps += x; note("stream %u: a gap: the DAC's buffer ran dry (%lu this stream): this receiver's DAC thread came late to it", S.id, S.xruns); }
+        const double gm = ((double)D.buffer - (double)D.buf0) * 1000.0 / (D.rate ? D.rate : 1);
+        const uint32_t f = gm > 0 ? (uint32_t)(gm * D.rate / 1000.0) : 0;
+        if (f != atomic_load(&j_dev_extra)) { atomic_store(&j_dev_extra, f); if (f) atomic_store(&j_t_sign, mono()); }
+        return;
+    }
+#ifndef ANET_NULL_ONLY
+    if (o_null || o_shm[0] || !D.o || !D.open) return;
+    const long g = out_gaps(D.o);
+    if (g > (long)S.dev_gaps) {
+        const unsigned long n = (unsigned long)g - S.dev_gaps;
+        S.dev_gaps = (unsigned long)g; S.underruns += n; S.gaps += n;
+        note("stream %u: a gap: the DAC's buffer ran short (%lu this stream): this machine came late to feed it (its buffer grows)", S.id, S.dev_gaps);
+    }
+    const double x = out_grown_ms(D.o);
+    const uint32_t f = x > 0 ? (uint32_t)(x * D.rate / 1000.0) : 0;
+    if (f != atomic_load(&j_dev_extra)) { atomic_store(&j_dev_extra, f); if (f) atomic_store(&j_t_sign, mono()); }
+#endif
+}
 
 /* ── the DAC's thread: a period at a time ── */
 static void *audio_main(void *arg) {
@@ -625,7 +943,9 @@ static void *audio_main(void *arg) {
     rt_self(0);
     static int32_t zero[2 * 16384];
     unsigned per_report = 1, since = 0;
-    double t_wake = 0, t_pass = 0;
+    rt_guard ag = { 0 };                                /* bounded work at real time (rt_thread.h) */
+    double t_wake = 0, t_pass = 0, t_rep = 0, t_drain = 0;   /* t_drain : macOS, when its stream is played out */
+    (void)t_drain;
     pthread_mutex_lock(&lk);
     for (;;) {
         atomic_fetch_add(&a_beat, 1);
@@ -650,17 +970,43 @@ static void *audio_main(void *arg) {
             continue;
         }
         const uint64_t have = atomic_load(&rw) - atomic_load(&rr);
-        if (!S.started && (have >= S.target || (S.ended && have))) S.started = 1;
+        /* started once the ring holds its target and what the DAC's buffer takes at its start besides (80 ms on
+         * a Mac now): its ring at its target after that, not that much under it (the sender's pull at its limit for
+         * minutes to bring it back, the bench) */
+        if (!S.started && (have >= S.target + S.prefill || (S.ended && have))) S.started = 1;
         if (S.ended && !have) {                            /* all played out: the DAC's buffer heard, then let go */
-            const long d = dev_delay();
+#ifndef ANET_NULL_ONLY
+            if (!o_null && !o_shm[0] && t_drain == 0) out_drain(D.o);   /* what it finds short now: its play-out */
+#endif
+            long d = dev_delay();
             S.delay = d > 0 ? d : 0;
-            if (d <= 0 || S.tw == 0) { S.drained = 1; report_locked(); dev_close(); continue; }
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+            /* Core Audio: while the device runs, its delay keeps its own buffer and latency (its output time
+             * stamped ahead at each callback, out_coreaudio.c out_delay): never 0 (the BlackHole test: 3 s of silence
+             * until the connection went). Played out once the delay, as it stood when the last frame went in, has
+             * passed: then let go. */
+            if (!o_null && !o_shm[0] && S.tw > 0 && d > 0) {
+                if (t_drain == 0) t_drain = mono() + (double)d / (D.rate ? D.rate : 1);
+                if (mono() >= t_drain) d = 0;
+            }
+#endif
+            if (d <= 0 || S.tw == 0) { t_drain = 0; S.drained = 1; report_locked(); dev_close(); continue; }
             pthread_mutex_unlock(&lk); usleep(2000); pthread_mutex_lock(&lk);
             continue;
         }
+        t_drain = 0;
         const int started = S.started, paused = S.paused, running = S.tw > 0;
         pthread_mutex_unlock(&lk);
+        /* (21/10, the box froze, rt_thread.h) at real time, 5 ms of work since this thread last waited: a nap, whatever
+         * the pass (the guard and RLIMIT_RTTIME besides) */
+        if (atomic_load(&rt_now)) rt_guard_step(&ag, 0.005, 0.0002);
         if (!started && !running) { usleep((useconds_t)o_period_us); pthread_mutex_lock(&lk); continue; }   /* filling, the DAC not started */
+        if (test_late_ms > 0 && started && !paused) {      /* the bench's late thread */
+            static double t_l = 0; static int k_l = 0;
+            const double tn = mono();
+            if (t_l == 0) t_l = tn;
+            else if (tn - t_l >= test_late_every) { t_l = tn; const double f = k_l + 1 < test_late_steps ? (k_l + 1.0) / test_late_steps : 1.0; k_l++; usleep((useconds_t)(test_late_ms * f * 1000)); }
+        }
         long a = dev_avail();
         if (a >= 0 && a < (long)D.period) {
             dev_wait();
@@ -682,6 +1028,12 @@ static void *audio_main(void *arg) {
                 w = dev_write(ring + 2 * at, n, 1);
                 data = 1;
                 if (w > 0) atomic_fetch_add(&rr, (uint64_t)w);
+            } else if (started && !paused && !h && dev_delay() > dry_keep()) {
+                /* the ring dry, the DAC's buffer still holding music: nothing written (no zeros before what
+                 * comes next: no gap if it comes in time), a period's wait; the DAC's buffer and the ring one reserve
+                 * against the network's stalls, the DAC's buffer alone against this thread's lateness */
+                usleep((useconds_t)o_period_us);
+                w = OUT_AGAIN_;
             } else {                                       /* paused, filling again, or dry: a period of zeros, the DAC kept locked */
                 w = dev_write(zero, D.period < 16384 ? D.period : 16384, 0);
             }
@@ -693,18 +1045,49 @@ static void *audio_main(void *arg) {
         if (w == OUT_AGAIN_) continue;
         if (w < 0 && started && !paused && dev_recover(w) == 0) {   /* its buffer run dry: a gap, the music going on */
             S.xruns++; S.underruns++; if (!S.dry) S.gaps++; S.dry = 1;
+            note("stream %u: a gap: the DAC's buffer ran dry (%lu this stream): this receiver's DAC thread came late to it", S.id, S.xruns);
             continue;
         }
-        if (w < 0) { S.failed = 1; S.why = ANET_WHY_DAC; report_locked(); dev_close(); continue; }
-        if (w > 0) { S.tw += (uint64_t)w; if (!data) { S.zeros += (uint64_t)w; if (started && !paused) { S.underruns++; if (!S.dry) S.gaps++; S.dry = 1; } } else S.dry = 0; }
+        if (w < 0) {
+            S.failed = 1; S.why = ANET_WHY_DAC;
+#ifndef ANET_NULL_ONLY
+
+            if (!o_null && !o_shm[0] && out_last_refusal() == OUT_REF_START) {
+                S.why = ANET_WHY_DAC_START;
+                const double b = STUCK_S[stuck_n < 4 ? stuck_n : 4];
+                stuck_n++; stuck_until = mono() + b; stuck_serial = out_dev_serial(dac_dev);
+                lg("the DAC %s refuses to start: unplug it and plug it in again (USB), or switch it off and on; streams refused %.0f s (sooner once it is plugged in again)", o_name, b);
+            }
+#endif
+            report_locked(); dev_close(); continue;
+        }
+        if (w > 0) {
+            S.tw += (uint64_t)w;
+            if (!data) {
+                S.zeros += (uint64_t)w;
+                if (started && !paused) {
+                    S.underruns++;
+                    if (!S.dry) { S.gaps++; S.t_dry0 = mono(); atomic_store(&pkt_gap_us, 0); atomic_store(&pkt_late_us, 0); }
+                    S.dry = 1;
+                }
+            } else {
+                if (S.dry && S.t_dry0 > 0) dry_said();         /* the ring ran dry: how long, and why */
+                S.dry = 0;
+            }
+        }
+        dev_watch();                                       /* the DAC's own buffer: its gaps, its growth */
         if (started && !paused && !S.ended) {             /* the ring this stream, while it plays */
             const uint64_t h2 = atomic_load(&rw) - atomic_load(&rr);
             if (h2 < S.rmin) S.rmin = h2;
             if (h2 > S.rmax) S.rmax = h2;
+            if (S.caps & ANET_CAP_ADAPT && !S.dry) ring_watch(h2);   /* its target raised before it runs dry */
         }
         const long d = dev_delay();
         S.delay = d > 0 ? d : 0;
-        if (++since >= per_report) { since = 0; report_locked(); }
+        /* another player's input: its passes are not periods (nothing written while there is no music: a
+         * quarter of one apart), the reports by the clock, every ANET_REPORT_MS */
+        if (o_shm[0]) { const double tr = mono(); if (tr - t_rep >= ANET_REPORT_MS / 1000.0) { t_rep = tr; report_locked(); } }
+        else if (++since >= per_report) { since = 0; report_locked(); }
         h_add(&H_work, (cputime() - c0) * 1e6, step_work);
     }
     return NULL;
@@ -735,6 +1118,7 @@ static void *udp_main(void *arg) {
         atomic_store(&t_last_pkt, t);
         if (id != last_id) { last_id = id; t_last = 0; }   /* each stream's own rhythm */
         if (t_last > 0) h_add(&H_pkt, (t - t_last) * 1e6, step_pkt);
+        if (t_last > 0) { const uint32_t g = (uint32_t)((t - t_last) * 1e6); if (g > atomic_load_explicit(&pkt_gap_us, memory_order_relaxed)) atomic_store_explicit(&pkt_gap_us, g, memory_order_relaxed); }   /* */
         t_last = t;
         if (stamped) j_packet(anet_dhdr_flags(b), t, rate);   /* its lateness */
         const uint64_t w = atomic_load(&rw), r = atomic_load(&rr);
@@ -820,11 +1204,35 @@ static int conn_read(int fd, conn_t *k) {
     if (recv_all(fd, hb, sizeof hb, 3000)) return -1;
     k->e = anet_hdr_parse(hb, &k->h);
     if (!k->e && k->h.rate == 0) {                     /* INFO */
+        /* the Mac's uplink saying how it stands (anet.h ANET_IQ_UPLINK): noted for the box's app */
+        if ((k->h.caps & ANET_IQ_MASK) == ANET_IQ_UPLINK) {
+            struct sockaddr_in pa; socklen_t pal = sizeof pa;
+            memset(&pa, 0, sizeof pa);
+            getpeername(fd, (struct sockaddr *)&pa, &pal);
+            const int d = !!(k->h.caps & ANET_IQ_DEFAULT), v = !!(k->h.caps & ANET_IQ_DEVICE);
+            if (!UPS.seen_wall || d != UPS.defout || v != UPS.device)
+                lg("the Mac's uplink at %s: its system output %s%s", inet_ntoa(pa.sin_addr), d ? "its « audiolaz » device (its apps reach this room)" : "elsewhere (only the apps playing to « audiolaz » itself reach this room)",
+                   v ? "" : "; its « audiolaz » device not there");
+            UPS.seen_wall = (double)time(NULL); snprintf(UPS.addr, sizeof UPS.addr, "%s", inet_ntoa(pa.sin_addr)); UPS.defout = d; UPS.device = v;
+            ups_write();
+        }
         uint8_t ib[ANET_INFO] = { 0 };
         anet_p32(ib, ANET_IMAGIC);
-        const int n = snprintf((char *)ib + 4, ANET_INFO - 4, "id=%s;dac=%s;max=%u;v=%d", o_id, o_name, o_max, o_v2 ? 2 : ANET_PROTO);
-        /* the DAC's identity, whole or not at all (ANET_INFO is fixed: an older player reads that many bytes) */
-        if (o_hw[0] && n > 0 && (size_t)n + 4 + strlen(o_hw) + 1 < ANET_INFO - 4) snprintf((char *)ib + 4 + n, ANET_INFO - 4 - (size_t)n, ";hw=%s", o_hw);
+        int n = snprintf((char *)ib + 4, ANET_INFO - 4, "id=%s;dac=%s;max=%u;v=%d", o_id, o_name, o_max, o_v2 ? 2 : ANET_PROTO);
+
+        char rates[100];
+        snprintf(rates, sizeof rates, "%s", o_rates);
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+        if (!o_null && !o_shm[0] && out_rates_text(dac_dev, rates, sizeof rates) < 0) rates[0] = 0;
+#endif
+        for (char *q = o_room; *q; q++) if (*q == ';' || (unsigned char)*q < 0x20) *q = ' ';
+        const char *keys[4] = { o_room[0] ? "room" : NULL, o_hw[0] ? "hw" : NULL, rates[0] ? "rates" : NULL, stuck_until > mono() ? "err" : NULL };
+        const char *vals[4] = { o_room, o_hw, rates, "dac-start" };
+        for (int i = 0; i < 4; i++) {
+            if (!keys[i] || n <= 0) continue;
+            const size_t need = strlen(keys[i]) + strlen(vals[i]) + 2;
+            if ((size_t)n + need + 1 < ANET_INFO - 4) n += snprintf((char *)ib + 4 + n, ANET_INFO - 4 - (size_t)n, ";%s=%s", keys[i], vals[i]);
+        }
         send_all(fd, ib, sizeof ib);
         return 1;
     }
@@ -922,14 +1330,27 @@ static int stream_begin(int fd, const conn_t *k) {
     if (!(follow && D.open)) {
         dev_close();
         S.tw = S.zeros = 0;
-        if (dev_open(h.rate)) { S.why = ANET_WHY_DAC; unpark(); refuse(fd, h.id, ANET_E_DAC); lg("stream %u: the DAC %s did not open at %u Hz", h.id, dac_dev, h.rate); return -1; }
+#ifndef ANET_NULL_ONLY
+        out_native_only(!o_null && !o_shm[0] && (k->h.caps & ANET_CAP_RATES) && !o_v2);   /* the sender converts */
+#endif
+        /* a sender that converts, a rate its DAC does not take as it is (said: rates=): refused, it converts */
+        const int de = (k->h.caps & ANET_CAP_RATES) && !o_v2 && o_rates[0] && anet_rate_in(o_rates, h.rate) == 0 ? -2 : dev_open(h.rate);
+        if (de == -2) { S.why = ANET_WHY_RATE; unpark(); refuse(fd, h.id, ANET_E_RATE); lg("stream %u: %u Hz refused: not a rate the DAC takes as it is (the sender converts; it takes %s)", h.id, h.rate, o_rates[0] ? o_rates : "others"); return -1; }
+        if (de) { S.why = ANET_WHY_DAC; unpark(); refuse(fd, h.id, ANET_E_DAC); lg("stream %u: the DAC %s did not open at %u Hz", h.id, dac_dev, h.rate); return -1; }
         cur_rate = h.rate;
     }
     atomic_store(&rw, 0); atomic_store(&rr, 0);
     S.delay = 0;
     S.id = h.id; S.rate = h.rate; S.started = 0; S.ended = 0; S.paused = 0; S.drained = 0; S.failed = 0; S.underruns = 0; S.gaps = 0; S.xruns = 0; S.dry = 0;
     atomic_store(&lost_frames, 0); atomic_store(&late_pkts, 0);
-    S.target = (uint64_t)h.rate * (unsigned)o_ring_ms / 1000;
+
+    j_start_ms = !o_ring_given && h.rate >= HI_RATE ? o_ring_ms * 1.5 : o_ring_ms;
+    if (j_start_ms > o_ring_max_ms) j_start_ms = o_ring_max_ms;
+    S.target = (uint64_t)((double)h.rate * j_start_ms / 1000.0);
+    atomic_store(&j_boost, 0); atomic_store(&j_dev_extra, 0);
+    S.dev_gaps = 0; S.dry_n = 0; S.dry_ms = 0; S.boosts = 0; S.t_dry0 = 0; S.t_boost = 0; S.clk_t0 = 0; S.clk_ppm = 0; S.said = 0; S.boost_wait = 0;
+    S.prefill = follow ? 0 : (uint64_t)D.buffer;           /* after the last one's tail: its buffer full already */
+    atomic_store(&pkt_gap_us, 0);
     /* protocol 3: what this player offers that we follow; the jitter's memory kept for the same player, its
      * target there already (the stream still starts on --ring-ms: at once) */
     S.caps = o_v2 ? 0 : h.caps & (ANET_CAP_STAMP | ANET_CAP_STATE | ANET_CAP_WHO | (o_adapt ? ANET_CAP_ADAPT : 0));
@@ -945,6 +1366,9 @@ static int stream_begin(int fd, const conn_t *k) {
     atomic_store(&j_goal, (uint32_t)S.target);
     atomic_store(&j_live, 1);                              /* until its first ping says */
     if (S.caps & ANET_CAP_ADAPT) j_target(h.rate, mono());
+
+    const uint64_t start_was = S.target;
+    if (S.caps & ANET_CAP_ADAPT && atomic_load(&j_goal) > S.target && !follow) S.target = atomic_load(&j_goal);   /* (after the last one's tail: on its start, its DAC playing that tail meanwhile) */
     S.rmin = UINT64_MAX; S.rmax = 0; S.why = ANET_WHY_NONE; S.seq = 0; S.t_ping = mono(); S.npend = 0;
     atomic_store(&t_last_pkt, mono());
     S.from = k->addr;
@@ -957,16 +1381,19 @@ static int stream_begin(int fd, const conn_t *k) {
     const double tg = atomic_load(&j_goal) * 1000.0 / h.rate;
     unpark();
     send_all(fd, b, n);
+    if (o_status) { UPS.playing = 1; UPS.streams++; UPS.last_wall = (double)time(NULL); UPS.seen_wall = UPS.last_wall; snprintf(UPS.addr, sizeof UPS.addr, "%s", inet_ntoa(k->addr)); ups_write(); }   /* */
     char from[140];
     if (k->name[0]) snprintf(from, sizeof from, " from « %s »%s", k->name, k->take ? " (taking it over)" : ""); else snprintf(from, sizeof from, " from %s", inet_ntoa(k->addr));
     lg("stream %u%s: %u Hz, %s, packets of %u frames every %u µs%s; %s", h.id, from, h.rate, h.fmt == ANET_F_DOP ? "DoP" : h.fmt == ANET_F_S24_IN_S32 ? "24 bits in 32" : "32 bits", h.pkt_frames, h.pkt_us, follow ? ", after the last one" : "",
        !caps ? "version 2 (the ring fixed)" : caps & ANET_CAP_ADAPT ? "protocol 3, the ring sized by the network" : "protocol 3, the ring fixed");
-    if (caps & ANET_CAP_ADAPT && tg > o_ring_ms) lg("stream %u: starts on %d ms, the ring asked at %.0f ms at once (the jitter remembered from this player)", h.id, o_ring_ms, tg);
+    if (caps & ANET_CAP_ADAPT && S.target > start_was) lg("stream %u: starts on %.0f ms, its target (the jitter remembered from this player; %.0f ms otherwise)", h.id, tg, start_was * 1000.0 / h.rate);
+    else if (j_start_ms > o_ring_ms) lg("stream %u: starts on %.0f ms (%u Hz: half as long again)", h.id, j_start_ms, h.rate);
     return 0;
 }
 
 /* the stream ended here: the player told why (a last report, protocol 3), one line in the journal.
  * within `timeout` s (> 0: the guard's back-off, the DAC's thread perhaps stuck): −1 not done */
+static void gaps_say(unsigned id);
 static int stop_here_t(unsigned why, unsigned id, double timeout) {
     if (timeout > 0) { if (park_timed(timeout)) return -1; }
     else park();
@@ -974,8 +1401,10 @@ static int stop_here_t(unsigned why, unsigned id, double timeout) {
     if (S.caps & ANET_CAP_STATE) report_locked_f(ANET_R_STOPPED);
     S.live = 0; S.cfd = -1; dev_close(); S.ended = 1;
     unpark();
+    if (o_status && UPS.playing) { UPS.playing = 0; ups_write(); }   /* */
     if (why != ANET_WHY_LOST) HOLD.t_alive = mono();      /* its player's last sign: the stop (silent: its own) */
     lg("stream %u stopped by the receiver: %s", id, anet_why_text(why));
+    gaps_say(id);
     return 0;
 }
 static void stop_here(unsigned why, unsigned id) { stop_here_t(why, id, 0); }
@@ -1012,7 +1441,7 @@ static void backoff_exit(const char *what) {
 #endif
     _exit(75);
 }
-static void backoff(int level, const char *fmt, ...) {
+__attribute__((unused)) static void backoff(int level, const char *fmt, ...) {   /* the guard's: Linux */
     char w[200];
     va_list a; va_start(a, fmt); vsnprintf(w, sizeof w, fmt, a); va_end(a);
     if (atomic_load(&bk_level) < 1) {
@@ -1050,13 +1479,22 @@ static void *guard_main(void *arg) {
     unsigned long ab0 = atomic_load(&a_beat), ub0 = atomic_load(&u_beat);
     double t_ab = t_prev, t_ub = t_prev, u_stall = 0;
     int hot = 0, hot2 = 0; unsigned lates = 0;   /* lates: the last 10 seconds, a bit each (the DAC's thread late) */
+    static rtw_snap rtw;                         /* (21/10, rt_watch.h) the machine's real-time threads, now and then */
+    rtw_take(&rtw);
+    double t_late_who = -1e9;
     for (;;) {
         const struct timespec d = { 0, 250000000 };
         nanosleep(&d, NULL);
         const double t = mono(), late = t - t_prev - 0.25;
         t_prev = t;
         if (atomic_exchange(&xcpu_hit, 0)) backoff(1, "a real-time thread of ours ran 200 ms without blocking (SIGXCPU)");
+        if (late > 1.5 && t - t_late_who > 60) {   /* who held them: said, real time of ours or not */
+            t_late_who = t;
+            char who[600]; double span = 0;
+            if (rtw_late(&rtw, who, sizeof who, &span)) lg("the guard woke %.1f s late; the real-time threads that ran most in the last %.1f s: %s", late, span, who);
+        }
         if (late > 1.5 && atomic_load(&rt_now)) backoff(1, "the guard woke %.1f s late: the cores starved", late);
+        if (rtw_now() - rtw.at >= RTW_EVERY_S) rtw_take(&rtw);
         const unsigned long ab = atomic_load(&a_beat), ub = atomic_load(&u_beat);
         if (ab != ab0 || atomic_load(&a_parked)) { ab0 = ab; t_ab = t; }
         else {
@@ -1102,9 +1540,84 @@ static void *guard_main(void *arg) {
 }
 #endif
 
+/* the DAC's clock against ours, from what it played (under lk): ppm, + faster; 0 not known yet (10 s at least) */
+static double dac_ppm(double t) {
+    if (!S.clk_t0 || t - S.clk_t0 < 10.0 || !S.rate) return 0;
+    const double played = (double)atomic_load(&rr) - (double)S.delay;
+    return ((played - S.clk_p0) / ((t - S.clk_t0) * S.rate) - 1.0) * 1e6;
+}
+
+static void gaps_say(unsigned id) {
+    pthread_mutex_lock(&lk);
+    if (S.said || S.id != id || !S.tw) { pthread_mutex_unlock(&lk); return; }
+    S.said = 1;
+    const unsigned long g = S.gaps, dg = S.dev_gaps, dn = S.dry_n, xr = S.xruns, b = S.boosts;
+    const double dm = S.dry_ms, dp = S.clk_ppm, sk = atomic_load(&j_skew_ppm), goal = atomic_load(&j_goal) * 1000.0 / (S.rate ? S.rate : 1);
+    pthread_mutex_unlock(&lk);
+    char cl[160] = "";
+    if (dp != 0 || sk != 0) snprintf(cl, sizeof cl, "; the DAC's clock %+.1f ppm against this machine's, the sender's %+.1f ppm", dp, sk);
+    if (!g) lg("stream %u: no gap heard (its ring's target %.0f ms at the end%s%s)%s", id, goal, b ? ", raised before running dry " : "", b ? (b > 1 ? "more than once" : "once") : "", cl);
+    else lg("stream %u: %lu gap%s heard: the ring ran dry %lu time%s (%.0f ms in all), the DAC's buffer short %lu time%s (this machine late to feed it), run dry %lu (its thread late); the ring's target %.0f ms at the end%s",
+            id, g, g > 1 ? "s" : "", dn, dn == 1 ? "" : "s", dm, dg, dg == 1 ? "" : "s", xr, goal, cl);
+}
+/* The notes' thread: the DAC's thread's lines written (notes), the clocks said every 10 min of play. */
+static void *notes_main(void *arg) {
+    (void)arg;
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "az-notes");
+#else
+    pthread_setname_np("az-notes");
+#endif
+    double t_clk = 0;
+    for (;;) {
+        const struct timespec d = { 0, 250000000 };
+        nanosleep(&d, NULL);
+        notes_flush();
+        const double t = mono();
+        pthread_mutex_lock(&lk);
+        char said[240] = "";
+#ifndef ANET_NULL_ONLY
+        /* the DAC's own line (its buffer grown: out_alsa.c), never written by the DAC's thread; said below */
+        if (!o_null && !o_shm[0] && D.open && D.o && !out_said(D.o, said, sizeof said)) said[0] = 0;
+#endif
+        const int on = S.live && S.started && !S.paused && !S.ended && D.open;
+        if (!on) S.clk_t0 = 0;
+        else if (!S.clk_t0 && t - t_stream0 >= 5.0) { S.clk_t0 = t; S.clk_p0 = (double)atomic_load(&rr) - (double)S.delay; t_clk = t; }
+        const double dp = on ? dac_ppm(t) : 0, sk = atomic_load(&j_skew_ppm);
+        if (dp != 0) S.clk_ppm = dp;
+        const unsigned id = S.id;
+        pthread_mutex_unlock(&lk);
+        if (said[0]) lg("%s", said);
+        if (on && t - t_clk >= 600.0 && (dp != 0 || sk != 0)) {
+            t_clk = t;
+            lg("stream %u: the DAC's clock %+.1f ppm against this machine's, the sender's %+.1f ppm (its packets' stamps)", id, dp, sk);
+        }
+    }
+    return NULL;
+}
+
 static void on_quit(int s) { quit_sig = s; if (quit_pipe[1] >= 0) { const char c = 1; (void)!write(quit_pipe[1], &c, 1); } }
+/* the DAC that refused to start seen again as a new device (unplugged and plugged in again: a new object):
+ * its wait over at once (1), said */
+static int dac_back(void) {
+#ifndef ANET_NULL_ONLY
+    if (o_null || o_shm[0] || !stuck_serial) return 0;
+    const unsigned long now = out_dev_serial(dac_dev);
+    if (!now || now == stuck_serial) return 0;
+    lg("the DAC %s is there again (plugged in again): tried at once", o_name);
+    stuck_until = 0; stuck_serial = 0; stuck_n = 0;
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 int main(int argc, char **argv) {
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+
+    o_period_us = 5000; o_periods = 16;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--list-devices")) { out_print_devices(); return 0; }
+#endif
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!strcmp(a, "--null")) o_null = 1;
@@ -1119,8 +1632,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--id")) { snprintf(o_id, sizeof o_id, "%s", v); i++; }
         else if (!strcmp(a, "--max-rate")) { o_max = (unsigned)strtoul(v, NULL, 10); i++; }
         else if (!strcmp(a, "--period-us")) { o_period_us = atoi(v); i++; }
-        else if (!strcmp(a, "--periods")) { o_periods = atoi(v); i++; }
-        else if (!strcmp(a, "--ring-ms")) { o_ring_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--periods")) { o_periods = atoi(v); o_periods_given = 1; i++; }
+        else if (!strcmp(a, "--ring-ms")) { o_ring_ms = atoi(v); o_ring_given = 1; i++; }
+        else if (!strcmp(a, "--log-time")) o_log_time = 1;   /* */
+        else if (!strcmp(a, "--grow-ms")) { o_grow_ms = atoi(v); i++; }   /* */
         else if (!strcmp(a, "--ring-max-ms")) { o_ring_max_ms = atoi(v); i++; }
         else if (!strcmp(a, "--jitter-q")) { o_q = atof(v); i++; }
         else if (!strcmp(a, "--jitter-memory-s")) { o_mem_s = atoi(v); i++; }
@@ -1130,10 +1645,29 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--lock-mb")) { o_lock_mb = atoi(v); i++; }
         else if (!strcmp(a, "--null-ppm")) { o_ppm = atof(v); i++; }
         else if (!strcmp(a, "--dump")) { o_dump = v; i++; }
-        else { fprintf(stderr, "usage: audiolaz-recv [--dac hw:…|auto] [--null] [--port N] [--name S] [--id S] [--max-rate Hz] [--period-us N] [--periods N] [--ring-ms N] [--ring-max-ms N] [--no-adapt] [--jitter-q Q] [--jitter-memory-s S] [--no-mdns] [--rt auto|N] [--cpu auto|N] [--force] [--lock-mb N] [--null-ppm N] [--dump F] [--stats] [--once] [--v2]\n"); return 2; }
+        else if (!strcmp(a, "--null-rates")) { snprintf(o_rates, sizeof o_rates, "%s", v); i++; }   /* the tests': a DAC taking these only */
+        else if (!strcmp(a, "--status")) { o_status = v; i++; }   /* the uplink's state for the box's app */
+        else if (!strcmp(a, "--room")) { snprintf(o_room, sizeof o_room, "%s", v); i++; }   /* INFO room= */
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+        else if ((!strcmp(a, "--exclusive") || !strcmp(a, "--integer") || !strcmp(a, "--test-start-fail") || !strcmp(a, "--test-refuse-rates") || !strcmp(a, "--test-stick")) && out_option(a, v)) i++;   /* out_coreaudio.c's */
+#endif
+        else { fprintf(stderr, "usage: audiolaz-recv [--dac hw:…|auto|shm:<name>|<Core Audio UID or name>] [--null] [--port N] [--name S] [--id S] [--max-rate Hz] [--period-us N] [--periods N] [--ring-ms N] [--ring-max-ms N] [--no-adapt] [--jitter-q Q] [--jitter-memory-s S] [--no-mdns] [--rt auto|N] [--cpu auto|N] [--force] [--lock-mb N] [--null-ppm N] [--null-rates R,…] [--dump F] [--status F] [--room S] [--log-time] [--grow-ms N] [--stats] [--once] [--v2] (macOS: [--exclusive on|off] [--integer on|off] [--list-devices] [--test-start-fail N] [--test-refuse-rates R,…])\n"); return 2; }
     }
+
+    if (!strncmp(o_dac, "shm:", 4)) {
+        if (o_dac[4] != '/' || strlen(o_dac + 4) >= sizeof o_shm || strchr(o_dac + 5, '/')) { lg("--dac %s: shm:/<name>, one word", o_dac); return 2; }
+        snprintf(o_shm, sizeof o_shm, "%s", o_dac + 4);
+    }
+#if !defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+    /* a Linux DAC's buffer sizing itself (out_alsa.c), up to --grow-ms */
+    if (!o_null && strncmp(o_dac, "shm:", 4) && o_grow_ms > 0) { char gb[16]; snprintf(gb, sizeof gb, "%d", o_grow_ms); out_option("--grow-ms", gb); }
+#endif
     if (o_period_us < 500) o_period_us = 500;
     if (o_periods < 2) o_periods = 2;
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+
+    if (!o_ring_given && !o_null && strncmp(o_dac, "shm:", 4)) o_ring_ms = MAC_RING_MS;
+#endif
     if (o_ring_ms < 10) o_ring_ms = 10;
     if (o_ring_max_ms < o_ring_ms) o_ring_max_ms = o_ring_ms;
     if (o_ring_max_ms > 2000) o_ring_max_ms = 2000;
@@ -1147,15 +1681,42 @@ int main(int argc, char **argv) {
         if (ts && *ts) { test_spin_s = atof(ts); test_spin_park = strstr(ts, ":park") != NULL; }
         const char *tx = getenv("AUDIOLAZ_RECV_TEST_XRUN");
         if (tx && *tx) test_xrun_s = atof(tx);
+        const char *tl = getenv("AUDIOLAZ_RECV_TEST_LATE");
+        if (tl && *tl) {
+            test_late_ms = atof(tl); const char *c = strchr(tl, ':'); test_late_every = c ? atof(c + 1) : 5; if (test_late_every < 0.1) test_late_every = 0.1;
+            const char *c2 = c ? strchr(c + 1, ':') : NULL; if (c2) test_late_steps = atoi(c2 + 1); if (test_late_steps < 1) test_late_steps = 1;
+        }
     }
     signal(SIGPIPE, SIG_IGN);
     if (pipe(quit_pipe) == 0) { signal(SIGTERM, on_quit); signal(SIGINT, on_quit); }
     if (!o_id[0]) { gethostname(o_id, sizeof o_id); o_id[sizeof o_id - 1] = 0; char *d = strchr(o_id, '.'); if (d) *d = 0; }
 #ifdef ANET_NULL_ONLY
-    o_null = 1;
+    if (!o_shm[0]) o_null = 1;
 #endif
-    if (o_null) { snprintf(dac_dev, sizeof dac_dev, "null"); if (!o_name[0]) snprintf(o_name, sizeof o_name, "null (test)"); if (!o_max) o_max = ANET_MAX_RATE; }
-#ifndef ANET_NULL_ONLY
+    if (o_null) { o_shm[0] = 0; snprintf(dac_dev, sizeof dac_dev, "null"); if (!o_name[0]) snprintf(o_name, sizeof o_name, "null (test)"); if (!o_max) o_max = ANET_MAX_RATE; }
+    else if (o_shm[0]) {                               /* the rates the reader takes: the Linux plugin's, 44.1 to 768 kHz */
+        snprintf(dac_dev, sizeof dac_dev, "shm:%s", o_shm);
+        if (!o_name[0]) snprintf(o_name, sizeof o_name, "audiolaz");
+        if (!o_max) o_max = 768000;
+        if (shm_map()) { lg("%s: %s", o_shm, strerror(errno)); return 1; }   /* there before any stream: the reader maps it */
+        lg("%s: the ring another player reads (its volume %s)", o_shm, atomic_load(&D.m->vol_cdb) ? "below full, as last said" : "full");
+    }
+#if !defined(ANET_NULL_ONLY) && defined(__APPLE__)
+    else {
+
+        if (!strcmp(o_dac, "auto") || !o_dac[0]) { lg("macOS: --dac <the device's UID or a part of its name> (--list-devices): none chosen by itself"); return 2; }
+        char uid[160], nm[160];
+        if (out_dev_info(o_dac, uid, sizeof uid, nm, sizeof nm)) { lg("%s: no such Core Audio output (--list-devices)", o_dac); return 1; }
+        snprintf(dac_dev, sizeof dac_dev, "%s", uid);
+        if (!o_name[0]) snprintf(o_name, sizeof o_name, "%.95s", nm[0] ? nm : uid);
+        lg("DAC « %s » (Core Audio %s)", nm, uid);
+        if (!o_max) {   /* the highest PCM rate it takes as it is (resampled ones not said); held by another program: 192 kHz said */
+            static const unsigned R[] = { 1536000, 768000, 705600, 384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100 };
+            for (size_t i = 0; i < sizeof R / sizeof R[0] && !o_max; i++) { const int t = out_takes(dac_dev, OUTF_S32, R[i]); if (t < 0) { o_max = 192000; lg("%s held by another program now: up to 192000 Hz said", nm); } else if (t == 1) o_max = R[i]; }
+            if (!o_max) o_max = 48000;
+        }
+    }
+#elif !defined(ANET_NULL_ONLY)
     else {
 
         char line[256], id[64] = "", nm[96] = "";
@@ -1187,6 +1748,7 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < sizeof R / sizeof R[0] && !o_max; i++) { const int t = out_takes(dac_dev, OUTF_S32, R[i]); if (t < 0) { o_max = 384000; lg("%s busy now: up to 384000 Hz said", dac_dev); } else if (t == 1) o_max = R[i]; }
             if (!o_max) o_max = 192000;
         }
+        if (out_rates_text(dac_dev, o_rates, sizeof o_rates) < 0) o_rates[0] = 0;   /* INFO rates= */
     }
 #endif
     /* the ring: half a second at the highest rate at least, and the ceiling's ring with room to spare */
@@ -1235,6 +1797,8 @@ int main(int argc, char **argv) {
     {   /* small stacks (256 KB: what is locked, with swap, stays small) */
         pthread_attr_t ta; pthread_attr_init(&ta); pthread_attr_setstacksize(&ta, 256 << 10);
         if (pthread_create(&th_a, &ta, audio_main, NULL) || pthread_create(&th_u, &ta, udp_main, NULL)) { lg("threads not started"); return 1; }
+        pthread_t tn;
+        if (pthread_create(&tn, &ta, notes_main, NULL)) lg("the notes' thread not started");   /* */
 #ifdef __linux__
         pthread_t tg;
         for (int i = 0; i < 100 && (!atomic_load(&a_tid) || !atomic_load(&u_tid)); i++) usleep(10000);   /* their ids, for the guard */
@@ -1299,6 +1863,12 @@ int main(int argc, char **argv) {
                     if (mono() - t_said > 60) { t_said = mono(); lg("stream %u refused: backing off (%s), %.0f s more", k.h.id, bk_why, bk_until - mono()); }
                     close(c);
                 }
+                else if (stuck_until > mono() && !dac_back()) {   /* its DAC refuses to start: a while */
+                    static double t_said = -1e9;
+                    refuse(c, k.h.id, ANET_E_DAC_START);
+                    if (mono() - t_said > 30) { t_said = mono(); lg("stream %u refused: the DAC refuses to start (%.0f s more; unplug it and plug it in again)", k.h.id, stuck_until - mono()); }
+                    close(c);
+                }
                 else if (busy_for(&k, fd, &why)) { refuse_busy(c, &k); close(c); }
                 else if (k.e) { refuse(c, k.h.id, (uint32_t)k.e); lg("stream refused (rate, %u Hz)", k.h.rate); close(c); }
                 else {
@@ -1340,9 +1910,16 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (t == ANET_M_META) {
-                char ti[160], ar[160];
+                char ti[160], ar[160], vc[16];
                 anet_meta_get((char *)pay, "title", ti, sizeof ti); anet_meta_get((char *)pay, "artist", ar, sizeof ar);
-                lg("stream %u: now playing « %s »%s%s", id, ti, ar[0] ? " by " : "", ar);
+
+                anet_meta_get((char *)pay, "volume_cdb", vc, sizeof vc);
+                if (vc[0]) dev_volume(strtol(vc, NULL, 10), id);
+
+                static char np_said[340];
+                char np[340];
+                snprintf(np, sizeof np, "%s|%s|%u", ti, ar, id);
+                if ((ti[0] || ar[0]) && strcmp(np, np_said)) { snprintf(np_said, sizeof np_said, "%s", np); lg("stream %u: now playing « %s »%s%s", id, ti, ar[0] ? " by " : "", ar); }
                 continue;
             }
             park();
@@ -1351,7 +1928,7 @@ int main(int argc, char **argv) {
             else if (t == ANET_M_PAUSE) S.paused = 1;
             else if (t == ANET_M_RESUME) { S.paused = 0; S.t_ping = mono(); atomic_store(&t_last_pkt, mono()); }
             unpark();
-            if (t == ANET_M_STOP) { lg("stream %u stopped by the player: %s", id, why ? anet_why_text(why) : "no reason given (a version-2 player)"); stats_print(); }
+            if (t == ANET_M_STOP) { lg("stream %u stopped by the player: %s", id, why ? anet_why_text(why) : "no reason given (a version-2 player)"); gaps_say(id); stats_print(); if (o_status && UPS.playing) { UPS.playing = 0; ups_write(); } }
             if (t == ANET_M_END) lg("stream %u: its end (%s), played out", id, why ? anet_why_text(why) : "the music's end");
             continue;
         }
@@ -1364,8 +1941,10 @@ int main(int argc, char **argv) {
         unpark();
         if (clean) shutdown(fd, SHUT_WR);
         close(fd); fd = -1;
+        if (o_status && UPS.playing) { UPS.playing = 0; ups_write(); }   /* */
         if (!clean) lg("stream %u: the connection went without its end: stopped (%s)", id, anet_why_text(ANET_WHY_CLOSED));
         for (int i = 0; i < 300; i++) { pthread_mutex_lock(&lk); const int done = !D.open; pthread_mutex_unlock(&lk); if (done) break; usleep(10000); }
+        notes_flush(); gaps_say(id);                       /* */
         stats_print();
         if (o_once) {   /* the tests: quit once played out */
             if (D.dump) fclose(D.dump);

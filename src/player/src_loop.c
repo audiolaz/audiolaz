@@ -82,6 +82,7 @@ static double c_started[CS_MAX];          /* when its stream (that generation) w
 static double c_tried[CS_MAX];
 static char CPATH[CS_MAX][48];
 static int card_arrow = 0;
+static char card_fixed[AZ_SHOWN_MAX] = "";
 static double cnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void cks_init(void) { if (!cks_set) { for (int k = 0; k < SRC_MAX; k++) CKS[k] = -1; for (int i = 0; i < CS_MAX; i++) CFD[i] = -1; cks_set = 1; } }
 static int is_card(int k) { cks_init(); return k >= 0 && k < SRC_MAX && CKS[k] >= 0; }
@@ -108,13 +109,20 @@ static struct azc_info *card_s(int cs) {
 static struct azc_info *card(int k) { return is_card(k) ? card_s(CKS[k]) : NULL; }
 
 int src_paced(int k) { return is_drv(k) || is_card(k); }
+/* src.h: an uplink's ring (lx 2) keeps its music for this player; the Linux plugin's (lx 1) as before */
+int src_keeps(int k) { az_shm *m = is_drv(k) ? drv() : NULL; return m && atomic_load(&m->lx) == 2; }
 /* src.h: the plugin's app stopped, paused or closed it (running 0), not a stall nor zeros */
 int src_io_ended(int k) {
     if (is_card(k)) { const struct azc_info *c = card(k); return c && !c->running; }
     az_shm *m = is_drv(k) ? drv() : NULL; return m && !atomic_load(&m->running);
 }
-/* the gain input k's source asks: the card's volume control (1 for the others) */
+
 double plat_src_volume(int k) {
+    if (is_drv(k)) {
+        az_shm *m = drv();
+        const uint32_t c = m ? atomic_load(&m->vol_cdb) : 0;
+        return c >= AZ_VOL_FLOOR_CDB ? 0.0 : c ? pow(10.0, -(double)c / 2000.0) : 1.0;
+    }
     if (!is_card(k)) return 1.0;
     const struct azc_info *c = card(k);
     if (!c) return 1.0;
@@ -143,7 +151,9 @@ void plat_src_dac(const char *name, const char *maker, const char *model, int lo
     (void)maker; (void)model; (void)local;
     cks_init();
     if (!any_card()) return;
-    if (card_arrow) {
+    if (card_fixed[0]) {                                 /* its room's name, as made: never the DAC's instead */
+        memcpy(card_name_want, card_fixed, sizeof card_name_want);   /* (both AZ_SHOWN_MAX, az_shown's cut) */
+    } else if (card_arrow) {
         if (!name || !*name) return;
         char t[160];
         snprintf(t, sizeof t, "audiolaz \u2192 %s", name);
@@ -153,11 +163,40 @@ void plat_src_dac(const char *name, const char *maker, const char *model, int lo
     } else az_shown(card_name_want, sizeof card_name_want, name);
     card_name_apply();
 }
-void plat_src_latency(int k, double ms) { (void)k; (void)ms; }
-/* src.h src_hold: AZC_IOC_HOLD (a module before 18/10: none, as before) */
+
+void plat_src_latency(int k, double ms) {
+    az_shm *m = is_drv(k) ? drv() : NULL;
+    if (m && ms >= 0 && ms < 60000) atomic_store(&m->lat_us, (uint32_t)(ms * 1000.0 + 0.5));
+}
+/* src.h src_hold: AZC_IOC_HOLD (a module before 18/10: none, as before); an uplink's ring (lx 2):
+ * hold_ns (audiolaz_drv.h; the Linux plugin's ring, lx 1, as before: nothing held, its activity as it was) */
 void plat_src_hold(int k, int ms) {
+    if (is_drv(k)) {
+        az_shm *m = drv();
+        if (m && atomic_load(&m->lx) == 2) atomic_store(&m->hold_ns, ms > 0 ? dns(CLOCK_MONOTONIC) + (uint64_t)ms * 1000000ull : 0);
+        return;
+    }
     const struct azc_info *c = card(k);
     if (!c || CFD[CKS[k]] < 0) return;
+
+#define HOLD_CAP_MS 1500
+#define HOLD_BUDGET_MS 3000
+    static uint32_t budget_gen = UINT32_MAX; static double budget_t0 = 0; static int budget_said = 0;
+    if (ms > 0) {
+        const double tn = cnow();
+        if (c->gen != budget_gen) {
+            budget_gen = c->gen; budget_said = 0;
+            const uint64_t used = c->read + c->stand_in;
+            budget_t0 = used < (uint64_t)(c->rate ? c->rate : 48000) / 2 ? tn : -1;   /* −1: never held, this stream */
+        }
+        const double left = budget_t0 < 0 ? 0 : HOLD_BUDGET_MS - (tn - budget_t0) * 1000.0;
+        if (left <= 0) {
+            ms = 0;
+            if (!budget_said++) slog("input %d: the « audiolaz » card's stream not held (%s): its application's clock goes on", k,
+                                     budget_t0 < 0 ? "played already" : "held 3 s already");
+        } else if (ms > left) ms = (int)left;
+        if (ms > HOLD_CAP_MS) ms = HOLD_CAP_MS;
+    }
     __u32 v = ms > 0 ? (__u32)ms : 0;
     static uint32_t said_gen = UINT32_MAX;
     const int r = ioctl(CFD[CKS[k]], AZC_IOC_HOLD, &v);
@@ -221,7 +260,9 @@ int src_active(int k) {
         const uint64_t w = atomic_load(&m->w), now = dns(CLOCK_MONOTONIC);
         if (!lt) { lw = w; lt = now - 3000000000ull; }   /* first seen: playing once it writes (not a killed app's) */
         else if (w != lw) { lw = w; lt = now; }
-        return atomic_load(&m->running) && atomic_load(&m->rate) >= 8000 && now - lt < 2000000000ull;
+        /* an uplink's ring (lx 2) keeping its music for this player while its output opens (hold_ns): still
+         * active, nothing written meanwhile */
+        return atomic_load(&m->running) && atomic_load(&m->rate) >= 8000 && (now - lt < 2000000000ull || (atomic_load(&m->lx) == 2 && atomic_load(&m->hold_ns) > now));
     }
     if (!ctl || !active_vals[k] || snd_ctl_elem_read(ctl, active_vals[k]) < 0) return read_loop_sub(k).running;
     return snd_ctl_elem_value_get_boolean(active_vals[k], 0);
@@ -445,7 +486,7 @@ int src_poll_fds(src_pcm *s, struct pollfd *fds, int max) { if (s->card) { if (s
 void src_close(src_pcm *s) {
     if (!s) return;
     if (s->card) { free(s->cbuf); if (s->tfd >= 0) close(s->tfd); }   /* the device stays open: the card's next stream */
-    else if (s->m) { atomic_store(&s->m->beat, 0); if (s->tfd >= 0) close(s->tfd); }   /* the plugin's host clock at once */
+    else if (s->m) { atomic_store(&s->m->beat, 0); atomic_store(&s->m->hold_ns, 0); if (s->tfd >= 0) close(s->tfd); }   /* the plugin's host clock at once */
     else snd_pcm_close(s->p);
     free(s);
 }
@@ -470,7 +511,11 @@ int src_option(const char *name, const char *value) {
         if (e != value && *e == '=' && cs >= 0 && cs < CS_MAX) snprintf(CPATH[cs], sizeof CPATH[cs], "%s", e + 1);
         return 1;
     }
-    if (!strcmp(name, "--in-card-name")) { card_arrow = !strcmp(value, "arrow"); return 1; }
+    if (!strcmp(name, "--in-card-name")) {
+        card_arrow = !strcmp(value, "arrow");
+        if (value[0] == '=') az_shown(card_fixed, sizeof card_fixed, value + 1);   /* the rule's own cut */
+        return 1;
+    }
     if (!strcmp(name, "--in-card")) {               /* k[=s],…: input k reads the card's stream s (0 by default) */
         cks_init();
         for (int k = 0; k < SRC_MAX; k++) CKS[k] = -1;

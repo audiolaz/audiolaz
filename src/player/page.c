@@ -26,6 +26,7 @@
 #include "netout.h"
 #include "out.h"
 #include "alsa_hw.h"
+#include "remote_in.h"   /* play, pause, next, previous for AirPlay and Spotify Connect: POST /remote */
 #define hypot(a, b) sqrt((a) * (a) + (b) * (b))   /* hypot is GLIBC_2.35 ; the phasor is near 1: nothing overflows */
 
 volatile int page_image_pct = 100;
@@ -36,6 +37,13 @@ volatile int page_limiter_on = 1;
 volatile double page_in_peak = 0;
 volatile int page_lat_ring = 0, page_lat_rt = 0, page_lat_link = 0;
 static int lat_bound(long v, long lo, long hi) { return v <= 0 ? 0 : v < lo ? (int)lo : v > hi ? (int)hi : (int)v; }
+
+static int out_same(const char *a, const char *b) {
+    if (!a) a = "";
+    if (!b) b = "";
+    return !strcmp(!strcmp(a, "default") ? "" : a, !strcmp(b, "default") ? "" : b);
+}
+#include "vol_page.h"
 static char rooms_dir[512], out_label[128], level_mode[16] = "auto";
 int page_level_manual(void) { return !strcmp(level_mode, "manual"); }
 /* The app's address : http(s)://, a host, a port, a path, of safe characters only (nothing to escape in the JSON
@@ -69,12 +77,14 @@ static const char *SOUND_NAME[NSOUNDS] = { "Neutral", "Balanced", "Warm", "Analo
 #define THE_DAC "the DAC"
 #define IN_MAC "All the Mac’s apps"
 #define ROOM_EARLIER "Room installed earlier"
+#define NO_LICENCE "no licence here: its room's filter not played"
 #else
 static const char *SOUND_NAME[NSOUNDS] = { "Neutre", "Équilibré", "Chaleureux", "Analogique", "Personnalisé" };
 #define NO_CORRECTION "Sans correction"
 #define THE_DAC "le DAC"
 #define IN_MAC "Toutes les apps du Mac"
 #define ROOM_EARLIER "Pièce installée avant"
+#define NO_LICENCE "pas de licence ici : le filtre de la pièce n’est pas joué"
 #endif
 static int control_get(const char *key, char *out, size_t len);
 
@@ -106,6 +116,8 @@ static void place_name(const char *rooms, const char *id, char *name, size_t nn)
 void page_sound_label(const char *key, char *sound, size_t sl, char *room, size_t rl) {
     snprintf(sound, sl, "%s", NO_CORRECTION);
     if (room && rl) room[0] = 0;
+
+    if (key && !strcmp(key, "-L")) { if (room && rl) snprintf(room, rl, "%s", NO_LICENCE); return; }
     const char *slash = key ? strrchr(key, '/') : NULL;
     if (!key || !strcmp(key, "-") || !slash) return;
     char id[128];
@@ -143,6 +155,11 @@ int page_outroom(const char *rooms, const char *out, char *id, size_t idn, char 
     if (base && bn) snprintf(base, bn, "%s", d);
     place_name(rooms, v, name, nn);
     return 1;
+}
+/* the room output out plays in, a real one only (places/<id>), else "" */
+static void out_room_of(const char *out, char *id, size_t n) {
+    const char *o = out && strcmp(out, "default") ? out : "";
+    if (!page_outroom(rooms_dir, o, id, n, NULL, 0, NULL, 0) || !place_ok(id)) id[0] = 0;
 }
 
 static void rooms_json(char *o, size_t len) {
@@ -439,6 +456,7 @@ static void save_conf(void) {
     fprintf(f, "mode=%s\nimage=%d\nlimiter=%d\n", level_mode, page_image_pct, page_limiter_on);
     if (app_url[0]) fprintf(f, "app=%s\n", app_url);
     if (page_lat_ring || page_lat_rt || page_lat_link) fprintf(f, "lat_ring=%d\nlat_rt=%d\nlat_link=%d\n", page_lat_ring, page_lat_rt, page_lat_link);
+    vol_conf_save(f);
     fclose(f);
 }
 static void load_conf(void) {
@@ -455,6 +473,7 @@ static void load_conf(void) {
         else if (!strncmp(line, "lat_rt=", 7)) page_lat_rt = lat_bound(atol(line + 7), 1, 89);
         else if (!strncmp(line, "lat_link=", 9)) page_lat_link = lat_bound(atol(line + 9), 10, 150);
         else if (!strncmp(line, "app=", 4) && app_url_ok(line + 4)) snprintf(app_url, sizeof app_url, "%s", line + 4);
+        else if (vol_conf_line(line)) { }
     }
     fclose(f);
 }
@@ -565,9 +584,12 @@ CURVE_CSS \
 "const on=s.state==='playing';$('st').classList.toggle('on',on);$('stt').textContent=on?T.playing:s.state==='busy'?T.busy:T.idle;\n" \
 "$('rt').textContent=on&&s.rate>0?(s.rate/1000).toFixed(s.rate%1000?1:0):'–';$('in').textContent=s.input==='squeeze'?'Roon':s.input||'–';\n" \
 "$('ch').textContent=s.inputChannels>2?T.first2(s.inputChannels):'';$('ch').hidden=!(s.inputChannels>2);outs(s);spks(s);\n" \
-"const P=s.soundPath,LL=s.bitPerfect===false&&s.bitPerfectLossless===true;$('bp').textContent=s.bitPerfect===true?T.bp:s.bitPerfect===false?(LL?T.lbp:T.nbp)+(s.bitPerfectWhy||[]).map(w=>T.why[w]||w).join(', '):T.ubp;$('bp').classList.toggle('acting',s.bitPerfect===true||LL);\n" \
+"const P=s.soundPath,LL=s.bitPerfect===false&&s.bitPerfectLossless===true,V=s.volume,VO=!!(V&&V.on),Z=VO&&s.bitPerfect===true&&!V.mute&&Math.abs(V.db)<0.005;\n" \
+"const VB=VO&&!Z&&(s.bitPerfect!==false||(s.bitPerfectWhy||[]).every(w=>['volume','changed','bits'].includes(w)));\n" \
+"$('bp').textContent=VB?T.vbp:s.bitPerfect===true?T.bp:s.bitPerfect===false?(LL?T.lbp:T.nbp)+(s.bitPerfectWhy||[]).map(w=>T.why[w]||w).join(', '):T.ubp;$('bp').classList.toggle('acting',!VB&&(s.bitPerfect===true||LL));\n" \
 "$('path').textContent=P?(P.inRate/1000)+' kHz'+(P.inBits?' · '+P.inBits+' bits':'')+' → '+((P.deviceRate||P.outRate)/1000)+' kHz · '+P.outBits+' bits'+(P.dac?' · '+P.dac:''):'';\n" \
-"const a=$('logo');if(s.appUrl){a.href=s.appUrl}else a.removeAttribute('href');$('room').hidden=!s.appUrl;if(s.appUrl)$('room').href=s.appUrl}catch(x){}setTimeout(tick,1000)}tick();\n"
+"$('volr').hidden=$('voln').hidden=!VO;if(VO)$('vol').textContent=V.mute?T.muted:Math.abs(V.db)<0.05?'0 dB':(V.db<0?'\\u2212':'')+Math.abs(V.db).toFixed(Math.abs(Math.round(V.db)-V.db)>=0.05?1:0).replace('.',T.dec)+' dB';\n" \
+"const a=$('logo');if(s.appUrl){a.href=s.appUrl}else a.removeAttribute('href');$('roomb').hidden=!s.appUrl;if(s.appUrl)$('room').href=s.appUrl}catch(x){}setTimeout(tick,1000)}tick();\n"
 static const char PAGE[] =
 #ifdef ROOM_EN
 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
@@ -586,22 +608,26 @@ PAGE_CSS
 "<div class=\"row\"><span id=\"bp\">…</span><span id=\"path\"></span></div>\n"
 "<div class=\"row note\" id=\"ch\" hidden></div>\n"
 "<div class=\"row\"><span>To</span><span><select id=\"outs\" onchange=\"outp(this.value)\" hidden></select><span id=\"out\">…</span></span></div>\n"
-"<div class=\"row note\"><span>The music goes to the output as it came, bit for bit. Room correction: audiolaz Room, in the app.</span></div>\n"
-"</div><p><a class=\"logo\" id=\"room\" hidden>audiolaz Room ›</a></p>\n"
+"<div class=\"row\" id=\"volr\" hidden><span>Volume</span><span id=\"vol\">…</span></div>\n"
+"<div class=\"row note\" id=\"voln\" hidden><span>64-bit, after everything else: bit-perfect at 0 dB.</span></div>\n"
+"<div class=\"row note\"><span>Your DAC’s sound, intact: bit-perfect, verified, at the pace of its own clock. Controlled from your phone.</span></div>\n"
+"</div><div id=\"roomb\" hidden><div class=\"label\">Your room</div><div class=\"panel\"><a class=\"row\" id=\"room\" style=\"color:inherit;text-decoration:none\"><span>What your room does to the sound, and what its correction would give back</span><span>›</span></a></div></div>\n"
 SPK_HTML_EN
-"<script>const T={playing:'playing',busy:'output busy',idle:'waiting',first2:n=>'A source of '+n+' channels: its first two (needed for this output)',\n"
-"bp:'Bit-perfect, verified',nbp:'Not intact: ',lbp:'Lossless, verified: ',ubp:'Bit-perfect: not known yet',why:{swap:'left and right swapped',polarity:'polarity inverted',channels:'channels (needed for this output)',bits:'word length (needed for this output)',rate:'rate (needed for this device)',output:'converted by the AirPlay device',dropped:'frames dropped',changed:'samples changed'}};\n"
+"<script>const T={playing:'playing',busy:'output busy',idle:'waiting',first2:n=>'A source of '+n+' channels: its first two (needed for this output)',muted:'Muted',dec:'.',\n"
+"bp:'Bit-perfect, verified',vbp:'Adjustable volume: bit-perfect at 0 dB',nbp:'Not intact: ',lbp:'Lossless, verified: ',ubp:'Bit-perfect: not known yet',why:{volume:'volume set here (bit-perfect at 0 dB)',swap:'left and right swapped',polarity:'polarity inverted',channels:'channels (needed for this output)',bits:'word length (needed for this output)',rate:'rate (needed for this device)',output:'converted by the AirPlay device',dropped:'frames dropped',changed:'samples changed'}};\n"
 #else
 "<div class=\"label\">Lecture</div><div class=\"panel\">\n"
 "<div class=\"row\"><span>Depuis</span><span id=\"in\">–</span></div>\n"
 "<div class=\"row\"><span id=\"bp\">…</span><span id=\"path\"></span></div>\n"
 "<div class=\"row note\" id=\"ch\" hidden></div>\n"
 "<div class=\"row\"><span>Vers</span><span><select id=\"outs\" onchange=\"outp(this.value)\" hidden></select><span id=\"out\">…</span></span></div>\n"
-"<div class=\"row note\"><span>La musique va à la sortie telle qu’elle arrive, au bit près. La correction de la pièce : audiolaz Room, dans l’app.</span></div>\n"
-"</div><p><a class=\"logo\" id=\"room\" hidden>audiolaz Room ›</a></p>\n"
+"<div class=\"row\" id=\"volr\" hidden><span>Volume</span><span id=\"vol\">…</span></div>\n"
+"<div class=\"row note\" id=\"voln\" hidden><span>En 64 bits, après tout le reste\u00a0: bit-perfect à 0\u00a0dB.</span></div>\n"
+"<div class=\"row note\"><span>Le son de votre DAC, intact\u00a0: bit-perfect vérifié, au rythme de son horloge. Piloté depuis votre téléphone.</span></div>\n"
+"</div><div id=\"roomb\" hidden><div class=\"label\">Votre pièce</div><div class=\"panel\"><a class=\"row\" id=\"room\" style=\"color:inherit;text-decoration:none\"><span>Ce que votre pièce fait au son, et ce que la correction rendrait</span><span>›</span></a></div></div>\n"
 SPK_HTML_FR
-"<script>const T={playing:'en lecture',busy:'sortie occupée',idle:'en attente',first2:n=>'Une source de '+n+' voies : ses deux premières (conversion nécessaire pour cette sortie)',\n"
-"bp:'Bit-perfect, vérifié',nbp:'Pas intact : ',lbp:'Sans perte, vérifié : ',ubp:'Bit-perfect : pas encore vérifié',why:{swap:'gauche et droite inversées',polarity:'phase inversée',channels:'voies (conversion nécessaire pour cette sortie)',bits:'résolution (conversion nécessaire pour cette sortie)',rate:'fréquence (conversion nécessaire pour cet appareil)',output:'converti par l’appareil AirPlay',dropped:'échantillons perdus',changed:'échantillons modifiés'}};\n"
+"<script>const T={playing:'en lecture',busy:'sortie occupée',idle:'en attente',first2:n=>'Une source de '+n+' voies : ses deux premières (conversion nécessaire pour cette sortie)',muted:'Muet',dec:',',\n"
+"bp:'Bit-perfect, vérifié',vbp:'Volume réglable : bit-perfect à 0 dB',nbp:'Pas intact : ',lbp:'Sans perte, vérifié : ',ubp:'Bit-perfect : pas encore vérifié',why:{volume:'volume réglé ici (bit-perfect à 0 dB)',swap:'gauche et droite inversées',polarity:'phase inversée',channels:'voies (conversion nécessaire pour cette sortie)',bits:'résolution (conversion nécessaire pour cette sortie)',rate:'fréquence (conversion nécessaire pour cet appareil)',output:'converti par l’appareil AirPlay',dropped:'échantillons perdus',changed:'échantillons modifiés'}};\n"
 #endif
 PLAYER_JS
 SPK_JS
@@ -791,7 +817,7 @@ static void state_json(int c) {
     char hv[340];
     int heard = -1;
     status_get("heard", hv, sizeof hv);
-    if (!strcmp(hv, "-")) heard = 0;
+    if (!strcmp(hv, "-") || !strcmp(hv, "-L")) heard = 0;
     else if (rhas && hv[0]) {
         char *sl = strrchr(hv, '/');
         if (sl) {
@@ -908,9 +934,11 @@ static void state_json(int c) {
         , ubyj, used == 2 ? "true" : "false", tkrj, tkbj, players, ceil(rtry), rtryj
         );
     lim_now.frames = 0; lim_now.limited = 0; lim_now.min_gain = 1; lim_now.peak = 0; page_in_peak = 0;
+    if (n > 0 && (size_t)n < sizeof b) n = vol_json(b, sizeof b, n);
     if (n > 0 && (size_t)n < sizeof b) n = channels_json(b, sizeof b, n);   /* */
     if (n > 0 && (size_t)n < sizeof b) n = spk_json(b, sizeof b, n);        /* the speakers' channels */
     if (n > 0 && (size_t)n < sizeof b) n = upnp_json(b, sizeof b, n);   /* */
+    if (n > 0 && (size_t)n < sizeof b) n = remote_in_json(b, sizeof b, n, rooms_dir);   /* remote_in.h */
     if (n > 0 && (size_t)n < sizeof b) n = link_json(b, sizeof b, n, outc0);   /* */
     if (n > 0 && (size_t)n < sizeof b) n = variant_json(b, sizeof b, n);       /* the free player or Room's */
     reply(c, "application/json", b, (size_t)n);
@@ -935,7 +963,8 @@ static void handle(int c) {
 
     if (!strcmp(method, "POST")) {
         static const char *const FREE[] = { "/measure", "/measure/stop", "/airplay-buffered", "/airplay-meta-log", "/app", "/output",
-                                            "/take", "/upnp", "/airplay", "/latency", "/nowplaying", "/nowplaying/cover", "/channels" };
+                                            "/take", "/upnp", "/airplay", "/latency", "/nowplaying", "/nowplaying/cover", "/channels", "/remote",
+                                            "/volume" };
         int free_ = !strcmp(path, "/listen") && q && !strcmp(q, "to=0");
         for (size_t i = 0; !free_ && i < sizeof FREE / sizeof *FREE; i++) free_ = !strcmp(path, FREE[i]);
         if (!free_) {
@@ -955,6 +984,15 @@ static void handle(int c) {
         return;
     }
     if (!strcmp(path, "/state")) { snap_begin(); state_json(c); snap_end(); return; }   /* the files read once */
+
+    if (!strcmp(method, "POST") && !strcmp(path, "/volume")) { vol_post(c, q); return; }
+    /* play, pause, next, previous for AirPlay's and Spotify's senders (remote_in.h): POST /remote?src=&c= */
+    if (!strcmp(method, "POST") && !strcmp(path, "/remote")) {
+        char b[96];
+        const int code = remote_in_post(rooms_dir, q ? q : "", b, sizeof b);
+        reply_code(c, code == 200 ? "200 OK" : code == 409 ? "409 Conflict" : "400 Bad Request", "application/json", b, strlen(b));
+        return;
+    }
     if (!strcmp(path, "/latency") && !strcmp(method, "GET")) {
         char b[1024];
         const int m = roomd_latency_json(b, sizeof b);
@@ -1204,8 +1242,15 @@ static void *page_main(void *arg) {
     (void)arg;
     for (;;) {
         struct pollfd pf = { listen_fd, POLLIN, 0 };
-        const int r = poll(&pf, 1, 1000);
-        sounds_check();
+        const int r = poll(&pf, 1, 250);                 /* four times a second: the volume's sources (vol_tick) */
+        {
+            static double t_sounds = 0;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const double tn = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+            if (r > 0 || tn - t_sounds >= 1.0) { t_sounds = tn; sounds_check(); }
+        }
+        vol_tick();
         if (r <= 0) continue;
         int c = accept(listen_fd, NULL, NULL);
         if (c < 0) { usleep(100000); continue; }

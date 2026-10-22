@@ -28,6 +28,8 @@ int src_closed(int k);
 int src_paced(int k);
 
 int src_io_ended(int k);
+
+int src_keeps(int k);
 /* The events that wake the main loop when a source starts or stops (the Loopback's control), into fds (max of them):
  * how many; src_drain: read them (after poll). */
 int src_event_fds(struct pollfd *fds, int max);

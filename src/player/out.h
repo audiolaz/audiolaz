@@ -24,6 +24,16 @@ long out_avail(out_pcm *o);
 int out_delay(out_pcm *o, long *frames);
 /* Its buffer and period as taken (frames). */
 void out_params(out_pcm *o, unsigned long *buffer, unsigned long *period);
+/* No more music this stream (the receiver waits for its last frames to be heard): what the device finds short
+ * from now on is its play-out, not a gap (out_coreaudio.c tells them apart at out_close); the next write ends it.
+ * out_gaps: the gaps heard so far (a device found short, then music: macOS; Linux's show as negative out_write);
+ * out_grown_ms: how much its buffer grew since it opened (azgrow.h: the receiver takes as much more on its ring). */
+void out_drain(out_pcm *o);
+long out_gaps(out_pcm *o);
+double out_grown_ms(out_pcm *o);
+/* a line the device has for the journal (its buffer grown), never written by its writer: 1 copied, 0 none
+ * (macOS: its own watch writes them). Under the caller's lock on o. */
+int out_said(out_pcm *o, char *buf, size_t len);
 /* After a negative out_write or out_avail: the device made ready for the next writes, its stream going on (ALSA:
  * an underrun, its buffer run dry, or a suspend: snd_pcm_recover) — 0; −1 when it cannot be (unplugged, taken; macOS
  * always): closed and opened again then. The receiver's (audiolaz-recv.c): a DAC late by its thread, a gap heard, never
@@ -55,6 +65,8 @@ void out_list_json(char *out, size_t len);
  * out_card_ok: a device name the page may set (no character the control file or the JSON cannot hold). */
 #ifdef __APPLE__
 #define OUT_CARD_PREFIX "ca:"
+#elif defined(__CYGWIN__)
+#define OUT_CARD_PREFIX "wasapi:"   /* Windows: a WASAPI endpoint by its id (engine/win/out_wasapi.c) */
 #else
 #define OUT_CARD_PREFIX "alsa:"
 #endif
@@ -66,6 +78,16 @@ int out_option(const char *name, const char *value);
 /* --list-devices (anywhere on the command line): this machine's outputs for the app (src/player.js), JSON on stdout:
  * [{"name","uid","maxRate","default"}]; then roomd quits. */
 void out_print_devices(void);
+#ifdef __APPLE__
+
+int out_dev_info(const char *dev, char *uid, size_t ul, char *name, size_t nl);
+#endif
+
+enum { OUT_REF_NONE = 0, OUT_REF_RATE = 1, OUT_REF_START = 2, OUT_REF_BUSY = 3 };
+void out_native_only(int on);
+int out_last_refusal(void);
+unsigned long out_dev_serial(const char *dev);
+int out_rates_text(const char *dev, char *out, size_t len);
 /* The system's default output when no --dac is given ("plughw:0,0" on Linux, "default" on macOS: the default device). */
 const char *out_default_dev(void);
 /* The device dev names there now: 1, or 0 (unplugged). Linux: a card named by its id (CARD=<id>) found, any

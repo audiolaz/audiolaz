@@ -1,8 +1,12 @@
 # audiolaz Link — protocol
 
 audiolaz Link carries a stereo PCM stream from a **sender** (the audiolaz player, `src/player/anet_send.c`) to a
-**receiver** beside the DAC (`src/player/audiolaz-recv.c`), bit for bit, the DAC's clock pacing the sender. The
-definitions are in `src/player/anet.h`; this page is enough to write either side.
+**receiver** beside the DAC (`src/player/audiolaz-recv.c`: ALSA on Linux, Core Audio on macOS), bit for bit, the
+DAC's clock pacing the sender. The definitions are in `src/player/anet.h`; this page is enough to write either side.
+
+A receiver may also play into another player's input instead of a DAC (`audiolaz-recv --dac shm:<name>`: the ring of
+`src/player/audiolaz_drv.h`, read by that player at its own output's pace). Its reports then carry that player's pace,
+and that player's latency in their last word (`after`, below): a chain of players keeps one clock, the last DAC's.
 
 Everything is little-endian. Protocol 3 is described; it stays compatible with version 2 peers (below).
 
@@ -28,7 +32,12 @@ request (a stream header with rate 0) on the TCP port answers the same.
    | 24 | u32 | frames per packet (nominal) |
    | 28 | u32 | packet interval, µs |
 
-   INFO: the receiver answers 192 bytes, `AZI2` then `id=…;dac=…;max=…;v=…;hw=…`, NUL-padded, and closes.
+   INFO: the receiver answers 192 bytes, `AZI2` then `id=…;dac=…;max=…;v=…;hw=…`, NUL-padded, and closes. Optional
+   keys, each whole or absent (a reader skips the ones it does not know): `rates=44100,48000,…` the PCM rates its DAC
+   takes as it is now (a rate it lists but would not go to left out once tried), `err=dac-start` while its DAC refuses
+   to start, `room=<name>` the room a receiver that feeds another player serves. An INFO request may say who asks in
+   its capabilities word: `0x555xxxxx` (an uplink: bit 0 its system output is its own « audiolaz » device, bit 1 that
+   device is there); a receiver before ignores it.
 
 2. **Data**: UDP datagrams, sender → receiver port P, each a 24-byte header then the frames:
 
@@ -76,6 +85,12 @@ Offered by the sender in the header's capabilities word, used only once the rece
 - `CAP_STATE` (4): both sides tell their state and why they stop.
 - `CAP_WHO` (8): right after its header the sender sends `HELLO`, `player=<unique id>\nname=<name>\ntake=0|1\n`,
   padded with spaces to a multiple of 8 bytes (never a NUL).
+- `CAP_RATES` (16): the sender converts rates itself: a rate the DAC does not take as it is is refused (reason 2)
+  rather than resampled at the receiver; the sender asks INFO's `rates=` and sends at one of them. Not part of the
+  protocol-3 handshake (a receiver that ignores it resamples as before).
+
+A receiver whose DAC refuses to start stops the stream with reason 15 (« the DAC refuses to start: unplug it and plug
+it in again ») and refuses new streams a while with reason 6, sooner once the device is seen plugged in again.
 
 **The ring, sized by the network.** The receiver measures each packet's lateness (its one-way delay less the least of
 the last 10 s), keeps a high quantile of each second's (0.999) and the largest of those over the last minutes, and asks
@@ -84,16 +99,34 @@ raised at once, lowered only by more than 10 % or 10 ms. The sender moves the ri
 sample**: music read ahead is sent a little faster (+25 % at most) or 1 % slower; a live source gets digital silence
 added before its first frame or inside a silence, or zeros of a silence left out — never more than it put in.
 
+Since 22/10 the buffers size themselves before they run short, never only after a gap. The receiver starts a stream on
+its target (the jitter it remembers from that sender included) once its ring also holds what its DAC's buffer takes at
+the start (a stream that follows the last one's tail at the same rate starts on its start, the DAC still playing that
+tail); from 176.4 kHz up its start is half as long again; on a Mac it starts at 200 ms. It raises its target at
+once (× 1.5, 20 ms more at least) when its ring falls under 30 % of its start while it plays, or runs dry, and adds what
+its own DAC's buffer grew by; it lowers it only after long calm (twice its peaks' memory, 10 minutes by default), a tenth
+at a time. Its DAC's buffer grows the same way (its lowest under 40 % of it: × 1.5, up to 500 ms), and while its
+ring is dry it lets that buffer play on instead of writing silence before the music still to come. A live sender also
+leaves out zeros of a silence when the ring stands far above what the receiver asks (40 ms, a fifth of it, averaged
+over 2 s, from 3 s after the receiver plays), or adds silence when it stands as far below; a source read at the sender's pace (a sound card whose app follows
+its clock) is pulled up to ±1000 ppm, any other ±300 ppm. Each gap is counted in the reports' underruns.
+
 Reports grow to 80 bytes (magic `AZR3`): the 40 bytes above, then u32 target (frames), u32 late (µs, the last second's
 quantile), u32 peak (µs), u32 underruns, u32 adjustments, u32 ring min, u32 ring max, u16 state (0 idle, 1 filling,
 2 playing, 3 paused, 4 draining, 5 drained, 6 DAC refused, 7 DAC failed, 8 stopped), u16 the last stop's reason, u32 the
-last ping's sequence number, u32 0.
+last ping's sequence number, u32 `after`: what is heard after the frames `played` counts, beyond the receiver's own DAC
+buffer, µs (another player behind the receiver: its own latency; 0 for a receiver beside its DAC, and from every
+receiver before it was defined). Never part of `played` (the sender's clock follows `played`); the sender counts it in
+what it holds unheard.
 
 `PING` (8-byte payload: u32 sequence, u32 the sender's state: 1 starting, 2 playing, 3 paused, 4 ending, or'ed with
 0x100 for a live source) every 500 ms; the receiver answers each with a report at once. No report for 1 s: each ping is
 a question; 5 s of questions unanswered: the receiver is lost. No ping nor packet for 10 s: the receiver ends the stream.
 
-`META` (≤ 4096 bytes): `key=value` lines in UTF-8, `title`, `artist`, `album`, `cover` (an `http://` URL).
+`META` (≤ 4096 bytes): `key=value` lines in UTF-8, `title`, `artist`, `album`, `cover` (an `http://` URL),
+`volume_cdb` (the sender's volume, hundredths of a dB below full, 6000 and above silence: for a player behind the
+receiver to apply after its own processing; a receiver beside its DAC applies none). Sent before the stream's first
+packet, then when it changes.
 
 Reasons (`STOP`, `END`, reports): 0 none, 1 the music's end, 2 stopped by the source, 3 another rate next, 4 settings
 changed, 5 the source changed, 6 the other side silent, 7 taken by another sender, 8 the DAC failed, 9 the program ends,

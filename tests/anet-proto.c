@@ -50,8 +50,12 @@ int main(void) {
         CHECK(n3 == ANET_REP3 && anet_rep_len(b) == ANET_REP3 && anet_rep_parse(b, &q3) == 0 && q3.v3 && q3.target == 14400 && q3.late_us == 12345 && q3.peak_us == 130000
               && q3.underruns == 2 && q3.adjusts == 3 && q3.ring_min == 100 && q3.ring_max == 20000 && q3.state == ANET_RS_PLAYING && q3.why == ANET_WHY_LOST && q3.seq == 77
               && q3.played == 1 && q3.received == 2 && q3.ring == 3 && q3.reason == 4, "protocol 3 report (AZR3, 80 bytes) round trip");
+        CHECK(q3.after_us == 0 && anet_g32(b + 76) == 0, "a receiver beside its DAC: its report's last word 0, as before 21/10");
+        r3.after_us = 412345;   /* another player behind the receiver (the Mac's uplink into a room's corrector) */
+        anet_rep_pack(b, &r3);
+        CHECK(anet_rep_parse(b, &q3) == 0 && q3.after_us == 412345 && q3.seq == 77 && q3.why == ANET_WHY_LOST, "protocol 3 report: what is heard after the receiver's DAC (µs) carried in its last word");
         r3.v3 = 0;
-        CHECK(anet_rep_pack(b, &r3) == ANET_REP && anet_rep_len(b) == ANET_REP && anet_rep_parse(b, &q3) == 0 && !q3.v3, "version-2 report still 40 bytes (AZR1)");
+        CHECK(anet_rep_pack(b, &r3) == ANET_REP && anet_rep_len(b) == ANET_REP && anet_rep_parse(b, &q3) == 0 && !q3.v3 && q3.after_us == 0, "version-2 report still 40 bytes (AZR1)");
         char v[64];
         anet_meta_get("title=Kind of Blue\nartist=Miles Davis\ncover=http://1.2.3.4:9001/cover/7.jpg\n", "artist", v, sizeof v);
         CHECK(!strcmp(v, "Miles Davis"), "meta: a value read");

@@ -42,6 +42,8 @@ ap.add_argument('--skip-at', type=float, default=0, help='strm q then strm s tra
 ap.add_argument('--quiet', action='store_true', help='no STMt heartbeat lines')
 ap.add_argument('--tone', type=float, default=0, help='track 1\'s tone in Hz, a whole number (default 440; each next '
                 'track 1.25 times the one before), at -20 dBFS (10/10, tests/mac-roomd-out.py: 1 kHz resampled)')
+ap.add_argument('--noise', type=float, default=0, help='(22/10) in place of the tone: this many seconds of mono music-like noise '
+                '(pinkish, about -20 dBFS, the same on both channels, seeded: the same each run), looped')
 ap.add_argument('--right-tone', type=float, default=0, help='the right channel\'s own tone in Hz, a whole number, at -26 dBFS '
                 '(20/10, the speakers\' channels: left and right told apart); 0 (default): the left\'s on both')
 ap.add_argument('--gapless', action='store_true', help='tracks of the same rate in one HTTP stream, the zone following the '
@@ -101,7 +103,30 @@ def fmt_of(n):
     return 'f' if A.flac else 'p'
 
 
+def noise_of(n):
+    """(22/10, the Windows player's bench) A.noise seconds of mono pinkish noise, the same
+    every run: music that is no tone, so that a copy of it can be found again in a recording (no period under them)."""
+    import random
+    R = rate_of(n)
+    rnd = random.Random(1000 + n)
+    out = bytearray(int(R * A.noise) * FRAME)
+    b0 = b1 = b2 = 0.0
+    for i in range(int(R * A.noise)):
+        w = rnd.uniform(-1.0, 1.0)
+        b0 = 0.99765 * b0 + w * 0.0990460
+        b1 = 0.96300 * b1 + w * 0.2965164
+        b2 = 0.57000 * b2 + w * 1.0526913
+        x = (b0 + b1 + b2 + w * 0.1848) * 0.05
+        v = int(round(max(-0.95, min(0.95, x)) * (1 << 23))) & 0xffffff
+        bb = bytes((v & 0xff, v >> 8 & 0xff, v >> 16 & 0xff))
+        out[i * FRAME:i * FRAME + 3] = bb
+        out[i * FRAME + 3:i * FRAME + 6] = bb
+    return bytes(out)
+
+
 def second_of(n):
+    if A.noise:
+        return noise_of(n)
     R = rate_of(n)
     f = (A.tone or 440.0) * (1.25 ** (n - 1))
     amp = 0.1 * (1 << 23)

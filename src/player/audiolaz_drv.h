@@ -2,6 +2,7 @@
 #ifndef AUDIOLAZ_DRV_H
 #define AUDIOLAZ_DRV_H
 #include <stdatomic.h>
+#include <stddef.h>                    /* offsetof */
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -34,11 +35,15 @@ typedef struct {
     uint64_t zh;
 
     _Atomic uint64_t rd;
-    _Atomic uint32_t fmt, lx;          /* lx: 1, the Linux plugin's ring */
+    _Atomic uint32_t fmt, lx;          /* lx: 1, the Linux plugin's ring; 2, an uplink's (below) */
     _Atomic uint64_t t0;
-    uint8_t pad[128 - 4 * 3 - 4 * 3 - 8 * 3 - 4 * 2 - 8 * 3 - 8 * 3];
+
+    _Atomic uint32_t lat_us, vol_cdb;
+    _Atomic uint64_t hold_ns;
+    uint8_t pad[128 - 4 * 3 - 4 * 3 - 8 * 3 - 4 * 2 - 8 * 3 - 8 * 3 - 4 * 2 - 8];
     float data[AZ_RING * AZ_CH];
 } az_shm;
+_Static_assert(offsetof(az_shm, data) == 128, "az_shm: its header 128 bytes, as every driver and plugin built before");
 
 /* The device's sample time now, by its last zero time stamp (0: none yet) */
 static inline double az_now(az_shm *m, uint64_t host) {
@@ -92,11 +97,30 @@ static inline const char *az_info_name(void) {
 
 #define AZ_SHOWN_MAX 32
 #define AZ_SHOWN_TAG " (audiolaz)"
+#define AZ_SHOWN_ARROW "audiolaz \xe2\x86\x92 "
 static inline void az_shown(char *d, size_t n, const char *dac) {
     char b[AZ_INFO_TEXT * 2];
     size_t w = 0;
     if (n > AZ_SHOWN_MAX) n = AZ_SHOWN_MAX;
     if (!n) return;
+    if (dac && !strncmp(dac, AZ_SHOWN_ARROW, sizeof AZ_SHOWN_ARROW - 1)) {
+        size_t k = 0;
+        while (dac[k] && k + 1 < n) {
+            const unsigned char c = (unsigned char)dac[k];
+            const size_t cw = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+            if (k + cw + 1 > n) break;
+            k += cw;
+        }
+        if (dac[k] && dac[k] != ' ') {                 /* cut: at a word's end, after the arrow */
+            size_t sp = k;
+            while (sp > sizeof AZ_SHOWN_ARROW - 1 && dac[sp] != ' ') sp--;
+            if (sp > sizeof AZ_SHOWN_ARROW - 1) k = sp;
+        }
+        while (k > 0 && dac[k - 1] == ' ') k--;
+        memcpy(d, dac, k); d[k] = 0;
+        for (size_t i = 0; i < k; i++) if ((unsigned char)d[i] < 0x20 || d[i] == '"' || d[i] == '\\' || d[i] == '%') d[i] = ' ';
+        return;
+    }
     for (const char *q = dac ? dac : ""; *q && w + 1 < sizeof b; q++) {
         const unsigned char c = (unsigned char)*q;
         if (c < 0x20 || c == 0x7f || c == '"' || c == '\\' || c == '%') continue;

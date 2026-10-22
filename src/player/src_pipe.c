@@ -240,20 +240,22 @@ static int air_multi_setting(void) {
     return v;
 }
 
-static int air_has_boff(void) {      /* the receiver's program knows buffered_latency_offset_in_seconds (read once) */
-    static int known = -1;
-    if (known >= 0) return known;
-    known = 0;
+static int air_knows(const char *key, int *known) {   /* the receiver's program names this setting (read once) */
+    if (*known >= 0) return *known;
+    *known = 0;
     FILE *f = fopen(A.recv, "rb");
-    if (!f) return known;
-    static const char key[] = "buffered_latency_offset_in_seconds";
+    if (!f) return *known;
     struct stat st;
     char *buf = !fstat(fileno(f), &st) && st.st_size > 0 && st.st_size < (64 << 20) ? malloc((size_t)st.st_size) : NULL;
-    if (buf && fread(buf, 1, (size_t)st.st_size, f) == (size_t)st.st_size && memmem(buf, (size_t)st.st_size, key, sizeof key - 1)) known = 1;
+    if (buf && fread(buf, 1, (size_t)st.st_size, f) == (size_t)st.st_size && memmem(buf, (size_t)st.st_size, key, strlen(key))) *known = 1;
     free(buf);
     fclose(f);
-    return known;
+    return *known;
 }
+static int air_has_boff(void) { static int k = -1; return air_knows("buffered_latency_offset_in_seconds", &k); }
+/* play, pause, next, previous from the app (engine/alsa/remote_in.h): a receiver built with
+ * engine/linux/patches/shairport-sync-5.6.1-remote-pipe.patch reads them from <rooms>/airplay-remote */
+static int air_has_remote(void) { static int k = -1; return air_knows("remote_control_pipe", &k); }
 static int air_conf(void) {
     char old[16384] = "";
     FILE *f = fopen(A.conf, "r");
@@ -280,6 +282,8 @@ static int air_conf(void) {
         const char *eq = strchr(loff, '=');
         snprintf(lboff, sizeof lboff, "  buffered_latency_offset_in_seconds = %.3f; // audiolaz: kept by the player\n", eq ? atof(eq + 1) : 0.0);
     }
+    char lrem[760] = "";
+    if (air_has_remote()) snprintf(lrem, sizeof lrem, "  remote_control_pipe = \"%s/airplay-remote\"; // the app's play, pause, next (remote_in.h)\n", ROOMS);
     char lprep[760] = "", lplist[760] = "";
     for (const char *l = old; *l; ) {
         const char *e = strchr(l, '\n');
@@ -316,7 +320,7 @@ static int air_conf(void) {
         "  eight_channel_mode = \"%s\"; // audiolaz: AirPlay channels, the player's (%s)\n"
         "  mixdown = \"%s\"; // audiolaz: AirPlay channels, the player's (%s)\n"
         "  output_channel_mapping = \"off\"; // audiolaz: AirPlay channels, the player's (FFmpeg's order, the stream's channels first)\n"
-        "%s%s%s%s%s"
+        "%s%s%s%s%s%s"
         "};\n"
         "sessioncontrol =\n"
         "{\n"
@@ -336,7 +340,7 @@ static int air_conf(void) {
         "};\n"
         "%s", A.conf, lname, air_port, udp, ifl, AIR_D_S, multi ? "on" : "off", mw, multi ? "on" : "off", mw,
         multi ? "off" : "stereo", multi ? "multi: none, the player mixes" : "stereo: anything wider folded by the receiver",
-        loff, lprep, liv, ldecl, lboff, A.meta, lplist);
+        loff, lprep, liv, ldecl, lboff, lrem, A.meta, lplist);
     if (!strcmp(old, now)) return 0;
     char tmp[PATH_MAX + 16];
     snprintf(tmp, sizeof tmp, "%s/.airplay.conf.in", ROOMS);
@@ -1064,6 +1068,7 @@ double src_started(int k) { return k >= 0 && k < SUBS ? atomic_load(&in_[k].star
 int src_paced(int k) { (void)k; return 0; }   /* src.h: the Mac's driver input is steered instead (src_shift) */
 /* src.h: the driver's IO stopped by the HAL (StopIO: running 0), not a stall nor zeros */
 int src_io_ended(int k) { return k >= 0 && k < SUBS && in_[k].used && in_[k].drv && in_[k].shm && !atomic_load(&in_[k].shm->running); }
+int src_keeps(int k) { (void)k; return 0; }   /* src.h: none here (an uplink's ring is the box's) */
 int src_closed(int k) {
     if (k < 0 || k >= SUBS || !in_[k].used) return 1;
     if (in_[k].air && atomic_load(&A.session)) return 0;

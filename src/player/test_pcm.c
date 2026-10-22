@@ -1,5 +1,7 @@
 /* src/player/test_pcm.c: part of the audiolaz player (https://audiolaz.com). MIT licence: see LICENSE. */
 #include "squeeze.c"
+
+double page_vol_src(int src, double want, int mute, int fresh, int try_) { (void)src; (void)want; (void)mute; (void)fresh; (void)try_; return NAN; }
 static int feed(job *j, const uint8_t *data, size_t n) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return -1;

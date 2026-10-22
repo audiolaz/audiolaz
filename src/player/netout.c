@@ -28,6 +28,7 @@
 #include "netout.h"
 #include <sys/wait.h>
 #include "anet.h"
+#include "azsrc.h"    /* the corrector's own rate converter: a rate a receiver's DAC takes, never its machine's */
 
 #define BPF 6                    /* bytes per frame: two 24-bit samples (S.bpf: 4 to the AirPlay bridge, 10/10) */
 #define CHUNK 2048               /* frames packed per write */
@@ -64,6 +65,7 @@ typedef struct {
     int self;                                     /* AirPlay: the player's own AirPlay input (never listed, never played to) */
     char id[96], name[96], model[64], addr[48];   /* id: the MAC (aa:bb:…) or the UDN (uuid:…) */
     char hw[96];                                  /* audiolaz: its DAC's identity as it says it (anet.h anet_peer) */
+    char rates[96], err[24];                      /* audiolaz: the rates its DAC takes as it is, its error (INFO) */
     unsigned max_rate;                            /* its HELO's MaxSampleRate (0: not said) */
     double seen;
     int fd;                                       /* Squeezebox: its SlimProto connection */
@@ -1818,6 +1820,39 @@ static int last_asked = 0;
 int netout_open_asked(void) { return last_asked; }
 
 static int AZ = 0;                                     /* the stream playing is an audiolaz one */
+
+static char az_known_path[700] = "";
+void netout_state_dir(const char *dir) { if (dir && *dir) snprintf(az_known_path, sizeof az_known_path, "%s/link-known", dir); }
+static int az_known_get(const char *id, char *loc, size_t ll) {
+    if (!az_known_path[0] || !id || !*id) return -1;
+    FILE *f = fopen(az_known_path, "r");
+    char line[300]; int hit = -1;
+    while (f && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *sp = strchr(line, ' ');
+        if (!sp) continue;
+        *sp = 0;
+        if (!strcasecmp(line, id)) { snprintf(loc, ll, "%s", sp + 1); hit = 0; }
+    }
+    if (f) fclose(f);
+    return hit;
+}
+static void az_known_put(const char *id, const char *loc) {
+    char was[200] = "";
+    if (!az_known_path[0] || !id[0] || !loc[0] || strchr(id, ' ') || (!az_known_get(id, was, sizeof was) && !strcmp(was, loc))) return;
+    char tmp[720], line[300];
+    snprintf(tmp, sizeof tmp, "%s.%d", az_known_path, (int)getpid());
+    FILE *in = fopen(az_known_path, "r"), *out = fopen(tmp, "w");
+    if (!out) { if (in) fclose(in); return; }
+    int n = 0;
+    while (in && fgets(line, sizeof line, in) && n < 63) {
+        char k[100]; if (sscanf(line, "%99s", k) != 1 || !strcasecmp(k, id)) continue;
+        fputs(line, out); n++;
+    }
+    if (in) fclose(in);
+    fprintf(out, "%s %s\n", id, loc);
+    if (fclose(out) || rename(tmp, az_known_path)) unlink(tmp);
+}
 #define AZ_FORGET_S 60.0
 static void *az_browse_main(void *arg) {
     (void)arg;
@@ -1863,7 +1898,10 @@ static void *az_browse_main(void *arg) {
             snprintf(R[i].addr, sizeof R[i].addr, "%.47s", P[k].addr);
             snprintf(R[i].loc, sizeof R[i].loc, "%s:%d", P[k].addr, P[k].port);
             if (P[k].hw[0] || !R[i].hw[0]) snprintf(R[i].hw, sizeof R[i].hw, "%.95s", P[k].hw);   /* (an mDNS answer and INFO agree) */
+            if (P[k].rates[0]) snprintf(R[i].rates, sizeof R[i].rates, "%s", P[k].rates);   /* INFO's only */
+            if (P[k].rates[0] || P[k].err[0]) snprintf(R[i].err, sizeof R[i].err, "%s", P[k].err);
             R[i].max_rate = P[k].max_rate; R[i].seen = t;
+            az_known_put(R[i].id, R[i].loc);              /* its address kept by its id */
         }
         for (int j = 0; j < NRCV; j++)
             if (R[j].used && R[j].kind == NK_AUDIOLAZ && t - R[j].seen > AZ_FORGET_S && !(AZ && S.ri == j)) { nlog("audiolaz receiver \"%s\" no longer seen", R[j].id); R[j].used = 0; }
@@ -1900,14 +1938,64 @@ int netout_az_unknown(const char *spec, char *heard, size_t hl) {
     pthread_mutex_unlock(&rlk);
     return ri < 0 && !strchr(key, '.') && !strchr(key, ':');
 }
+
+#define AZQ_S 3.0
+static const double AZQ_STEPS[] = { 1, 2, 5, 10, 15 };
+static struct { char spec[160]; int n; double until; } AZQ;
+static char AZ_STUCK[160];                             /* the receiver whose DAC refuses to start ("" none) */
+int netout_dac_start(const char *spec) { return spec && AZ_STUCK[0] && !strcmp(spec, AZ_STUCK); }
+static void az_quick_note(const char *spec, int finish) {
+    unsigned rw = 0;
+    const int quick = !finish && anet_lost_early(AZQ_S, &rw);
+    if (strcmp(AZQ.spec, spec)) { memset(&AZQ, 0, sizeof AZQ); snprintf(AZQ.spec, sizeof AZQ.spec, "%s", spec); }
+    if (!quick) { AZQ.n = 0; return; }                 /* played (or lost later): forgotten */
+    const int k = AZQ.n < (int)(sizeof AZQ_STEPS / sizeof AZQ_STEPS[0]) ? AZQ.n : (int)(sizeof AZQ_STEPS / sizeof AZQ_STEPS[0]) - 1;
+    AZQ.n++;
+    AZQ.until = mono() + AZQ_STEPS[k];
+    if (rw == ANET_WHY_DAC_START) snprintf(AZ_STUCK, sizeof AZ_STUCK, "%s", spec);
+    nlog("%s: its stream lost within %.0f s of its start (%s%s%s): the next one asked in %.0f s", spec, AZQ_S, anet_why(),
+         rw ? ": " : "", rw ? anet_why_text(rw) : "", AZQ_STEPS[k]);
+}
+/* (21/10, point 7 of that evening: the Flex 8 DL took 48 kHz only, the stream went at 44.1 kHz, the Mac's Core Audio
+ * converted) A receiver that says the rates its DAC takes as it is (INFO rates=, asked before each stream): a stream at
+ * a rate it does not take goes at one it does, converted here by the corrector's own converter (azsrc.h: −156 dB of
+ * error in band), never at its machine; ANET_CAP_RATES offered, so that a receiver that learns a refusal only by trying
+ * (a Mac's device that lists a rate and stays at another) refuses it rather than resampling: its rates asked again,
+ * the stream opened again at one of them. The rate chosen: the same family above (44.1 → 88.2, 176.4), then any above,
+ * then the highest below (out_coreaudio.c's rule). The play upstream knows nothing of it (its frames, its latency, its
+ * pace: all said in its own rate here). */
+static struct { azsrc *s; unsigned rate, drate; int32_t *p; long pn, po, pcap; uint64_t taken; } AZC;
+static void az_conv_free(void) { azsrc_free(AZC.s); free(AZC.p); memset(&AZC, 0, sizeof AZC); }
+static unsigned az_pick(const char *rates, unsigned want) {
+    static const unsigned R_[] = { 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000 };
+    const int n = (int)(sizeof R_ / sizeof R_[0]);
+    for (int i = 0; i < n; i++) if (R_[i] > want && R_[i] % want == 0 && anet_rate_in(rates, R_[i]) == 1) return R_[i];
+    for (int i = 0; i < n; i++) if (R_[i] > want && anet_rate_in(rates, R_[i]) == 1) return R_[i];
+    for (int i = n - 1; i >= 0; i--) if (R_[i] < want && anet_rate_in(rates, R_[i]) == 1) return R_[i];
+    return 0;
+}
+unsigned netout_link_rate(void) { return AZ && AZC.s ? AZC.drate : 0; }
+static int AZ_CONV = 1;                                /* netout_link_convert (the tests: a sender before 21/10) */
+void netout_link_convert(int on) { AZ_CONV = on; }
 static int az_open(const char *spec, const char *key, unsigned rate) {
     char host[256] = ""; int port = ANET_PORT;
+    az_conv_free();
+    if (!strcmp(AZQ.spec, spec) && mono() < AZQ.until) {
+        set_why("its last stream lost at its start (%d in a row): asked again in %.0f s", AZQ.n, ceil(AZQ.until - mono()));
+        last_asked = 0;
+        return -1;
+    }
     pthread_mutex_lock(&rlk);
     const int ri = find_rcv(NK_AUDIOLAZ, key);
     unsigned maxr = 0;
     if (ri >= 0) { snprintf(host, sizeof host, "%s", R[ri].loc); maxr = R[ri].max_rate; }
     pthread_mutex_unlock(&rlk);
-    if (ri < 0) snprintf(host, sizeof host, "%s", key);
+    if (ri < 0 && (strchr(key, '.') || az_known_get(key, host, sizeof host))) snprintf(host, sizeof host, "%s", key);
+    else if (ri < 0) {                                 /* link-known: said once an address */
+        static char said[300];
+        char now_[300]; snprintf(now_, sizeof now_, "%s %s", spec, host);
+        if (strcmp(said, now_)) { snprintf(said, sizeof said, "%s", now_); nlog("%s: not heard lately: asked at its last address, %s", spec, host); }
+    }
     char *c = strrchr(host, ':');
     if (c) { port = atoi(c + 1); *c = 0; }
     if (maxr && rate > maxr) { set_why("%s takes up to %u Hz, not %u", spec, maxr, rate); return -1; }
@@ -1935,7 +2023,44 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
     }
     anet_take(take);
     char why[600];
-    if (anet_open(host, port, rate, ANET_F_S32, 0, why, sizeof why)) {
+    /* its rates (and whether its DAC refuses to start), asked now: the rate it takes */
+    anet_peer ip;
+    char rates[96] = "";
+    if (!anet_info(host, port, &ip, 1000)) {
+        snprintf(rates, sizeof rates, "%s", ip.rates);
+        pthread_mutex_lock(&rlk);
+        if (ri >= 0 && R[ri].used) { snprintf(R[ri].rates, sizeof R[ri].rates, "%s", ip.rates); snprintf(R[ri].err, sizeof R[ri].err, "%s", ip.err); }
+        pthread_mutex_unlock(&rlk);
+        if (!strcmp(ip.err, "dac-start")) {
+            snprintf(AZ_STUCK, sizeof AZ_STUCK, "%s", spec);
+            set_why("%s: its DAC (%s) refuses to start: unplug it and plug it in again", spec, ip.dac);
+            last_asked = 0;
+            return -1;
+        }
+    }
+    unsigned drate = rate;
+    if (AZ_CONV && anet_rate_in(rates, rate) == 0) drate = az_pick(rates, rate);
+    if (!drate) drate = rate;
+    anet_convert(AZ_CONV);
+    int e = anet_open(host, port, drate, ANET_F_S32, 0, why, sizeof why);
+    if (e && AZ_CONV && anet_refused() == ANET_E_RATE && drate == rate) {   /* refused by trying (a Mac's device): its rates again */
+        if (!anet_info(host, port, &ip, 1000) && ip.rates[0]) {
+            snprintf(rates, sizeof rates, "%s", ip.rates);
+            const unsigned d2 = az_pick(rates, rate);
+            if (d2 && d2 != rate) { drate = d2; e = anet_open(host, port, drate, ANET_F_S32, 0, why, sizeof why); }
+        }
+    }
+    if (e && anet_refused() == ANET_E_DAC_START) snprintf(AZ_STUCK, sizeof AZ_STUCK, "%s", spec);
+    if (!e) AZ_STUCK[0] = 0;
+    if (!e && drate != rate) {
+        AZC.s = azsrc_new(rate, drate);
+        AZC.pcap = 8192; AZC.p = malloc(sizeof(int32_t) * 2 * (size_t)AZC.pcap);
+        if (!AZC.s || !AZC.p) { az_conv_free(); anet_close(0); set_why("%s: no converter %u → %u Hz", spec, rate, drate); return -1; }
+        AZC.rate = rate; AZC.drate = drate;
+        nlog("%s: its DAC takes %s Hz, not %u Hz as it is: the stream at %u Hz, converted here (the corrector's converter, %u taps a phase, %.1f ms; never the receiver's machine)",
+             spec, rates, rate, drate, AZC.s->T, 1000.0 * azsrc_delay_in(AZC.s) / rate);
+    }
+    if (e) {
         if (anet_busy(by, sizeof by)) {                    /* another player there: never a rate refused, nothing to start */
             pthread_mutex_lock(&azlk);
             const int first = !AZB.fails;
@@ -1972,9 +2097,36 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
         if (was) nlog("%s: ours now%s, after %.0f s busy (%d questions)", spec, take ? " (taken over: the listener asked)" : "", since, was);
         else if (take) nlog("%s: taken over (the listener asked)", spec);
     }
-    nlog("stream to %s at %u Hz (audiolaz net: 32 bits as they are, the DAC's clock)", spec, rate);
+    if (AZC.s) nlog("stream to %s at %u Hz, converted from %u Hz (audiolaz net: the DAC's clock)", spec, AZC.drate, rate);
+    else nlog("stream to %s at %u Hz (audiolaz net: 32 bits as they are, the DAC's clock)", spec, rate);
     return 0;
 }
+/* through the converter: what it made and anet has not taken first (all of it, or 0: full); then the frames
+ * given, converted, as far as anet takes; the frames given taken in all (their conversion kept for the next call) */
+static long az_conv_write(const int32_t *lr, long frames) {
+    while (AZC.po < AZC.pn) {
+        const long k = anet_write(AZC.p + 2 * AZC.po, AZC.pn - AZC.po);
+        if (k < 0) return -1;
+        if (k == 0) return 0;
+        AZC.po += k;
+    }
+    AZC.pn = AZC.po = 0;
+    /* at most what fits the buffer: frames · drate/rate + 2 out of this call's input */
+    long n = (long)((double)(AZC.pcap - 4) * AZC.rate / AZC.drate);
+    if (n > frames) n = frames;
+    long used = 0;
+    AZC.pn = azsrc_run(AZC.s, lr, n, AZC.p, AZC.pcap, &used);
+    AZC.taken += (uint64_t)used;
+    while (AZC.po < AZC.pn) {
+        const long k = anet_write(AZC.p + 2 * AZC.po, AZC.pn - AZC.po);
+        if (k < 0) return -1;
+        if (k == 0) break;
+        AZC.po += k;
+    }
+    return used;
+}
+/* its frames (at the receiver's rate) in the play's own */
+static long az_conv_in(double frames) { return (long)(frames * AZC.rate / AZC.drate); }
 int netout_open(unsigned rate) {
     last_asked = 0;
     {
@@ -2156,7 +2308,7 @@ static void pack16(const int32_t *lr, long n, uint8_t *p) {
     }
 }
 long netout_write(const int32_t *lr, long frames) {
-    if (AZ) { const long r = anet_write(lr, frames); if (r < 0) set_why("%s", anet_why()); return r; }
+    if (AZ) { const long r = AZC.s ? az_conv_write(lr, frames) : anet_write(lr, frames); if (r < 0) set_why("%s", anet_why()); return r; }
     pthread_mutex_lock(&slk);
     const double t = mono();
     long r = 0;
@@ -2200,7 +2352,7 @@ void netout_wait(int ms) {
     poll(&p, 1, ms);
 }
 uint64_t netout_sent(void) {
-    if (AZ) return anet_sent();
+    if (AZ) return AZC.s ? AZC.taken : anet_sent();   /* the play's frames taken, converted or not */
     pthread_mutex_lock(&slk);
     const uint64_t n = S.bytes / (uint64_t)S.bpf;
     pthread_mutex_unlock(&slk);
@@ -2214,7 +2366,7 @@ int netout_lost(void) {
     return r;
 }
 long netout_held(void) {
-    if (AZ) return anet_held();
+    if (AZ) return AZC.s ? az_conv_in((double)anet_held() + (double)(AZC.pn - AZC.po)) + (long)azsrc_delay_in(AZC.s) : anet_held();
     pthread_mutex_lock(&slk);
     if (!S.on) { pthread_mutex_unlock(&slk); return 0; }
     const double sent = (double)(S.bytes / (uint64_t)S.bpf), t = mono(), srate = S.rate;
@@ -2295,7 +2447,20 @@ void netout_pause(int on) {
 /* All the music sent (the Squeezebox input's last track read to its end): the end of file now, so that the receiver
  * knows it (squeezelite's STMd then STMu, the renderer's STOPPED) while the play goes on following what it plays. */
 void netout_end(void) {
-    if (AZ) { anet_end(); return; }
+    if (AZ) {
+        if (AZC.s) {   /* what the converter still holds (its delay) out, then the end: a second at most */
+            static const int32_t z[2 * 256] = { 0 };
+            long left = (long)azsrc_delay_in(AZC.s) + 2;
+            const double t0 = mono();
+            while ((left > 0 || AZC.po < AZC.pn) && mono() - t0 < 1.0) {
+                const long k = az_conv_write(z, left > 256 ? 256 : left);
+                if (k < 0) break;
+                if (k == 0 && AZC.po < AZC.pn) { anet_wait(5); continue; }
+                left -= k;
+            }
+        }
+        anet_end(); return;
+    }
     pthread_mutex_lock(&slk);
     if (!S.on || S.ended || S.lost || S.fd < 0) { pthread_mutex_unlock(&slk); return; }
     const int fd = S.fd;
@@ -2310,7 +2475,10 @@ void netout_end(void) {
     nlog("all sent (%.1f s): the stream's end given to the receiver", secs);
 }
 void netout_close(int finish) {
-    if (AZ) { anet_close(finish); AZ = 0; nlog("audiolaz stream %s", finish ? "ended: the receiver plays out what it holds" : "stopped"); return; }
+    if (AZ) {
+        { char sp[160]; pthread_mutex_lock(&slk); snprintf(sp, sizeof sp, "%s", spec_now); pthread_mutex_unlock(&slk); az_quick_note(sp, finish); }   /* */
+        anet_close(finish); AZ = 0; az_conv_free(); nlog("audiolaz stream %s", finish ? "ended: the receiver plays out what it holds" : "stopped"); return;
+    }
     pthread_mutex_lock(&slk);
     if (!S.on) { pthread_mutex_unlock(&slk); return; }
     const int fd = S.fd, kind = S.kind, ri = S.ri, lost = S.lost, ended = S.ended, taken = S.taken, gone = S.gone;
@@ -2685,6 +2853,18 @@ _Static_assert((int)NETOUT_WHY_END == (int)ANET_WHY_END && (int)NETOUT_WHY_USER 
                && (int)NETOUT_WHY_SETTINGS == (int)ANET_WHY_SETTINGS && (int)NETOUT_WHY_SOURCE == (int)ANET_WHY_SOURCE && (int)NETOUT_WHY_LOST == (int)ANET_WHY_LOST
                && (int)NETOUT_WHY_QUIT == (int)ANET_WHY_QUIT && (int)NETOUT_WHY_PAUSE == (int)ANET_WHY_PAUSE && (int)NETOUT_WHY_OUTPUT == (int)ANET_WHY_OUTPUT, "netout.h's reasons are anet.h's");
 void netout_live(int on) { anet_live(on); }
+void netout_paced(int on) { anet_paced(on); }   /* */
+long netout_link_gaps(void) {
+    anet_state s;
+    if (!AZ || anet_get_state(NULL, &s) || !s.on) return 0;
+    return (long)s.underruns;
+}
+int netout_link_pace(double *dac_ppm, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms) {
+    anet_state s;
+    if (!AZ || anet_get_state(NULL, &s) || !s.on || !s.adapt) return -1;
+    *dac_ppm = s.dac_ppm; *pull_ppm = s.pull_ppm; *ring_ms = s.ring_ms; *target_ms = s.target_ms; *anchor_ms = s.anchor_ms;
+    return 0;
+}
 void netout_fifo_ms(int ms) { anet_fifo_ms(ms); }
 void netout_rt(int prio) { anet_rt(prio); }   /* */
 void netout_stop_reason(int why, const char *text) { anet_stop_reason((unsigned)why, text); }
@@ -2713,7 +2893,7 @@ double netout_link_extra_ms(void) {
     return netout_link_extra_ms_for(sp);
 }
 int netout_link_json(const char *spec, char *out, size_t len) {
-    char hp[200], dac[96] = "", rid[64] = "";
+    char hp[200], dac[96] = "", rid[64] = "", rates[96] = "";
     az_hostport(spec, hp, sizeof hp);
     anet_state s;
     if (!hp[0] || anet_get_state(hp, &s)) return snprintf(out, len, "null");
@@ -2722,29 +2902,34 @@ int netout_link_json(const char *spec, char *out, size_t len) {
         if (spec_kind(spec, &key) == NK_AUDIOLAZ) {
             pthread_mutex_lock(&rlk);
             const int ri = find_rcv(NK_AUDIOLAZ, key);
-            if (ri >= 0) { snprintf(dac, sizeof dac, "%s", R[ri].model); snprintf(rid, sizeof rid, "%s", R[ri].id); }
+            if (ri >= 0) { snprintf(dac, sizeof dac, "%s", R[ri].model); snprintf(rid, sizeof rid, "%s", R[ri].id); snprintf(rates, sizeof rates, "%s", R[ri].rates); }
             pthread_mutex_unlock(&rlk);
         }
         for (char *p = dac; *p; p++) if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) *p = ' ';
         for (char *p = rid; *p; p++) if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) *p = ' ';
+        for (char *p = rates; *p; p++) if (!(*p >= '0' && *p <= '9') && *p != ',') *p = ' ';
         for (char *p = s.last_stop; *p; p++) if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) *p = ' ';
     }
     return snprintf(out, len,
         "{\"id\":\"%s\",\"dac\":\"%s\",\"playing\":%s,\"protocol\":%d,\"adaptive\":%s,\"live\":%s,\"rate\":%u,\"state\":\"%s\","
         "\"reserveMs\":%.0f,\"targetMs\":%.0f,\"startMs\":%.0f,\"targetLowMs\":%.0f,\"targetHighMs\":%.0f,\"latencyMs\":%.0f,\"silenceInMs\":%.0f,"
-        "\"jitterMs\":%.1f,\"jitterPeakMs\":%.1f,\"underruns\":%lu,\"adjustments\":%lu,\"senderLate\":%lu,\"senderLateMs\":%.0f,\"lastStop\":\"%s\",\"lastStopAgoS\":%.0f}",
+        "\"jitterMs\":%.1f,\"jitterPeakMs\":%.1f,\"underruns\":%lu,\"adjustments\":%lu,\"senderLate\":%lu,\"senderLateMs\":%.0f,\"lastStop\":\"%s\",\"lastStopAgoS\":%.0f,\"afterMs\":%.0f,"
+        "\"rates\":\"%s\",\"convertedFrom\":%u,\"dacStart\":%s,\"dacPpm\":%.1f,\"pullPpm\":%.1f,\"leftOverMs\":%.0f,\"putBackMs\":%.0f}",
         rid, dac, s.on ? "true" : "false", s.on ? (s.p3 ? 3 : 2) : 0, s.adapt ? "true" : "false", s.live ? "true" : "false", s.rate,
         anet_rs_text(s.rstate), s.on ? s.ring_ms : 0, s.target_ms, s.start_ms, s.lo_ms, s.hi_ms, s.on ? s.held_ms : 0, s.on ? s.ins_ms : 0,
-        s.late_ms, s.peak_ms, s.underruns, s.adjusts, s.tx_late, s.tx_late_ms, s.last_stop, s.last_stop_age);
+        s.late_ms, s.peak_ms, s.underruns, s.adjusts, s.tx_late, s.tx_late_ms, s.last_stop, s.last_stop_age, s.on ? s.after_ms : 0,   /* afterMs: in latencyMs too */
+        rates, AZ && AZC.s ? AZC.rate : 0u, netout_dac_start(spec) ? "true" : "false", s.on ? s.dac_ppm : 0, s.on ? s.pull_ppm : 0, s.on ? s.over_ms : 0, s.on ? s.back_ms : 0);   /* its DAC's rates, the stream's own rate when converted, its DAC refusing to start */
 }
 /* under nplk (np_bump): what the source playing says, to the audiolaz receiver (its cover by our stream server's URL,
  * {self}: the address the receiver reaches us at, filled in by anet_send.c) */
+
 static void np_tell_link(void) {
     char m[ANET_META_MAX] = "";
-    if (np_act >= 0 && NP[np_act].has) {
+    if (FL.on) snprintf(m, sizeof m, "title=audiolaz \xc2\xb7 %s\nartist=%s\n", FL.title, FL.sub);
+    else if (np_act >= 0 && NP[np_act].has) {
         const np_t *n = &NP[np_act];
         int k = snprintf(m, sizeof m, "source=%s\ntitle=%s\nartist=%s\nalbum=%s\n", NP_SRC[np_act], n->title, n->artist, n->album);
         if (n->img && k > 0 && (size_t)k < sizeof m) snprintf(m + k, sizeof m - (size_t)k, "cover=http://{self}:%d/cover/%u.jpg\n", http_port_, np_ser);
-    }
+    } else if (NPI_t[0]) snprintf(m, sizeof m, "title=%s\nartist=%s\n", NPI_t, NPI_s);
     anet_meta(m, np_ser);
 }
