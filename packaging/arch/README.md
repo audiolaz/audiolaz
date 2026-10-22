@@ -1,6 +1,6 @@
 # Arch Linux packages
 
-`PKGBUILD` builds two packages from the `v1.3.1` tag's GitHub tarball (x86_64 and aarch64, so Arch Linux ARM and
+`PKGBUILD` builds two packages from the `v1.3.4` tag's GitHub tarball (x86_64 and aarch64, so Arch Linux ARM and
 Arch-based distributions such as Audiolinux too):
 
 | Package | What | Licence |

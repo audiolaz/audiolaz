@@ -1,6 +1,6 @@
 # Gentoo ebuilds
 
-This folder is a small Portage overlay (repository name `audiolaz`) that builds the `v1.3.1` tag's GitHub tarball
+This folder is a small Portage overlay (repository name `audiolaz`) that builds the `v1.3.4` tag's GitHub tarball
 (amd64 and arm64, so GentooPlayer and other Gentoo-based systems too):
 
 | Package | What | Licence |
@@ -13,13 +13,13 @@ packaging/gentoo/
 ├── metadata/layout.conf          masters = gentoo
 ├── profiles/repo_name            audiolaz
 └── media-sound/
-    ├── audiolaz-player/          audiolaz-player-1.3.1.ebuild, metadata.xml, Manifest
+    ├── audiolaz-player/          audiolaz-player-1.3.4.ebuild, metadata.xml, Manifest
     │   └── files/                audiolaz-player.initd, audiolaz-player.confd, audiolaz-player.service, 50-audiolaz.conf
-    └── snd-audiolaz/             snd-audiolaz-1.3.1.ebuild, metadata.xml, Manifest
+    └── snd-audiolaz/             snd-audiolaz-1.3.4.ebuild, metadata.xml, Manifest
 ```
 
 Distributions with their own overlay (GentooPlayer…) can copy the two `media-sound/` folders into it as they are: both
-ebuilds share the distfile `audiolaz-1.3.1.tar.gz`, and nothing in them refers to this overlay.
+ebuilds share the distfile `audiolaz-1.3.4.tar.gz`, and nothing in them refers to this overlay.
 
 ## Add the overlay
 
@@ -69,7 +69,7 @@ USE flags of `audiolaz-player`:
 | `/usr/share/alsa/alsa.conf.d/50-audiolaz.conf`, linked from `/etc/alsa/conf.d/` | defines the PCM `audiolaz`: `aplay -D audiolaz …` plays into the player |
 | `/etc/init.d/audiolaz-player`, `/etc/conf.d/audiolaz-player` | the OpenRC service (supervise-daemon) and its settings, **not added to any runlevel** |
 | `/usr/lib/systemd/system/audiolaz-player.service` | the systemd unit, **not enabled** |
-| `/usr/share/doc/audiolaz-player-1.3.1/` | README, PLAYER.md (every option, the control file, the page's API), LINK-PROTOCOL.md, BIT-PERFECT.md |
+| `/usr/share/doc/audiolaz-player-1.3.4/` | README, PLAYER.md (every option, the control file, the page's API), LINK-PROTOCOL.md, BIT-PERFECT.md |
 | `/lib/modules/<kernel>/extra/snd-audiolaz.ko` | (`snd-audiolaz`) the kernel module |
 
 AirPlay ([shairport-sync](https://github.com/mikebrady/shairport-sync)) and Spotify Connect
@@ -111,7 +111,7 @@ The kernel module: `modprobe snd-audiolaz` (its options: `modinfo snd-audiolaz`)
 
 ## Notes for packagers
 
-- The tag's `VERSION` file still says 1.2.6: the ebuild writes `${PV}` into it, so `--version` says 1.3.1.
+- The tag's `VERSION` file still says 1.2.6: the ebuild writes `${PV}` into it, so `--version` says 1.3.4.
 - `build.sh` compiles and links in one command, so the ebuild passes `LDFLAGS` along with `CFLAGS`. It runs the built
   player (`--version`) at its end; the ebuild drops that line when cross-compiling.
 - ALSA loads `libasound_module_pcm_<type>.so` for `type <type>`: the plug-in is built as
