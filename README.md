@@ -14,6 +14,15 @@
 
 # audiolaz — free audio player, audiolaz Link and drivers
 
+**Your DAC becomes a bit-perfect network player.**
+
+- Plays what your sources send, unchanged, and checks it while it plays: *bit-perfect, verified*
+- Inputs: Roon, Lyrion, AirPlay (with shairport-sync), Spotify Connect (with librespot), a built-in UPnP/DLNA renderer
+- Outputs: your DAC, network players, or an **audiolaz Link** receiver beside a DAC, paced by that DAC's clock
+- Runs on Linux (Raspberry Pi included) and macOS; free and open source
+
+Transport only: this player does not change the sound. Room correction is the paid audiolaz app: [audiolaz.com](https://audiolaz.com).
+
 A Swiss army knife for audio streams on your network: one small program takes music from the sources you already use,
 sends it to the outputs you already have, and leaves it **exactly as it came**. It tells you so: *bit-perfect,
 verified*.
