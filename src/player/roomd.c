@@ -135,8 +135,15 @@ static char net_spec[160];
 static uint64_t dither_rng = 0x9E3779B97F4A7C15ull;   /* the output's TPDF dither (pcmclock.h s32_out_q) */
 /* The speakers' channels (channels.h) for the output this process plays to, as the control file says them
  * (swap.<out>=1, invert_l.<out>=1, invert_r.<out>=1; <out> its out=, "default" the command line's; absent: off): CH_*
- * bits, read by the writer at each chunk (a change while it plays crossfaded there), the free player as Room's. */
+ * bits, the free player as Room's. Two stages: the swap is the music's, in the play thread as soon as it is
+ * read, before everything that belongs to one speaker (each output channel keeps its own processing), never on what
+ * POST /measure or /calibrate plays (chan_swap_now: what one speaker is sent stays on it); the polarity is the
+ * writer's, per output channel (invert_l: the speaker on the output's left channel), on everything sent. A change while
+ * it plays crossfaded in each. */
 static _Atomic int chan_want = 0;
+static int chan_swap_now(void) {
+    return (atomic_load_explicit(&chan_want, memory_order_relaxed) & CH_SWAP) && !(SQ_SERVER && sq_measuring() == 1) ? CH_SWAP : 0;
+}
 static volatile sig_atomic_t quit = 0;
 static void on_signal(int s) { (void)s; quit = 1; }
 /* --parent-pid <pid> (10/10, the Mac player started by the app, src/player.js, as the Swift player was): the player
@@ -212,6 +219,8 @@ enum { AIR_AUTO, AIR_VIDEO, AIR_MUSIC };
 /* the contexts' settings kept in the control file, every output's together (page.c keeps to the same), and a
  * measured calibration's bounds (ms; page.c too) */
 #define CTX_LINES 64
+
+#define MEAS_RELOCK_MS 1000
 #define CAL_MS_MIN (-200.0)
 #define CAL_MS_MAX 3000.0
 /* Which control file was read last: its inode (each switch renames a new file in place) and its time to the
@@ -257,24 +266,33 @@ static void voie_out_of(const char *room, char *out, size_t on) {
     const char *o = pick_ok ? pick : first;
     snprintf(out, on, "%s", !have || !strcmp(o, "default") ? "" : o);
 }
+
+static void voie_auto_gain(control *n) { (void)n; }   /* the free player: no level */
+static int vl_seen = 0;
+static atomic_int vl_gen;
 static int read_control(control *c, stamp *seen) {
     static control file;                /* the control file's settings, as last read (c: as played) */
     static int have = 0, meas_was = 0;
+    static double ctl_gain = 0;         /* the control's gain= as read (a voie may play its own: voie_auto_gain) */
     const int meas = measuring();
     if (VOIE) page_conf_follow(ROOMS);                 /* a voie: the page's settings as the player's page keeps them */
+    const int vmoved = VOIE && have && atomic_load(&vl_gen) != vl_seen;   /* its own automatic level found again */
     char path[512];
     snprintf(path, sizeof path, "%s/control", ROOMS);
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     stamp now = { st.st_ino, (long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec };
     const int same = have && now.ino == seen->ino && now.sec == seen->sec && now.nsec == seen->nsec;
-    if (same && meas == meas_was) return 0;
+    if (same && meas == meas_was && !vmoved) return 0;
 
     if (meas != meas_was && SQ_SERVER)
         logf_("measurement state: %d → %d (squeeze: measuring %d, state %d, generation %u, corrected %d)", meas_was, meas,
               sq_measuring(), sq_state(), sq_generation(), sq_measure_corrected());
     meas_was = meas;
-    if (same) return played_control(c, &file, meas);
+    if (same) {
+        if (VOIE) { file.gain = ctl_gain; voie_auto_gain(&file); }   /* its own level found again, or by hand now */
+        return played_control(c, &file, meas);
+    }
     *seen = now;
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -380,8 +398,8 @@ static int read_control(control *c, stamp *seen) {
     {
         int ch = 0;
         for (int i = 0; i < chan_n; i++) if (!strcmp(chan_o[i], n.out[0] ? n.out : "default")) ch |= chan_b[i];
-        if (ch != atomic_load(&chan_want)) logf_("output's channels: %s%s%s%s", ch & CH_SWAP ? "left and right swapped" : "", ch & CH_SWAP && ch & (CH_INV_L | CH_INV_R) ? ", " : "",
-                                                 ch & (CH_INV_L | CH_INV_R) ? (ch & CH_INV_L && ch & CH_INV_R ? "both speakers' polarity inverted" : ch & CH_INV_L ? "the left speaker's polarity inverted" : "the right speaker's polarity inverted") : "",
+        if (ch != atomic_load(&chan_want)) logf_("output's channels: %s%s%s%s", ch & CH_SWAP ? "the music's left and right swapped, before the correction" : "", ch & CH_SWAP && ch & (CH_INV_L | CH_INV_R) ? ", " : "",
+                                                 ch & (CH_INV_L | CH_INV_R) ? (ch & CH_INV_L && ch & CH_INV_R ? "both outputs' polarity inverted" : ch & CH_INV_L ? "the left output's polarity inverted" : "the right output's polarity inverted") : "",
                                                  ch ? "" : "as they come (nothing swapped nor inverted)");
         atomic_store(&chan_want, ch);
     }
@@ -389,6 +407,8 @@ static int read_control(control *c, stamp *seen) {
     fclose(f);
     if (n.gain > 0) n.gain = 0;
     if (n.gain < -40) n.gain = -40;
+    ctl_gain = n.gain;
+    voie_auto_gain(&n);                  /* a voie: its own room's automatic level (the page's level automatic) */
     file = n; have = 1;
     netout_bound(n.out);                 /* the receiver it is set to, said to the other audiolaz players */
     return played_control(c, &file, meas);
@@ -397,10 +417,12 @@ static int read_control(control *c, stamp *seen) {
 static int played_control(control *c, const control *file, int meas) {
     control n = *file;
 
-    (void)meas;
     n.bypass = 1; n.gain = 0; n.room[0] = 0; n.dyn[0] = 0; n.image[0] = 0; n.noroom = 1;
     snprintf(n.place, sizeof n.place, "-");
     n.relief = n.dialogue = 0; n.out_lat = 0; n.ctx_n = 0; n.cal_ms = NAN; n.air_dev = 0; n.air_iv = 1; n.air_iv_now = 0;
+
+    if (meas) {
+    }
     int changed = strcmp(n.room, c->room) || n.bypass != c->bypass || n.gain != c->gain || strcmp(n.dyn, c->dyn) ||
                   n.dyn_lo != c->dyn_lo || n.dyn_hi != c->dyn_hi || n.dyn_band != c->dyn_band || strcmp(n.image, c->image) ||
                   strcmp(n.sounds_at, c->sounds_at) || strcmp(n.out, c->out) || n.air_mode != c->air_mode ||
@@ -439,10 +461,11 @@ static unsigned slave_rate(void) { return src_rate(cur_sub); }
 static void shift_set(long v) { src_shift(cur_sub, v); }
 
 static void input_stop(int k) {
-    if (VOIE) return;                          /* a voie never stops the player's inputs (AirPlay, Spotify…): shared */
-    if (src_stop(k)) return;                   /* macOS: the receiver roomd runs itself, started again (src.h) */
+
+    if (!VOIE && src_stop(k)) return;          /* macOS: the receiver roomd runs itself, started again (src.h) */
     char path[600], cmd[700];
-    snprintf(path, sizeof path, "%s/input-stop", ROOMS);
+    if (VOIE) snprintf(path, sizeof path, "%s/voies/%s/input-stop", ROOMS, VOIE);
+    else snprintf(path, sizeof path, "%s/input-stop", ROOMS);
     if (access(path, X_OK)) return;
     snprintf(cmd, sizeof cmd, "'%s' %d </dev/null >/dev/null 2>&1 &", path, k);
     if (system(cmd) == -1) logf_("input-stop %d: not run", k);
@@ -732,8 +755,9 @@ static void inputs_conf_path(char *path, size_t n) {
     if (VOIE) snprintf(path, n, "%s/voies/%s/inputs.conf", ROOMS, VOIE);
     else snprintf(path, n, "%s/inputs.conf", ROOMS);
 }
-/* The Loopback subdevice inputs.conf names airplay (install.sh: "1=airplay"), or −1. */
+
 static int airplay_sub(void) {
+    if (VOIE) return -1;
     char path[600], line[128];
     inputs_conf_path(path, sizeof path);
     FILE *f = fopen(path, "r");
@@ -765,6 +789,9 @@ static void sub_input_name(int k, char *out, size_t len) {
  * not set; its ALSA buffer in *bufs, 0.2 s if not set), 0 otherwise (none, or not the player's to keep). *decl: the
  * output latency declared to the senders (09/10, below), its line the player's too, −1 when the file has none. */
 static int iv_line(const char *k) { return !strncmp(k, "ignore_volume_control", 21) && (k[21] == ' ' || k[21] == '\t' || k[21] == '='); }
+
+static int ip_line(const char *k) { return !strncmp(k, "interpolation", 13) && (k[13] == ' ' || k[13] == '\t' || k[13] == '='); }
+#define AIR_IP_LINE "interpolation = \"basic\"; // audiolaz: the sender's clock followed by a frame put in or left out (resampled packets came out as full-scale garbage)"
 
 typedef struct { char prep_key[CTX_KEY]; int prep_corr, prep_known, plist, diag_other; char prep_key_b[CTX_KEY]; int prep_corr_b, prep_known_b, has_boff; double boff; char boff_why[160];
                  char prep_out[160]; int prep_out_known; } air_extra;   /* prep_out : the output they were written for */
@@ -857,7 +884,7 @@ static int air_write(const char *path, const char *buf, double off, double decl,
     if (iv == 2) snprintf(ivl, sizeof ivl, "ignore_volume_control = \"yes\"; // audiolaz: set by the player (%s)", AIR_IV_DEV);
     else snprintf(ivl, sizeof ivl, "ignore_volume_control = \"%s\"; // audiolaz: set on the player's page (%s)", iv ? "yes" : "no",
              iv ? "the sender's volume ignored: the volume is set on the amp or the streamer" : "the sender's volume applied");
-    int iv_done = 0;
+    int iv_done = 0, ip_done = 0;
     for (const char *l = buf; *l; ) {
         const char *e = strchr(l, '\n');
         const size_t ll = e ? (size_t)(e - l) : strlen(l);
@@ -887,6 +914,18 @@ static int air_write(const char *path, const char *buf, double off, double decl,
                 }
                 if (!later) { fprintf(f, "%s%.*s%s\n", e ? "" : "\n", (int)ind, l, ivl); iv_done = 1; }
             }
+            if (!ip_done) {                              /* the same for the interpolation's line */
+                int later = 0;
+                for (const char *m = e ? e + 1 : l + ll; *m && !later; ) {
+                    const char *me = strchr(m, '\n');
+                    later = ip_line(m + strspn(m, " \t"));
+                    m = me ? me + 1 : m + strlen(m);
+                }
+                if (!later) { fprintf(f, "%.*s" AIR_IP_LINE "\n", (int)ind, l); ip_done = 1; }
+            }
+        }
+        else if (ind < ll && ip_line(l + ind)) {
+            if (!ip_done) { fprintf(f, "%.*s" AIR_IP_LINE "%s", (int)ind, l, e ? "\n" : ""); ip_done = 1; }
         }
         else if (name && ind < ll && !strncmp(l + ind, "name", 4) && (l[ind + 4] == ' ' || l[ind + 4] == '=') && strstr(line, "audiolaz: kept by the player"))
             fprintf(f, "%.*sname = \"%s\"; // audiolaz: kept by the player (the output's name)%s", (int)ind, l, name, e ? "\n" : "");
@@ -1197,7 +1236,6 @@ static int air_last = -1;                 /* the mode of the last sender whose m
 static struct { char name[96]; int video; } air_seen[AIR_SENDERS];   /* the senders known by their model, by name */
 static int air_seen_n = 0;
 static int air_play_video = -1;           /* this play's: 1 video, 0 music; −1 not an AirPlay play (the status) */
-static int air_level0 = 0;
 static double st_ring_ms = 0;             /* this play's ring target (ms), for the status */
 
 #ifndef SCHED_RESET_ON_FORK
@@ -1663,7 +1701,7 @@ static void write_status(const char *state, unsigned rate, unsigned orate, const
     fprintf(f, "state=%s\nrate=%u\nroom=%s\nbypass=%d\ngain=%.1f\nclipped=%ld\nxruns=%ld\nroon_slowed_ppm=%.1f\nsteady_ppm=%.1f\ndac_fill=%ld\ndac_delay=%ld\n"
                "dynamic=%s\nshare=%.0f\nlevel=%.1f\nimage=%s\nrate_out=%u\n",
             state, rate, c->room, c->bypass, c->gain, clipped, xruns, ppm, steady, fill, delay, c->dyn, share * 100, level, c->image,
-            netout_link_rate() ? netout_link_rate() : orate);   /* a Link receiver's rate, converted here */
+            netout_conv_rate() ? netout_conv_rate() : orate);   /* a Link receiver's rate, converted here; the AirPlay bridge's 44.1 kHz */
     /* what the app reads : which engine, and whether Roon reaches it as a Squeezebox and in which format */
     fprintf(f, "variant=player\n");
     if (VOIE) {
@@ -1710,7 +1748,7 @@ static void write_status(const char *state, unsigned rate, unsigned orate, const
     }
     fprintf(f, "ring_target_ms=%.0f\n", strcmp(state, "idle") ? st_ring_ms : 0.0);
 
-    fprintf(f, "airplay_level0=%d\nairplay_ignore_volume=%d\nairplay_session=%d\n", strcmp(state, "idle") && air_level0, air_iv_file, air_session);
+    fprintf(f, "airplay_ignore_volume=%d\nairplay_session=%d\n", air_iv_file, air_session);
     {   /* the sender's volume on the device: where it is ("" not forwarded now) */
         char dvs[200] = "";
         if (atomic_load(&dv_live)) netout_dev_volume_said(dvs, sizeof dvs);
@@ -1785,7 +1823,8 @@ static void status_disc_off(void) {
 
 /* ── The DAC ───────────────────────────────────────────────────────────────────────────────────── */
 
-static int out_fmt = OUTF_S32;                 /* this play's: S32_LE, or DSD's */
+static int out_fmt = OUTF_S32;                 /* this play's: PCM's 32-bit words (22/10: packed by out_alsa.c into the
+                                                * best format the card takes, S16_LE…), or DSD's */
 static unsigned dac_periods = 16;
 static out_pcm *dac_open(unsigned rate, unsigned long period) {
     return out_open(DAC, out_fmt, rate, period, dac_periods, dac_quiet);   /* non-blocking (out.h) */
@@ -1800,7 +1839,9 @@ static void dac_refused(unsigned rate) {
     if (!dac_busy_tries++) {
         dac_busy_t0 = dac_busy_line = t;
         dac_quiet = 1;
-        logf_("the DAC refuses %u Hz (above): another player may hold it, such as its own Roon zone; trying again every second, a line a minute", rate);
+
+        if (!out_takes(DAC, out_fmt, rate)) logf_("the DAC refuses %u Hz (above): it takes none of the formats we send at this rate (%s); trying again every second, a line a minute", rate, out_fmt == OUTF_S32 ? "PCM: S32, S24, S24_3, S16" : out_fmt_name(out_fmt));
+        else logf_("the DAC refuses %u Hz (above): another player may hold it, such as its own Roon zone; trying again every second, a line a minute", rate);
     } else if (t - dac_busy_line >= 60) {
         dac_busy_line = t;
         logf_("the DAC still refuses %u Hz after %.0f s (%ld tries)", rate, t - dac_busy_t0, dac_busy_tries);
@@ -2084,9 +2125,9 @@ static void *writer_main(void *arg) {
     int32_t *pcm = malloc(sizeof(int32_t) * 2 * P), *zero = calloc(2 * P, sizeof(int32_t)), *zrest = zero;
     for (unsigned long i = 0; i < 2 * P; i++) zero[i] = W->idle;
     uint64_t dopn = 0;                               /* DoP: frames marked so far */
-    /* the speakers' channels (channels.h), as asked when the play starts (no crossfade into them then) */
+    /* the speakers' polarity (channels.h), as asked when the play starts (no crossfade into it then); * the swap is the play thread's, on the music */
     chan_stage chs;
-    chan_init(&chs, atomic_load(&chan_want));
+    chan_init(&chs, atomic_load(&chan_want) & (CH_INV_L | CH_INV_R));
     if (W->dop) {                                    /* what the DAC is given again after a stop: marked already */
         zrest = malloc(sizeof(int32_t) * 2 * P);
         for (unsigned long i = 0; i < P; i++) { const int32_t m = (int32_t)((i & 1 ? 0xFAu : 0x05u) << 24); zrest[2 * i] = W->idle | m; zrest[2 * i + 1] = W->idle | m; }
@@ -2202,14 +2243,11 @@ static void *writer_main(void *arg) {
                 }
                 chunk_r0 = atomic_load(&W->q->r); ring_pop(W->q, pcm, P); off = 0; len = P;
                 if (W->L == 1) bp_out(chunk_r0, pcm, P);   /* bitperfect.h: compared as it goes out */
-                /* the speakers' channels, the last stage, after the comparison (it is exact: said, bitperfect.h)
-                 * and before DoP's markers; the music only, never the silence the writer makes */
+
                 {
-                    const int cw = atomic_load_explicit(&chan_want, memory_order_relaxed);
-                    if (chan_run(&chs, cw, pcm, P, W->chk, W->obits, W->rate) && cw) {
-                        const unsigned said = (cw & CH_SWAP ? BP_SWAP : 0) | (cw & (CH_INV_L | CH_INV_R) ? BP_POLARITY : 0);
-                        if ((atomic_load_explicit(&bp.why, memory_order_relaxed) & said) != said) bp_say(said);
-                    }
+                    const int cw = atomic_load_explicit(&chan_want, memory_order_relaxed) & (CH_INV_L | CH_INV_R);
+                    if (chan_run(&chs, cw, pcm, P, W->chk, W->obits, W->rate) && cw && !(atomic_load_explicit(&bp.why, memory_order_relaxed) & BP_POLARITY))
+                        bp_say(BP_POLARITY);
                 }
                 /* (13/10, bug 10) started on a little of it: when the ring reached its level, and its lowest until then */
                 if (W->start && !fill_said) {
@@ -2388,14 +2426,9 @@ static void *writer_main(void *arg) {
     return NULL;
 }
 
-static const control *as_played(const control *c, control *tmp) {
-
-    if (!air_level0 || c->gain == 0 || page_level_manual()) return c;
-    *tmp = *c; tmp->gain = 0;
-    return tmp;
-}
-
 /* ── One play: the DAC open at one rate, from Roon starting on the Loopback to it stopping or changing rate ─── */
+
+static int play_again_now = 0;
 static void play(unsigned rate, control *c, stamp *seen, int sq) {
     const double t_enter = now_s();
     /* An AirPlay play : video or music, decided now and kept to its end (the header) */
@@ -2413,17 +2446,16 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     const int paced = !sq && !NO_LOOP && src_paced(cur_sub);
     if (paced) drv_play = 1;
     st_input = sq ? -1 : cur_sub;
-    air_level0 = air_play;
     double play_in_peak = 0, play_out_peak = 0;          /* this play's peaks, input and output */
-    control c0;                                         /* c as played (AirPlay: at 0 dB) */
     /* whose title and cover the receivers show (nowplay.h): Roon (the Squeezebox input, or Roon / Roon Bridge
      * into the Loopback's subdevice 0), AirPlay, Spotify Connect; another input: none (the player's own card) */
     {
         char inm[32];
         sub_input_name(cur_sub, inm, sizeof inm);
 
-        netout_np_source(sq || (!NO_LOOP && (cur_sub == 0 || !strcmp(inm, "roonbridge") || !strcmp(inm, "roon") || (paced && !inm[0] && !air_play))) ? NETOUT_NP_ROON
-                         : air_play ? NETOUT_NP_AIRPLAY : !NO_LOOP && !strcmp(inm, "spotify") ? NETOUT_NP_SPOTIFY
+        netout_np_source(sq || (!NO_LOOP && ((cur_sub == 0 && !(VOIE && inm[0])) || !strcmp(inm, "roonbridge") || !strcmp(inm, "roon") || (paced && !inm[0] && !air_play))) ? NETOUT_NP_ROON
+
+                         : air_play ? NETOUT_NP_AIRPLAY : !NO_LOOP && !VOIE && !strcmp(inm, "spotify") ? NETOUT_NP_SPOTIFY
                          : !NO_LOOP && !strcmp(inm, "upnp") ? NETOUT_NP_UPNP : -1);   /* the UPnP input's DIDL */
     }
 
@@ -2441,6 +2473,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     } else if (!strncmp(c->out, OUT_CARD_PREFIX, OUT_CARD_PREFIX_LEN) && c->out[OUT_CARD_PREFIX_LEN]) { snprintf(dac_buf, sizeof dac_buf, "%s", c->out + OUT_CARD_PREFIX_LEN); DAC = dac_buf; OUT = OUT_ALSA; }
     st_out_why = ""; st_out_max = 0;
     int net_cut = 0;                                    /* the play ends with the music cut: the receiver stopped at once */
+    int give_late = 0;                                  /* Roon paused to a network receiver: given back at the end */
     int up_ultra = 0;
     int obits = 32;                                     /* the bits the output keeps: TPDF dither to them (pcmclock.h) */
     double air_q0 = 0, air_blip_said = 0;               /* since when AirPlay's side of the Loopback is stopped */
@@ -2448,6 +2481,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     int air_live = 0;
     long air_blips = 0;
     int net_paused = 0, net_ended = 0;
+    int in_changed = 0, in_swapped = 0;                 /* its input playing another stream in another shape;
+                                                         * seen so, its stop never seen (said at the play's end) */
     unsigned orate = rate;                              /* the DAC at the stream's own rate (or DSD's words, below) */
     int L = 1;
     out_fmt = OUTF_S32;
@@ -2506,9 +2541,9 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         }
         net_opened();
         outbuf = 0;
-        /* a Squeezebox player or a UPnP renderer: 24 bits (netout.c rounds to them); the AirPlay bridge: 16 bits,
-         * dithered there already (netout.c pack16); an audiolaz receiver: the 32-bit words to its DAC */
+
         obits = !strncmp(out_asked, "audiolaz:", 9) || netout_is_airplay(out_asked) ? 32 : 24;
+        if (!strncmp(out_asked, "audiolaz:", 9) && !netout_link_rate() && netout_link_bits() >= 8 && netout_link_bits() < 32) obits = netout_link_bits();
     } else
     {
         out = dac_open(orate, period);
@@ -2525,6 +2560,22 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         period = outper;
     }
     open_fails = 0;                                    /* the output open */
+
+    long meas_pre = 0;
+    const int meas_play = sq && measuring();           /* a measurement's play: its output peak said at its end */
+    {
+        static char last_out[sizeof c->out];
+        static unsigned last_orate = 0;
+        static int last_dsd = 0;
+        int dsd_now = 0;
+        if (sq && measuring() && last_orate && !strcmp(last_out, out_asked) && (last_dsd != dsd_now || last_orate != orate)) {
+            meas_pre = (long)((uint64_t)rate * MEAS_RELOCK_MS / 1000);
+            logf_("measurement: in PCM at %u Hz (the last play %s at %u Hz): %d ms of silence first, the DAC relocking", rate,
+                  last_dsd ? "in DSD" : "upsampled or at another rate", last_orate, MEAS_RELOCK_MS);
+        }
+        snprintf(last_out, sizeof last_out, "%s", out_asked);
+        last_orate = orate; last_dsd = dsd_now;
+    }
 #undef OPEN_FAILED
 
     unsigned long iper = L > 1 ? period / (unsigned long)L : period;
@@ -2643,7 +2694,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
 
     filt *cur = NULL, *next = NULL, *pend = NULL;         /* the free player: no filter, ever (build) */
     long warm = 0;
-    (void)c0; (void)pend;
+    (void)pend;
     st_heard[0] = 0;
     int32_t *raw = malloc(sizeof(int32_t) * CAP_MAX_CH * iper);
     double *a = malloc(sizeof(double) * 2 * iper);    /* the levels' copy (levels.h: they read, nothing goes back) */
@@ -2692,6 +2743,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     uint64_t sq_start_at = 0, sq_track0 = 0;
     int sq_due = 0, sq_track = 0, sq_done = 0;
     long loop_tail = -1;                               /* the same for a Loopback or card source that stopped */
+    int in_rest = 0;                                   /* the source stopped: its last frames, less than a period, read */
     long sq_tail = -1;
 
     double sq_t_el = 0, sq_t_end = 0, sq_t_pause = 0, vol = 1.0;
@@ -2748,6 +2800,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
         if (OUT == OUT_ALSA && out && out_device_rate(out)) { st_bp_dev = out_device_rate(out); bp_say(BP_RATE); }
         /* a Link receiver whose DAC does not take this rate: converted by netout.c, said (never bit for bit) */
         if (OUT == OUT_NET && netout_link_rate()) { st_bp_dev = netout_link_rate(); bp_say(BP_RATE); logf_("output: the Link receiver's DAC takes %u Hz, not %u Hz: converted here (the corrector's converter)", netout_link_rate(), orate); }
+        /* and keeps fewer bits (its INFO bits=): the converted words requantized by the receiver, once; said */
+        if (OUT == OUT_NET && netout_link_rate() && netout_link_bits() >= 8 && netout_link_bits() < 32) st_bp_obits = netout_link_bits();
         if (OUT == OUT_ALSA && out && out_device_name(out)[0]) snprintf(st_bp_dac, sizeof st_bp_dac, "%s", out_device_name(out));
         else dac_of(c, st_bp_dac, sizeof st_bp_dac);
 
@@ -2756,6 +2810,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     struct pollfd fds[16];
     int more = 0;
     int net_anchor = 0;                                 /* a network receiver from a Loopback source: 1 full, 2 level kept */
+    double t_anchor = 0;                                /* when its level was first kept (its settling: 60 s) */
     double ctl_target = (double)ring_target;            /* the ring's level the clock correction keeps */
 
     double vf_sum = 0, t_vf = t_play0, t_vf_said = 0, t_vf_off = -1e9;   /* t_vf_off: the ring last seen above it */
@@ -2764,6 +2819,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     rt_guard pg = { 0 };                                /* (21/10, rt_thread.h) this thread at real time: bounded work */
     double pspin_for = 0, pspin_at = rt_test_spin("play", &pspin_for);   /* the tests' (test/rt-safety.sh) */
     const double t_pspin0 = now_s();
+    chan_stage chi;                                     /* the swap, on the music (channels.h): at once here */
+    chan_init(&chi, chan_swap_now());
     while (!quit && !atomic_load(&W.dead)) {
         rt_xcpu_tick();                                 /* a thread of ours dropped by its SIGXCPU: said */
         if (pspin_at > 0 && now_s() - t_pspin0 >= pspin_at) { pspin_at = 0; logf_("test: the play's thread spins %.1f s without a wait (SCHED_FIFO %d now)", pspin_for, lat_rt_now); rt_test_spin_now(pspin_for); }
@@ -2846,8 +2903,9 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             if (!paused) sq_t_pause = 0;
             else if (!sq_t_pause) sq_t_pause = now_s();
             else if (now_s() - sq_t_pause > let_go) {      /* the DAC let go; what was read and not heard, given back */
-                /* a network receiver paused holds its buffer, not heard: given back too, the receiver stopped */
-                sq_unread((long)((W.net ? unheard(&q, &W) : ring_fill(&q)) / (uint64_t)L) + (cur ? cur->lat : 0));
+
+                if (W.net) give_late = 1;
+                else sq_unread((long)(ring_fill(&q) / (uint64_t)L) + (cur ? cur->lat : 0));
                 sq_given = 1; net_cut = 1;
                 PLAY_END(NETOUT_WHY_PAUSE, "Roon paused %.1f s: the output let go", let_go);
                 break;
@@ -2904,7 +2962,14 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                     break;
                 }
             }
-            const int gone = in && !slave_active();         /* read once: both cases below on the same answer */
+
+            int swapped = 0;
+            if (in && paced) {
+                const unsigned sr = slave_active() ? slave_rate() : 0;
+                swapped = in_changed || (sr >= 8000 && (sr != rate || loop_channels(cur_sub) != nch));
+            }
+            const int gone = in && (swapped || !slave_active());   /* read once: both cases below on the same answer */
+            if (swapped) in_swapped = 1;
             if (air_play) {
                 if (!gone) air_q0 = 0;
                 else {
@@ -2936,15 +3001,24 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             }
             /* Roon stopped: let go of the Loopback now; the writer keeps the DAC fed with silence for up to 2 s */
 
-            if (gone && !air_play) {
-                src_close(in); in = NULL; held = now_s(); atomic_store(&W.ending, 1);
-                loop_tail = (cur ? cur->lat : 0) + (lim ? lim_latency(lim) : 0) + UP_LAT(1) + (long)(rate / 20) + (long)iper + 1;
-            }
+#define IN_LET_GO() do { in_rest = 0; src_close(in); in = NULL; held = now_s(); atomic_store(&W.ending, 1); \
+                         loop_tail = (cur ? cur->lat : 0) + (lim ? lim_latency(lim) : 0) + UP_LAT(1) + (long)(rate / 20) + (long)iper + 1; } while (0)
+            if (gone && !air_play && in && !in_rest) { if (src_avail(in) > 0) in_rest = 1; else IN_LET_GO(); }
             if (!in) {
                 if (slave_active()) {
                     loop_tail = -1;
-                    if (slave_rate() != rate || loop_channels(cur_sub) != nch) break;   /* another rate (or channel count, 10/10): start again */
-                    in = open_capture(rate, iper, nch);
+                    const int unseen = in_swapped;
+                    in_changed = 0; in_swapped = 0;
+                    const unsigned sr = slave_rate();
+                    if (sr != rate || loop_channels(cur_sub) != nch) {   /* another rate (or channel count, 10/10): start again */
+
+                        if (paced) { src_hold(cur_sub, OUT == OUT_NET ? 4000 : 1500); play_again_now = 1; }
+                        const char *how = unseen ? " (begun before its stop was seen)" : "";
+                        if (loop_channels(cur_sub) != nch) PLAY_END(NETOUT_WHY_RATE, "the source's next stream at %u Hz, %d channels%s", sr, loop_channels(cur_sub), how);
+                        else PLAY_END(NETOUT_WHY_RATE, "the source's next stream at %u Hz%s", sr, how);
+                        break;
+                    }
+                    in = open_capture(rate, iper, nch); in_rest = 0;
                     if (in && (int)cap_ch != nch) { src_close(in); in = NULL; }   /* not that count after all: start again */
                     if (!in) break;
                     src_start(in);
@@ -2982,6 +3056,11 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                  * pause, STMs, the elapsed time) waiting for all of it: 10 s late on a slow machine. The next turn
                  * starts at once. */
                 if (now_s() - t_read > 0.02) { more = 1; break; }
+                if (meas_pre > 0) {                        /* a measurement's pre-roll: the DAC relocking */
+                    n = meas_pre < (long)iper ? meas_pre : (long)iper;
+                    memset(raw, 0, sizeof(int32_t) * 2 * (size_t)n);
+                    meas_pre -= n;
+                } else
                 n = sq_read(raw, (long)iper, rate, &sq_first);
                 if (n > 0) { if (sq_tail >= 0) atomic_store(&W.ending, 0); sq_tail = -1; }
                 else {                                     /* nothing to read: the music late (wait), or its end */
@@ -3027,11 +3106,13 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                     keep_reads++;
                 }
 
-                if (av >= 0 && av < (paced ? 1L : (long)iper)) break;
-                n = av < 0 ? av : src_read(in, raw, keep > 0 ? (unsigned long)keep : paced && av < (long)iper ? (unsigned long)av : iper);
+                const int part = paced || in_rest;          /* a stopped source's last frames: a part of a period */
+                if (av >= 0 && av < (part ? 1L : (long)iper)) break;
+                n = av < 0 ? av : src_read(in, raw, keep > 0 ? (unsigned long)keep : part && av < (long)iper ? (unsigned long)av : iper);
                 if (n == SRC_AGAIN) break;
                 if (n > 0) t_rd = now_s();
 
+                if (n == SRC_CHANGED) { in_changed = 1; more = 1; break; }
                 if (n == SRC_ENDED) { src_recover(in, n); break; }
                 if (n < 0) {                               /* the Loopback's buffer overflowed: read too late */
 
@@ -3057,13 +3138,18 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                 if (ipd > page_in_peak) page_in_peak = ipd;
                 if (ipd > play_in_peak) play_in_peak = ipd;
             }
-            bp_in(raw, n, nch);                             /* the source as it came (bitperfect.h) */
+            /* the swap (channels.h), the music's, decided once a block for both builds: never what POST /measure
+             * or /calibrate plays (chan_swap_now). The source fingerprinted as the output carries it (bitperfect.h). */
+            const int cin = chan_swap_now();
+            bp_in_as(raw, n, nch, chan_moving(&chi, cin) ? BP_IN_SKIP : cin ? BP_IN_SWAP : BP_IN_AS);   /* the source, as the output carries it */
+            if (cin && nch > 1 && !(atomic_load_explicit(&bp.why, memory_order_relaxed) & BP_SWAP)) bp_say(BP_SWAP);
             /* The free player: the source's frames as they came, bit for bit; only what the output needs (its
              * two channels: a source of more, its first two, a mono one on both; its bits: a word longer than the DAC
              * takes, requantized once with TPDF dither, a sample already on its grid untouched, pcmclock.h). */
             long m = n;
             if (nch == 2) memcpy(pcm, raw, sizeof(int32_t) * 2 * (size_t)n);
             else for (long i = 0; i < n; i++) { pcm[2 * i] = raw[(size_t)i * (size_t)nch]; pcm[2 * i + 1] = raw[(size_t)i * (size_t)nch + (nch > 1)]; }
+            chan_run(&chi, cin, pcm, (unsigned long)n, CH_PCM, 32, rate);   /* the swap, as Room's: the words moved */
             {
 
                 const double vt = sq ? sq_volume() : src_volume(cur_sub);
@@ -3081,7 +3167,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                     else vol_ramp_to(&vr, 0.0, 0);                /* off: back to full, the music as it came */
                     if (vr_first && vol_on_now) { vr.db = vr.tdb; vr.mg = vr.tmute ? 0.0 : 1.0; }   /* nothing played before it: at the level at once */
                     vdone = vol_ramp_run_s32(&vr, pcm, a, m, (double)rate * L, obits, &dither_rng);
-                    if (vdone) bp_say(BP_VOLUME);
+                    if (vdone) bp_say(sq && measuring() ? BP_AMP_VOLUME : BP_VOLUME);   /* a measurement's: the power amplifier's, as Room's */
                     if (!vol_on_now && vol_ramp_settled(&vr)) vr.active = 0;   /* handed back, at 0 dB */
                 }
                 vr_first = 0;
@@ -3110,8 +3196,8 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             }
             if (trim > 0) {
                 long k = 0;
-                /* dithered to 24 bits or fewer: its ±1 LSB of 24 bits (TRIM_FLOOR) counted below the music too */
-                const int32_t tf = obits < 32 ? TRIM_FLOOR + 1 : TRIM_FLOOR;
+
+                const int32_t tf = obits < 32 ? ((int32_t)1 << (32 - (obits < 8 ? 8 : obits))) + 1 : TRIM_FLOOR;
                 while (k < m && k < trim && pcm[2 * k] > -tf && pcm[2 * k] < tf && pcm[2 * k + 1] > -tf && pcm[2 * k + 1] < tf) k++;
                 trim = k < m && k < trim ? 0 : trim - k;   /* a step of music: nothing more dropped, ever, this play */
                 if (k) {
@@ -3129,6 +3215,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
             ring_push(&q, pcm, (uint64_t)m);
             if (live_fin && atomic_load(&q.w) >= live_fin + AIR_LIVE_FADE) { ring_fade(&q, live_fin, AIR_LIVE_FADE, 1); live_fin = 0; }   /* */
         }
+        if (in_rest) { if (in) IN_LET_GO(); else in_rest = 0; }   /* a stopped source's last frames read: let go now */
 
         double t = now_s();
         if (t - t_fill >= 0.1) {                           /* the ring's fill, exact: no question to any driver */
@@ -3305,7 +3392,7 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                     sq_given = 1; net_cut = 1;
                     break;
                 }
-                request(as_played(c, &c0), rate);
+                request(c, rate);
             }
         }
 
@@ -3331,28 +3418,47 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                     logf_("network receiver: the ring kept at its target, %.0f ms once the receiver holds its %.0f ms (now %.0f ms on average)",
                           ring_target * ms, (double)atomic_load(&W.hold) * ms, avg * ms);
                 else {
-                    ctl_target = avg < ring_target / 4.0 ? ring_target / 4.0 : avg > ring_target ? ring_target : avg;
+
+                    double hi = az_out ? (double)ring_target : (double)cap_frames - 1.5 * orate;   /* an audiolaz receiver: as before */
+                    if (hi < ring_target) hi = ring_target;
+                    ctl_target = avg < ring_target / 4.0 ? ring_target / 4.0 : avg > hi ? hi : avg;
+                    t_anchor = t;
                     atomic_store(&W.prime, (uint64_t)ctl_target);   /* a re-prime starts at the level kept */
-                    logf_("network receiver: the ring kept at %.0f ms (its target %.0f ms)", ctl_target * ms, ring_target * ms);
+                    logf_("network receiver: the ring kept at %.0f ms (its target %.0f ms%s)", ctl_target * ms, ring_target * ms,
+                          ctl_target > ring_target ? ": the receiver reads in bursts, the level it leaves kept" : "");
                 }
             }
             double e = (fill_sum / fill_n - ctl_target) / (double)orate;
+
+            if (W.net && !az_out && !W.vid && net_anchor == 2 && t_anchor > 0 && t - t_anchor < 60.0 && fabs(e) > CLOCK_NET_DEAD_S) {
+                const double avg = fill_sum / fill_n;
+                double hi = (double)cap_frames - 1.5 * orate;
+                if (hi < ring_target) hi = ring_target;
+                ctl_target = avg < ring_target / 4.0 ? ring_target / 4.0 : avg > hi ? hi : avg;
+                atomic_store(&W.prime, (uint64_t)ctl_target);
+                logf_("network receiver: its level still settling (%.0f s after it was kept): the ring kept at %.0f ms now", t - t_anchor, ctl_target * ms);
+                e = (avg - ctl_target) / (double)orate;
+            }
             double span = t - t_adjust;
             fill_sum = 0; fill_n = 0; t_adjust = t;
-            ppm = clock_regulate(e, span, &steady);       /* the integral near the target only (pcmclock.h, 09/10) */
+            ppm = clock_regulate_dead(e, span, &steady, W.net && !az_out ? CLOCK_NET_DEAD_S : 0.0);   /* the integral near the target only (pcmclock.h, 09/10); a Squeezebox or UPnP receiver's bursts in a band (an audiolaz receiver reads at its DAC's pace: as before) */
             shift_set(100000 + lround(ppm / 11.0));
         }
         if (log_n && t - t_log >= 60.0) {
-            char lat_said[300] = "";
+            char lat_said[400] = "";
             if (st_lat_ms >= 0) snprintf(lat_said, sizeof lat_said, "; input to output %.0f ms", st_lat_ms);
             /* (22/10, the FOCALE voie at −267 ppm from Roon, unsaid) an audiolaz receiver's pace: its DAC's clock against
              * this machine's (its reports), the ring's pull on it (the two together: the pace a card's app follows) */
+
             {
-                double dp, pp, rg, tg, an;
-                if (OUT == OUT_NET && !netout_link_pace(&dp, &pp, &rg, &tg, &an)) {
+                double dp, da, ds, pp, rg, tg, an;
+                if (OUT == OUT_NET && !netout_link_pace(&dp, &da, &ds, &pp, &rg, &tg, &an)) {
                     const size_t ll = strlen(lat_said);
-                    snprintf(lat_said + ll, sizeof lat_said - ll, "; Link: its DAC %+.0f ppm against this machine's clock, its ring %.0f ms (kept at %.0f, asked %.0f) pulling %+.0f ppm: sent at %+.0f ppm",
-                             dp, rg, an, tg, pp, dp + pp);
+                    char dac_said[96];
+                    if (ds > 0) snprintf(dac_said, sizeof dac_said, "%+.0f ppm against this machine's clock (its average over %.0f s; %+.0f now)", da, ds, dp);
+                    else snprintf(dac_said, sizeof dac_said, "%+.0f ppm against this machine's clock (its estimate now)", dp);
+                    snprintf(lat_said + ll, sizeof lat_said - ll, "; Link: its DAC %s, its ring %.0f ms (kept at %.0f, asked %.0f) pulling %+.0f ppm: sent at %+.0f ppm",
+                             dac_said, rg, an, tg, pp, dp + pp);
                 }
             }
             logf_("clock: ring %.0f ms on average (%.0f–%.0f, target %.0f), DAC buffer %.0f ms, Roon slowed %.1f ppm (steady %.1f), %ld DAC stops, %ld silences, %ld Loopback overruns; longest wait %.0f ms%s",
@@ -3401,6 +3507,10 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
                   + (lim ? lim_latency(lim) : 0) + UP_LAT(0));
     atomic_store(&W.stop, 1);
     pthread_join(W.th, NULL);
+    /* Roon paused, to a network receiver: what it has not played given back now, the writer stopped, just
+     * before output_release tells it to stop (its position as close as can be to where it stops) */
+    long give_back = 0;
+    if (give_late) { give_back = (long)(unheard(&q, &W) / (uint64_t)L) + (cur ? cur->lat : 0); netout_stop_mark(); }
     /* the music ended there (played out, another rate, the source stopped): a network receiver plays out its buffer;
      * stopped, flushed, paused, another source, another output, the receiver lost: stopped at once */
     {   /* the play's end in one line, its reason told to an audiolaz receiver */
@@ -3416,6 +3526,13 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     }
 #undef PLAY_END
     output_release(W.out, !net_cut && !atomic_load(&W.dead) && !quit && !(sq && sq_generation() != sq_gen));
+    /* what the receiver played beyond that while it was being stopped (its STMf's elapsed time, 300 ms at most):
+     * not given back, never heard twice */
+    if (give_late) {
+        const long extra = netout_stop_extra(300) / (long)L;
+        if (extra > 0) logf_("paused: the receiver played %.0f ms more while it was stopped: not given back", extra * 1000.0 / rate);
+        sq_unread(give_back > extra ? give_back - extra : 0);
+    }
     if (in) src_close(in);
     free(raw); free(a); free(pcm); free(q.buf);
     lim_free(lim);                                     /* the free player: none (player.h) */
@@ -3424,14 +3541,13 @@ static void play(unsigned rate, control *c, stamp *seen, int sq) {
     if (az_out) netout_fifo_ms(0);
     st_lat_ms = -1; st_heard[0] = 0;
     st_in_ch = 0; st_in_layout[0] = 0; st_dlg_centre = 0; cap_ch = 2;   /* */
-    air_level0 = 0;
     if (keep_reads) logf_("the « audiolaz » input read on at its rate %ld times while the network receiver held the music (its bursts)", keep_reads);
     logf_("stopped (%ld DAC stops, %ld silences, %ld Loopback overruns, %ld frames dropped; %ld clipped samples)",
           atomic_load(&W.underruns), atomic_load(&W.silences), xruns_in, dropped, clipped);
     /* the peaks of this play : the source's as it came (a Loopback input: AirPlay, Spotify…), the output's */
-    if (!sq) logf_("peaks this play: input %.1f dBFS (the source as it came%s), output %.1f dBFS%s", play_in_peak > 0 ? 20 * log10(play_in_peak) : -150.0,
-                   air_play ? ", AirPlay: the sender's volume and the source's loudness" : "", play_out_peak > 0 ? 20 * log10(play_out_peak) : -150.0,
-                   air_play ? " (AirPlay at 0 dB)" : "");
+    if (meas_play) logf_("measurement: its play's output peak %.1f dBFS", play_out_peak > 0 ? 20 * log10(play_out_peak) : -150.0);   /* test/engine-measure.sh */
+    if (!sq) logf_("peaks this play: input %.1f dBFS (the source as it came%s), output %.1f dBFS", play_in_peak > 0 ? 20 * log10(play_in_peak) : -150.0,
+                   air_play ? ", AirPlay: the sender's volume and the source's loudness" : "", play_out_peak > 0 ? 20 * log10(play_out_peak) : -150.0);
     /* its time counted for its session's kind of stream (the input set between sessions for the kind
      * played most): as said now, else as at its start */
     if (air_play && video) {
@@ -3544,6 +3660,10 @@ int main(int argc, char **argv) {
         page_conf_follow(ROOMS);                       /* the page's settings (its place's per output) as the player's page keeps them */
         logf_("voie %s: « %s »", VOIE, VOIE_NAME ? VOIE_NAME : "");
     }
+    if (!VOIE) {   /* before the control is read: the polarity set under 1.2.8 kept as it sounded (page.c) */
+        const int mv = page_channels_migrate(ROOMS);
+        if (mv > 0) logf_("channels: the polarity of %d output%s with left and right swapped kept as before (invert_l and invert_r exchanged: since 1.2.9 they name the output's side)", mv, mv > 1 ? "s" : "");
+    }
     control c = { .gain = -13, .dyn_lo = DYN_LO, .dyn_hi = DYN_HI };
     c.gain = 0; c.bypass = 1; c.noroom = 1; snprintf(c.place, sizeof c.place, "-");   /* no control file yet: as it came too */
     stamp seen = { 0, 0, 0 };
@@ -3627,7 +3747,10 @@ int main(int argc, char **argv) {
         else {                                         /* woken by the Loopback's event: the source that started last */
             struct pollfd efd[8];                      /* the Loopback's, the card's four streams, the UPnP input's */
             const int en = src_event_fds(efd, 8);
-            if (en > 0) { poll(efd, (nfds_t)en, SQ_SERVER ? 20 : 100); src_drain(); } else usleep(SQ_SERVER ? 20000 : 100000);
+            /* after a play ended on its source's next stream at another rate (play_again_now): no wait, it plays */
+            const int at_once = play_again_now;
+            play_again_now = 0;
+            if (en > 0) { poll(efd, (nfds_t)en, at_once ? 0 : SQ_SERVER ? 20 : 100); src_drain(); } else if (!at_once) usleep(SQ_SERVER ? 20000 : 100000);
             const int k = LOOP_SUBS > 1 ? newest_sub() : (slave_active_sub(0) ? 0 : -1);
             if (k >= 0) {
                 if (k != cur_sub) logf_("input: Loopback subdevice %d (the source that started last)", k);

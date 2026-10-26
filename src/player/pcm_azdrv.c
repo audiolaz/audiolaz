@@ -20,6 +20,7 @@ typedef struct {
     uint64_t base;            /* the ring's sample time of app frame 0 (prepare) */
     uint64_t pos;             /* app frames consumed (the hardware pointer, unwrapped) */
     uint64_t clk;             /* host clock (ns) up to which pos was advanced while standing in */
+    double posf;              /* a steady ring's pointer, in frames (below) */
     snd_pcm_uframes_t boundary;
     int run;
 } azd;
@@ -41,11 +42,22 @@ static int map(azd *a) {
     return 0;
 }
 
-/* The hardware pointer: the player's rd while it beats, else the host clock; never past what the app wrote. */
 static uint64_t advance(azd *a) {
     az_shm *m = a->m;
     const uint64_t now = ns(CLOCK_MONOTONIC), beat = atomic_load(&m->beat), w = atomic_load(&m->w);
     const uint64_t appl = w - a->base;
+    if (atomic_load(&m->lx) == 3) {
+        if (a->run && now > a->clk) {
+            const double ppb = (double)atomic_load(&m->ppb);
+            a->posf += (double)(now - a->clk) * a->io.rate / 1e9 / (1.0 + ppb * 1e-9);
+            a->clk = now;
+            if (a->posf > (double)appl) a->posf = (double)appl;    /* the app late: no xrun, the sink waits */
+            a->pos = (uint64_t)a->posf;
+            atomic_store(&m->rd, a->base + a->pos);
+        }
+        if (a->pos > appl) a->pos = appl;
+        return a->pos;
+    }
     if (a->run && beat && now - beat < AZ_BEAT_LX_NS && now >= beat) {
         const uint64_t rd = atomic_load(&m->rd);
         if (rd > a->base && rd - a->base > a->pos) a->pos = rd - a->base;
@@ -102,7 +114,7 @@ static int az_prepare(snd_pcm_ioplug_t *io) {
     if (snd_pcm_sw_params_current(io->pcm, sw) == 0) snd_pcm_sw_params_get_boundary(sw, &a->boundary);
     if (!a->boundary) a->boundary = io->buffer_size;
     atomic_store(&m->running, 0);
-    a->run = 0; a->pos = 0;
+    a->run = 0; a->pos = 0; a->posf = 0;
     a->base = atomic_load(&m->w);
     atomic_store(&m->rd, a->base);
     atomic_store(&m->fmt, io->format == SND_PCM_FORMAT_FLOAT_LE ? AZ_F32 : AZ_S32);

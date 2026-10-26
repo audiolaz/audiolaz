@@ -44,7 +44,8 @@ void out_close(out_pcm *o);
 /* Whether dev takes this format at this rate: 1 (natively), 0, or −1 when it cannot be asked now (busy); 2 (macOS, 10/10)
  * only resampled: a PCM rate the device does not play, played at another one through out_coreaudio.c's converter.
  * Never 2 for DSD, and DoP (S32 at the DoP rate) needs 1: resampled, its markers and one-bit words would be noise
- * (roomd.c dsd_plan). Cheap enough to call before each play; roomd.c keeps the answers. */
+ * (roomd.c dsd_plan). Cheap enough to call before each play; roomd.c keeps the answers. Linux, OUTF_S32: in any
+ * PCM format out_alsa.c packs the words into (S32_LE … S16_LE); DoP needs 24 bits of them (out_takes_bits). */
 int out_takes(const char *dev, int fmt, unsigned rate);
 /* Words for the log. */
 const char *out_strerror(long e);
@@ -53,8 +54,16 @@ const char *out_fmt_name(int fmt);
  * rate refused, resampled here), 0 otherwise; and the device's own name. Linux: 0 and "". */
 unsigned out_device_rate(out_pcm *o);
 /* The bits of each 32-bit sample word the device keeps (24: a 24-bit DAC, or Core Audio's float32 on the way;
- * 32: all of them, or not known): roomd.c requantizes to it once, with TPDF dither (pcmclock.h s32_out_q). */
+ * 32: all of them, or not known): roomd.c requantizes to it once, with TPDF dither (pcmclock.h s32_out_q). * Linux: 16 for a card that takes S16_LE only, 24 for S24_3LE… (out_alsa.c). */
 int out_bits(out_pcm *o);
+
+#if defined(__APPLE__) || defined(__CYGWIN__)
+static inline int out_takes_bits(const char *dev, unsigned rate) { (void)dev; (void)rate; return 32; }
+static inline const char *out_format(out_pcm *o) { (void)o; return ""; }
+#else
+int out_takes_bits(const char *dev, unsigned rate);
+const char *out_format(out_pcm *o);
+#endif
 const char *out_device_name(out_pcm *o);
 
 const char *out_device_maker(out_pcm *o);

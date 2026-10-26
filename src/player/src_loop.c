@@ -55,22 +55,26 @@ static loop_state read_loop_sub(int sub) {
     return s;
 }
 
-static int DK = -1;
-static az_shm *DM;
+static int DK = -1;                       /* the one --in-driver k without a name (AUDIOLAZ_SHM), −1 none */
+static char DNAME[SRC_MAX][64];           /* input k's ring by name ("" none, or DK's) */
+static az_shm *DMS[SRC_MAX];
+static int dnamed(int k) { return k >= 0 && k < SRC_MAX && DNAME[k][0]; }
 static uint64_t dns(clockid_t c) { struct timespec t; clock_gettime(c, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
-static az_shm *drv(void) {
-    if (DM) return DM;
-    const int fd = shm_open(az_shm_name(), O_RDWR, 0);
+static az_shm *drv_k(int k) {
+    if (k < 0 || k >= SRC_MAX) return NULL;
+    if (DMS[k]) return DMS[k];
+    const char *nm = dnamed(k) ? DNAME[k] : az_shm_name();
+    const int fd = shm_open(nm, O_RDWR, 0);
     if (fd < 0) return NULL;
     struct stat st;
     void *m = fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof(az_shm) ? mmap(NULL, sizeof(az_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
     close(fd);
     if (m == MAP_FAILED) return NULL;
     if (((az_shm *)m)->magic != AZ_MAGIC) { munmap(m, sizeof(az_shm)); return NULL; }
-    slog("input %d: the ALSA output « audiolaz » (%s), at the DAC's clock", DK, az_shm_name());
-    return DM = m;
+    slog("input %d: the ALSA output « audiolaz » (%s), at the DAC's clock", k, nm);
+    return DMS[k] = m;
 }
-static int is_drv(int k) { return k >= 0 && k == DK; }
+static int is_drv(int k) { return k >= 0 && (k == DK || dnamed(k)); }
 
 #define CS_MAX 8
 static int CKS[SRC_MAX];                  /* input k → the card's stream (−1: not the card's) */
@@ -110,16 +114,16 @@ static struct azc_info *card(int k) { return is_card(k) ? card_s(CKS[k]) : NULL;
 
 int src_paced(int k) { return is_drv(k) || is_card(k); }
 /* src.h: an uplink's ring (lx 2) keeps its music for this player; the Linux plugin's (lx 1) as before */
-int src_keeps(int k) { az_shm *m = is_drv(k) ? drv() : NULL; return m && atomic_load(&m->lx) == 2; }
+int src_keeps(int k) { az_shm *m = is_drv(k) ? drv_k(k) : NULL; return m && atomic_load(&m->lx) == 2; }
 /* src.h: the plugin's app stopped, paused or closed it (running 0), not a stall nor zeros */
 int src_io_ended(int k) {
     if (is_card(k)) { const struct azc_info *c = card(k); return c && !c->running; }
-    az_shm *m = is_drv(k) ? drv() : NULL; return m && !atomic_load(&m->running);
+    az_shm *m = is_drv(k) ? drv_k(k) : NULL; return m && !atomic_load(&m->running);
 }
 
 double plat_src_volume(int k) {
     if (is_drv(k)) {
-        az_shm *m = drv();
+        az_shm *m = drv_k(k);
         const uint32_t c = m ? atomic_load(&m->vol_cdb) : 0;
         return c >= AZ_VOL_FLOOR_CDB ? 0.0 : c ? pow(10.0, -(double)c / 2000.0) : 1.0;
     }
@@ -165,14 +169,14 @@ void plat_src_dac(const char *name, const char *maker, const char *model, int lo
 }
 
 void plat_src_latency(int k, double ms) {
-    az_shm *m = is_drv(k) ? drv() : NULL;
+    az_shm *m = is_drv(k) ? drv_k(k) : NULL;
     if (m && ms >= 0 && ms < 60000) atomic_store(&m->lat_us, (uint32_t)(ms * 1000.0 + 0.5));
 }
 /* src.h src_hold: AZC_IOC_HOLD (a module before 18/10: none, as before); an uplink's ring (lx 2):
  * hold_ns (audiolaz_drv.h; the Linux plugin's ring, lx 1, as before: nothing held, its activity as it was) */
 void plat_src_hold(int k, int ms) {
     if (is_drv(k)) {
-        az_shm *m = drv();
+        az_shm *m = drv_k(k);
         if (m && atomic_load(&m->lx) == 2) atomic_store(&m->hold_ns, ms > 0 ? dns(CLOCK_MONOTONIC) + (uint64_t)ms * 1000000ull : 0);
         return;
     }
@@ -254,26 +258,35 @@ const char *src_what(void) { return what; }
 int src_active(int k) {
     if (is_card(k)) { const struct azc_info *c = card(k); return c && c->running && c->rate >= 8000 && c->frame_bytes; }
     if (is_drv(k)) {                     /* playing, and writing (an app killed holding it: w still for 2 s, let go) */
-        static uint64_t lw; static uint64_t lt;
-        az_shm *m = drv();
+        static uint64_t lws[SRC_MAX], lts[SRC_MAX];      /* each ring's own */
+        uint64_t *lw = &lws[k], *lt = &lts[k];
+        az_shm *m = drv_k(k);
         if (!m) return 0;
         const uint64_t w = atomic_load(&m->w), now = dns(CLOCK_MONOTONIC);
-        if (!lt) { lw = w; lt = now - 3000000000ull; }   /* first seen: playing once it writes (not a killed app's) */
-        else if (w != lw) { lw = w; lt = now; }
+        if (!*lt) { *lw = w; *lt = now - 3000000000ull; }   /* first seen: playing once it writes (not a killed app's) */
+        else if (w != *lw) { *lw = w; *lt = now; }
         /* an uplink's ring (lx 2) keeping its music for this player while its output opens (hold_ns): still
          * active, nothing written meanwhile */
-        return atomic_load(&m->running) && atomic_load(&m->rate) >= 8000 && (now - lt < 2000000000ull || (atomic_load(&m->lx) == 2 && atomic_load(&m->hold_ns) > now));
+        return atomic_load(&m->running) && atomic_load(&m->rate) >= 8000 && (now - *lt < 2000000000ull || (atomic_load(&m->lx) == 2 && atomic_load(&m->hold_ns) > now));
     }
     if (!ctl || !active_vals[k] || snd_ctl_elem_read(ctl, active_vals[k]) < 0) return read_loop_sub(k).running;
     return snd_ctl_elem_value_get_boolean(active_vals[k], 0);
 }
 unsigned src_rate(int k) {
     if (is_card(k)) { const struct azc_info *c = card(k); return c ? c->rate : 0; }
-    if (is_drv(k)) { az_shm *m = drv(); return m ? atomic_load(&m->rate) : 0; }
+    if (is_drv(k)) { az_shm *m = drv_k(k); return m ? atomic_load(&m->rate) : 0; }
     if (!ctl || !srate_vals[k] || snd_ctl_elem_read(ctl, srate_vals[k]) < 0) return read_loop_sub(k).rate;
     return (unsigned)snd_ctl_elem_value_get_integer(srate_vals[k], 0);
 }
-double src_started(int k) { if (is_card(k)) { const struct azc_info *c = card(k); return c && c->running ? c_started[CKS[k]] : 0; } if (is_drv(k)) { az_shm *m = drv(); return m ? atomic_load(&m->t0) / 1e9 : 0; } return read_loop_sub(k).trigger; }
+double src_started(int k) { if (is_card(k)) { const struct azc_info *c = card(k); return c && c->running ? c_started[CKS[k]] : 0; } if (is_drv(k)) {
+        az_shm *m = drv_k(k);
+        if (!m) return 0;
+        const double t = atomic_load(&m->t0) / 1e9;
+        /* a named ring written by the plugin (lx 1, CLOCK_REALTIME): on the monotonic clock of the voie's other inputs */
+        if (dnamed(k) && (atomic_load(&m->lx) == 1 || atomic_load(&m->lx) == 3) && t > 0) return t - (dns(CLOCK_REALTIME) - dns(CLOCK_MONOTONIC)) / 1e9;
+        return t;
+    }
+    return read_loop_sub(k).trigger; }
 unsigned src_channels(int k) { if (is_card(k)) { const struct azc_info *c = card(k); return c ? c->channels : 0; } if (is_drv(k)) return 2; return read_loop_sub(k).channels; }
 /* Its source's side (device 1, subdevice k) closed: shairport-sync not playing into it, nor holding it. */
 int src_closed(int k) {
@@ -329,14 +342,82 @@ int src_air_connected(int port) {
 
 struct src_pcm { snd_pcm_t *p; az_shm *m; uint64_t r; uint32_t gen; int tfd; int card, cs; uint32_t cfmt, cfb; unsigned char *cbuf; size_t cbn;
                  long dop_run, dop_off; int dop_on, dop_said; uint32_t dop_last;
-                 uint32_t csi; unsigned crate; };   /* the card's stand_in as last seen (SRC_LOST), its rate */
+                 uint32_t csi; unsigned crate;   /* the card's stand_in as last seen (SRC_LOST), its rate */
+                 /* the stream's shape this read was opened on, kept for its life (the card: crate, cfmt, cfb and
+                  * cch; the driver's ring: drate), and changed: the input now plays another stream in another shape
+                  * (SRC_CHANGED, said until src_close) */
+                 unsigned cch, drate; int changed;
+                 /* a steady ring (lx 3, a voie's own AirPlay and Spotify Connect: drv_steer) */
+                 int steady, anchored; double e, e0, t_first, t_last;
+                 /* drv_steer: the DAC's clock followed (ppm, smoothed; said once known), the steps' checkpoint */
+                 double ff, t_ff, e_chk, t_chk; int ff_said; };
 static void beat(src_pcm *s) { atomic_store(&s->m->beat, dns(CLOCK_MONOTONIC)); }
-static src_pcm *drv_open(unsigned rate, unsigned ch) {
-    az_shm *m = drv();
+
+#define STEER_SETTLE_S 3.0
+#define STEER_TAU_S 30.0
+#define STEER_BEHIND_S 0.75
+#define STEER_AHEAD_S 0.1
+#define STEER_STEP_S 0.08
+#define STEER_MAX_PPB 500000.0
+#define STEER_FF_MIN_S 30.0                 /* the DAC's average taken once it covers this much of the stream */
+#define STEER_FF_MAX_PPM 50.0
+#define STEER_FF_TRUST_S 120.0              /* a young average's weight: ds / (ds + this) */
+#define STEER_FF_TAU_S 60.0
+/* netout.c's (roomd: the voie's own output): weak, so that a program with this file and no network output (the tests'
+ * readers) links; there, no DAC said: this machine's clock */
+extern int netout_link_pace(double *dac_ppm, double *dac_avg_ppm, double *avg_s, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms) __attribute__((weak));
+/* the voie's DAC's clock against this machine's (ppm, + faster) as its output says it now: 1 known, 0 none */
+static int steer_dac_ppm(double *ppm) {
+    double dp, da = 0, ds = 0, pp, rg, tg, an;
+    if (!netout_link_pace || netout_link_pace(&dp, &da, &ds, &pp, &rg, &tg, &an) || ds < STEER_FF_MIN_S) return 0;
+    *ppm = (da > STEER_FF_MAX_PPM ? STEER_FF_MAX_PPM : da < -STEER_FF_MAX_PPM ? -STEER_FF_MAX_PPM : da) * ds / (ds + STEER_FF_TRUST_S);
+    return 1;
+}
+static double steer_ff_kept = 0;            /* the DAC's clock last followed: the next read's start (the same output) */
+static void drv_steer(src_pcm *s) {
+    const double t = dns(CLOCK_MONOTONIC) / 1e9;
+    const double err = (double)(int64_t)(atomic_load(&s->m->rd) - s->r);
+    const double R = s->drate ? (double)s->drate : 44100.0;
+    if (s->t_last <= 0) { s->t_first = s->t_last = t; s->e = err; s->t_chk = 0; return; }
+    const double dt = t - s->t_last;
+    if (dt < 0.01) return;
+    s->t_last = t;
+    s->e += (err - s->e) * (dt > 1.0 ? 1.0 : dt);
+    /* the DAC's clock, once a second: smoothed toward what its output says (none said: as it was, at first this
+     * machine's) */
+    if (t - s->t_ff >= 1.0) {
+        double d;
+        const double span = s->t_ff > 0 ? t - s->t_ff : 1.0;
+        s->t_ff = t;
+        if (steer_dac_ppm(&d)) {
+            s->ff += (d - s->ff) * (span >= STEER_FF_TAU_S ? 1.0 : span / STEER_FF_TAU_S);
+            steer_ff_kept = s->ff;
+            if (!s->ff_said) { s->ff_said = 1; slog("the steady ring: its clock the DAC's (%+.1f ppm against this machine's: its output's average, as far as trusted yet), not this reader's pace", d); }
+        }
+    }
+    if (!s->anchored) { if (t - s->t_first < STEER_SETTLE_S) return; s->e0 = s->e; s->anchored = 1; s->e_chk = s->e; s->t_chk = t; }
+    if (t - s->t_chk >= 1.0) {                         /* a step within a second: the level moved with it */
+        const double step = s->e - s->e_chk;
+        if (fabs(step) > STEER_STEP_S * R) {
+            slog("the steady ring: its reader %.0f ms %s the plugin's clock: kept so (a jump, no drift)", fabs(step) / R * 1000, step > 0 ? "further behind" : "nearer to");
+            s->e0 += step;
+        }
+        s->e_chk = s->e; s->t_chk = t;
+    }
+    const double d = s->e - s->e0, behind = STEER_BEHIND_S * R, ahead = STEER_AHEAD_S * R;
+    const double past = d > behind ? d - behind : d < -ahead ? d + ahead : 0.0;
+    double ppb = -s->ff * 1000.0 + past / (STEER_TAU_S * R * 1e-9);   /* + slower: the DAC faster, the plugin faster */
+    if (ppb > STEER_MAX_PPB) ppb = STEER_MAX_PPB; else if (ppb < -STEER_MAX_PPB) ppb = -STEER_MAX_PPB;
+    atomic_store(&s->m->ppb, (int64_t)ppb);
+}
+static src_pcm *drv_open(int k, unsigned rate, unsigned ch) {
+    az_shm *m = drv_k(k);
     if (!m || ch != 2 || atomic_load(&m->rate) != rate) { slog("« audiolaz » at %u Hz, %u channels: not what it plays", rate, ch); return NULL; }
     src_pcm *s = calloc(1, sizeof *s);
     if (!s) return NULL;
-    s->m = m; s->gen = atomic_load(&m->gen); s->r = atomic_load(&m->rd);
+    s->m = m; s->gen = atomic_load(&m->gen); s->r = atomic_load(&m->rd); s->drate = rate;
+    s->steady = atomic_load(&m->lx) == 3;
+    if (s->steady) { s->ff = steer_ff_kept; atomic_store(&m->ppb, (int64_t)(-s->ff * 1000.0)); }
     s->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);   /* a wake-up every 2 ms, not a clock */
     struct itimerspec t = { { 0, 2000000 }, { 0, 2000000 } };
     if (s->tfd >= 0) timerfd_settime(s->tfd, 0, &t, NULL);
@@ -347,7 +428,14 @@ static long drv_avail(src_pcm *s) {
     uint64_t x;
     if (s->tfd >= 0) (void)!read(s->tfd, &x, sizeof x);
     beat(s);
-    if (atomic_load(&s->m->gen) != s->gen) return SRC_ENDED;       /* the app prepared again: another stream (18/10: no loss) */
+    if (s->steady) drv_steer(s);
+    if (s->changed) return SRC_CHANGED;
+    if (atomic_load(&s->m->gen) != s->gen) {                       /* the app prepared again: another stream (18/10: no loss) */
+        /* at another rate: never taken over (src_recover), the play ends on it (src.h SRC_CHANGED) */
+        const uint32_t nr = atomic_load(&s->m->rate);
+        if (nr >= 8000 && nr != s->drate) { s->changed = 1; return SRC_CHANGED; }
+        return SRC_ENDED;
+    }
     const uint64_t w = atomic_load_explicit(&s->m->w, memory_order_acquire);
     if (w < s->r || w - s->r > AZ_RING - 4096) return -EPIPE;
     return (long)(w - s->r);
@@ -360,7 +448,7 @@ static src_pcm *card_open(int k, unsigned rate, unsigned ch) {
     }
     src_pcm *s = calloc(1, sizeof *s);
     if (!s) return NULL;
-    s->card = 1; s->cs = CKS[k]; s->gen = c->gen; s->cfmt = c->format; s->cfb = c->frame_bytes;
+    s->card = 1; s->cs = CKS[k]; s->gen = c->gen; s->cfmt = c->format; s->cfb = c->frame_bytes; s->cch = c->channels;
     s->csi = c->stand_in; s->crate = c->rate;                       /* what the card let go before this player came: not its */
     s->cbn = 8192; s->cbuf = malloc(s->cbn * s->cfb);
     if (!s->cbuf) { free(s); return NULL; }
@@ -373,12 +461,20 @@ static src_pcm *card_open(int k, unsigned rate, unsigned ch) {
 }
 
 static char card_lost_why[96];
+
+static int card_other(const src_pcm *s, const struct azc_info *c) {
+    return c->rate != s->crate || c->channels != s->cch || c->format != s->cfmt || c->frame_bytes != s->cfb;
+}
 static long card_avail(src_pcm *s) {
     uint64_t x;
     if (s->tfd >= 0) (void)!read(s->tfd, &x, sizeof x);
+    if (s->changed) return SRC_CHANGED;
     const struct azc_info *c = card_s(s->cs);
     if (!c) return -EPIPE;                                       /* the card gone (its module unloaded) */
-    if (c->gen != s->gen || !c->running) return SRC_ENDED;
+    if (c->gen != s->gen || !c->running) {
+        if (c->running && card_other(s, c)) { s->changed = 1; return SRC_CHANGED; }   /* above */
+        return SRC_ENDED;
+    }
     if (c->stand_in > s->csi) {
         const uint32_t n = c->stand_in - s->csi;
         s->csi = c->stand_in;
@@ -416,9 +512,18 @@ static void card_dop(src_pcm *s, int32_t *pcm, unsigned long got) {
 static long card_read(src_pcm *s, int32_t *pcm, unsigned long n) {
     if (n > s->cbn) n = s->cbn;
     if (CFD[s->cs] < 0) return -EPIPE;
+    if (s->changed) return SRC_CHANGED;
     const ssize_t r = read(CFD[s->cs], s->cbuf, n * s->cfb);
     if (r < 0) return errno == EAGAIN ? SRC_AGAIN : -EPIPE;
     if (r == 0) { const long a = card_avail(s); return a < 0 ? a : SRC_AGAIN; }   /* the stream stopped or changed under the read */
+    /* the card reads each stream in its own frames: the stream changed between the last look and this read,
+     * into another shape, these bytes may be the new one's (another frame size, another format): never taken as this
+     * one's (at most a read's worth of the old stream's last frames lost with them, its app's silence before its
+     * teardown) */
+    {
+        const struct azc_info *c = card_s(s->cs);
+        if (c && c->gen != s->gen && c->running && card_other(s, c)) { s->changed = 1; return SRC_CHANGED; }
+    }
     const unsigned long got = (unsigned long)r / s->cfb;
     const unsigned sb = s->cfb / 2;                                 /* a sample's bytes */
     for (unsigned long i = 0; i < 2 * got; i++) pcm[i] = card_s32(s->cbuf + i * sb, s->cfmt);
@@ -428,7 +533,7 @@ static long card_read(src_pcm *s, int32_t *pcm, unsigned long n) {
 
 src_pcm *src_open(int k, unsigned rate, unsigned ch, unsigned long period, unsigned periods) {
     if (is_card(k)) return card_open(k, rate, ch);
-    if (is_drv(k)) return drv_open(rate, ch);
+    if (is_drv(k)) return drv_open(k, rate, ch);
     char name[64];
     snprintf(name, sizeof name, "plughw:%s,0,%d", LOOP, k);
     snd_pcm_t *p;
@@ -467,7 +572,7 @@ long src_read(src_pcm *s, int32_t *pcm, unsigned long n) {
         const uint32_t fmt = atomic_load(&s->m->fmt);
         for (unsigned long i = 0; i < n; i++) { pcm[2 * i] = az_get(s->m, fmt, s->r + i, 0); pcm[2 * i + 1] = az_get(s->m, fmt, s->r + i, 1); }
         s->r += n;
-        atomic_store(&s->m->rd, s->r);
+        if (!s->steady) atomic_store(&s->m->rd, s->r);   /* a steady ring's pointer is the plugin's own */
         return (long)n;
     }
     const snd_pcm_sframes_t r = snd_pcm_readi(s->p, pcm, n);
@@ -481,18 +586,40 @@ int src_delay(src_pcm *s, long *frames) {
     *frames = (long)d;
     return 0;
 }
-void src_recover(src_pcm *s, long err) { if (s->card) { const struct azc_info *c = card_s(s->cs); if (c) { if (c->gen != s->gen) s->csi = c->stand_in; s->gen = c->gen; s->crate = c->rate; } return; } if (s->m) { s->gen = atomic_load(&s->m->gen); s->r = atomic_load(&s->m->w); atomic_store(&s->m->rd, s->r); return; } snd_pcm_recover(s->p, (int)err, 1); snd_pcm_start(s->p); }
+/* a stream in another shape never taken over (SRC_CHANGED: card_other, the driver's ring at another rate): the
+ * shape this read was opened on kept for its life (before, the card's rate was taken from the new stream, its frames
+ * still read in the old format) */
+void src_recover(src_pcm *s, long err) {
+    if (s->card) {
+        const struct azc_info *c = card_s(s->cs);
+        if (c && !s->changed) {
+            if (c->gen != s->gen && c->running && card_other(s, c)) { s->changed = 1; return; }
+            if (c->gen != s->gen) s->csi = c->stand_in;
+            s->gen = c->gen;
+        }
+        return;
+    }
+    if (s->m) {
+        if (s->changed) return;
+        const uint32_t g = atomic_load(&s->m->gen), nr = atomic_load(&s->m->rate);
+        if (g != s->gen && nr >= 8000 && nr != s->drate) { s->changed = 1; return; }
+        s->gen = g; s->r = atomic_load(&s->m->w); if (!s->steady) atomic_store(&s->m->rd, s->r); else s->t_last = 0, s->anchored = 0;
+        return;
+    }
+    snd_pcm_recover(s->p, (int)err, 1); snd_pcm_start(s->p);
+}
 int src_poll_fds(src_pcm *s, struct pollfd *fds, int max) { if (s->card) { if (s->tfd < 0 || max < 1) return 0; fds[0].fd = s->tfd; fds[0].events = POLLIN; fds[0].revents = 0; return 1; } if (s->m) { if (s->tfd < 0 || max < 1) return 0; fds[0].fd = s->tfd; fds[0].events = POLLIN; return 1; } return snd_pcm_poll_descriptors(s->p, fds, (unsigned)max); }
 void src_close(src_pcm *s) {
     if (!s) return;
     if (s->card) { free(s->cbuf); if (s->tfd >= 0) close(s->tfd); }   /* the device stays open: the card's next stream */
-    else if (s->m) { atomic_store(&s->m->beat, 0); atomic_store(&s->m->hold_ns, 0); if (s->tfd >= 0) close(s->tfd); }   /* the plugin's host clock at once */
+    else if (s->m) { atomic_store(&s->m->beat, 0); atomic_store(&s->m->hold_ns, 0); if (s->steady) atomic_store(&s->m->ppb, 0); if (s->tfd >= 0) close(s->tfd); }   /* the plugin's host clock at once */
     else snd_pcm_close(s->p);
     free(s);
 }
 const char *src_strerror(long e) {
     if (e == SRC_ENDED) return "the stream ended or another began";
     if (e == SRC_LOST) return card_lost_why[0] ? card_lost_why : "music let go unread";
+    if (e == SRC_CHANGED) return "another stream began in another format";
     return snd_strerror((int)e);
 }
 /* The sources are the system's services here (install.sh): none run by this layer, <rooms>/input-stop stops them. */
@@ -505,7 +632,13 @@ int src_relayout(src_pcm *s) { (void)s; return 0; }
 void src_air_name(const char *name) { (void)name; }
 int src_status(char *out, size_t len) { (void)out; (void)len; return 0; }
 int src_option(const char *name, const char *value) {
-    if (!strcmp(name, "--in-driver")) { DK = strcmp(value, "off") && atoi(value) >= 0 && atoi(value) < SRC_MAX ? atoi(value) : -1; return 1; }
+    if (!strcmp(name, "--in-driver")) {
+        /* k=/<name>: input k reads that ring (given again for each); k alone: AUDIOLAZ_SHM's, as before */
+        char *e; const long k = strtol(value, &e, 10);
+        if (e != value && *e == '=' && k >= 0 && k < SRC_MAX && e[1] == '/' && strlen(e + 1) < sizeof DNAME[0] && !strchr(e + 2, '/')) { snprintf(DNAME[k], sizeof DNAME[k], "%s", e + 1); return 1; }
+        DK = strcmp(value, "off") && atoi(value) >= 0 && atoi(value) < SRC_MAX ? atoi(value) : -1;
+        return 1;
+    }
     if (!strcmp(name, "--in-card-path")) {          /* s=<device>: the card's stream s read there (a voie's card) */
         char *e; const long cs = strtol(value, &e, 10);
         if (e != value && *e == '=' && cs >= 0 && cs < CS_MAX) snprintf(CPATH[cs], sizeof CPATH[cs], "%s", e + 1);

@@ -82,6 +82,9 @@ struct azc_st {                     /* one playback stream (substream n) and its
 	u32 delay;                      /* frames heard after the reader (AZC_IOC_SET_DELAY) */
 	u32 rates;                      /* AZC_RATE_* the next streams may take (0: all) */
 	unsigned long last_read;        /* jiffies of the reader's last read (0: none yet) */
+	u64 appl_seen;                  /* the application's pointer as last seen (azc_avail), */
+	unsigned long appl_at;          /* when it last moved (jiffies), */
+	unsigned long idle_j;           /* and its buffer's time (jiffies): written nothing that long, its last frame given */
 	unsigned long hold_until;       /* AZC_IOC_HOLD: no stand-in before (0: none) */
 	unsigned long run_at;           /* (18/10, the switch) jiffies when the stream last began to run (start, resume; 0 not yet):
 	                                 * AZC_IOC_HOLD within AZC_HOLD_STREAM_MS of it only */
@@ -177,11 +180,28 @@ static snd_pcm_uframes_t azc_avail(struct azc_st *st)
 	a = (u64)appl;                  /* appl_ptr wraps at rt->boundary: on 64 bits, after centuries */
 	if (a <= st->read)
 		return 0;
+	if (a != st->appl_seen) {
+		st->appl_seen = a;
+		st->appl_at = jiffies;
+	}
 	/* one frame left while the application plays (all of it while it drains: its end): the reader taking the
 	 * last one is an empty buffer to the core, now told of every move — an underrun, Roon preparing its stream again
 	 * six times a second */
-	if (st->ss->runtime->state != SNDRV_PCM_STATE_DRAINING)
-		return a - st->read > 1 ? (snd_pcm_uframes_t)(a - st->read - 1) : 0;
+	if (st->ss->runtime->state != SNDRV_PCM_STATE_DRAINING) {
+		if (a - st->read > 1)
+			return (snd_pcm_uframes_t)(a - st->read - 1);
+
+		{
+			struct snd_pcm_runtime *rt = st->ss->runtime;
+			const snd_pcm_uframes_t hw = READ_ONCE(rt->status->hw_ptr);
+			const snd_pcm_uframes_t room = st->buffer > appl - hw ? st->buffer - (appl - hw) : 0;
+
+			if (!READ_ONCE(rt->twake) && room >= max_t(snd_pcm_uframes_t, READ_ONCE(rt->control->avail_min), 1) &&
+			    time_after(jiffies, st->appl_at + st->idle_j))
+				return (snd_pcm_uframes_t)(a - st->read);
+		}
+		return 0;
+	}
 	return (snd_pcm_uframes_t)(a - st->read);
 }
 
@@ -295,6 +315,9 @@ static int azc_prepare(struct snd_pcm_substream *ss)
 	st->stand_in = 0;
 	st->running = 0;
 	st->run_at = 0;
+	st->appl_seen = 0;
+	st->appl_at = jiffies;
+	st->idle_j = msecs_to_jiffies(max(100u, (unsigned int)div_u64((u64)rt->buffer_size * 1000, rt->rate ? rt->rate : 1)));
 	st->gen++;
 	rt->delay = st->delay;
 	spin_unlock_irqrestore(&st->lock, fl);

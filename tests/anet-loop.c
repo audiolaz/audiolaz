@@ -42,7 +42,10 @@ int main(int argc, char **argv) {
     netout_select(argv[1]);
     netout_live(live);
     const int lbits = getenv("ANET_LOOP_BITS") ? atoi(getenv("ANET_LOOP_BITS")) : 32;   /* */
+    const int top = getenv("ANET_LOOP_TOP") ? atoi(getenv("ANET_LOOP_TOP")) : 32;      /* */
+    const uint32_t tmask = top >= 8 && top < 32 ? ~(((uint32_t)1 << (32 - top)) - 1) : 0xFFFFFFFFu;
     const double sine = getenv("ANET_LOOP_SINE") ? atof(getenv("ANET_LOOP_SINE")) : 0;   /* a sine instead */
+    const int dopw = getenv("ANET_LOOP_DOP") && atoi(getenv("ANET_LOOP_DOP")) > 0;         /* DoP words */
     const double pace_from = getenv("ANET_LOOP_PACE_FROM") ? atof(getenv("ANET_LOOP_PACE_FROM")) : 2.0;
     if (getenv("ANET_LOOP_META")) {
         static char ml[1024];
@@ -76,6 +79,13 @@ int main(int argc, char **argv) {
             for (long i = 0; i < have; i++) {
                 const double ts = (double)(made + (uint64_t)i) / rate;
                 const int quiet = live && (ts < 0.6 || fmod(ts, 5.0) >= 4.2);   /* its silences: exactly zero */
+                if (dopw) {                               /* ANET_LOOP_DOP: DoP, its silences DSD's idle pattern */
+                    const uint32_t mk = ((made + (uint64_t)i) & 1 ? 0xFAu : 0x05u) << 24;
+                    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                    buf[2 * i] = (int32_t)(mk | (quiet ? 0x696900u : (x & 0xFFFF00u)));
+                    buf[2 * i + 1] = (int32_t)(mk | (quiet ? 0x696900u : ((x >> 8) & 0xFFFF00u)));
+                    continue;
+                }
                 if (sine > 0) {                           /* ANET_LOOP_SINE: a sine at −6 dBFS, both channels */
                     buf[2 * i] = buf[2 * i + 1] = quiet ? 0 : (int32_t)lrint(0.5 * sin(2 * M_PI * sine * ts) * 2147483647.0 * (lbits < 32 ? ldexp(1.0, lbits - 32) : 1.0));
                     continue;
@@ -84,6 +94,10 @@ int main(int argc, char **argv) {
                 buf[2 * i] = quiet ? 0 : lbits < 32 ? (int32_t)x >> (32 - lbits) | 1 : (int32_t)(x | 1);   /* never zero in the music: its runs told apart */
                 x ^= x << 13; x ^= x >> 17; x ^= x << 5;
                 buf[2 * i + 1] = quiet ? 0 : lbits < 32 ? (int32_t)x >> (32 - lbits) : (int32_t)x;
+                if (tmask != 0xFFFFFFFFu && !quiet) {     /* on the n-bit grid, the left never zero */
+                    buf[2 * i] = (int32_t)(((uint32_t)buf[2 * i] & tmask) | (~tmask + 1));
+                    buf[2 * i + 1] = (int32_t)((uint32_t)buf[2 * i + 1] & tmask);
+                }
             }
             made += (uint64_t)have;
             fwrite(buf, 8, (size_t)have, sf);
@@ -116,6 +130,10 @@ int main(int argc, char **argv) {
             char *r = strstr(lj, "\"reserveMs\":"), *g = strstr(lj, "\"targetMs\":"), *l = strstr(lj, "\"latencyMs\":"), *st = strstr(lj, "\"state\":\""), *si = strstr(lj, "\"silenceInMs\":");
             const char *af = strstr(lj, "\"afterMs\":");
             if (r && g && l && st && si) fprintf(stderr, "TRACE %.1f reserve %.0f target %.0f held %.0f silence %.0f after %.0f state %.*s\n", t - t_start, atof(r + 12), atof(g + 11), atof(l + 12), atof(si + 14), af ? atof(af + 10) : 0.0, (int)strcspn(st + 9, "\""), st + 9);
+
+            double dp, da, ds, pp, rg, tg, an;
+            if (!netout_link_pace(&dp, &da, &ds, &pp, &rg, &tg, &an))
+                fprintf(stderr, "PACE %.1f sent %+.1f dac %+.1f pull %+.1f avg %+.1f over %.0f ring %.1f anchor %.1f target %.1f\n", t - t_start, dp + pp, dp, pp, da, ds, rg, an, tg);
         }
     }
     const double t_e = now(); const uint64_t sent_e = netout_sent() - (uint64_t)netout_held() + (uint64_t)after_frames(argv[1], rate);

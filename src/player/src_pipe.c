@@ -320,6 +320,8 @@ static int air_conf(void) {
         "  eight_channel_mode = \"%s\"; // audiolaz: AirPlay channels, the player's (%s)\n"
         "  mixdown = \"%s\"; // audiolaz: AirPlay channels, the player's (%s)\n"
         "  output_channel_mapping = \"off\"; // audiolaz: AirPlay channels, the player's (FFmpeg's order, the stream's channels first)\n"
+
+        "  interpolation = \"basic\"; // audiolaz: the sender's clock followed by a frame put in or left out\n"
         "%s%s%s%s%s%s"
         "};\n"
         "sessioncontrol =\n"

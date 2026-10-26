@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -160,6 +161,24 @@ int page_outroom(const char *rooms, const char *out, char *id, size_t idn, char 
 static void out_room_of(const char *out, char *id, size_t n) {
     const char *o = out && strcmp(out, "default") ? out : "";
     if (!page_outroom(rooms_dir, o, id, n, NULL, 0, NULL, 0) || !place_ok(id)) id[0] = 0;
+}
+
+static void vol_dac_of(const char *out, char *k, size_t n) {
+    char v[160] = "";
+    const char *o = out && strcmp(out, "default") ? out : "";
+    if (!o[0]) { if (strcmp(out_label, THE_DAC)) snprintf(v, sizeof v, "%s", out_label); }
+    else if (!strncmp(o, "audiolaz:", 9)) {
+        netout_out_dac(o, v, sizeof v);
+        char nm[128] = "";
+        if (!v[0]) { netout_out_name(o, nm, sizeof nm); if (nm[0]) snprintf(v, sizeof v, "link:%.120s", nm); }
+    }
+    else if (!strncmp(o, OUT_CARD_PREFIX, OUT_CARD_PREFIX_LEN) && o[OUT_CARD_PREFIX_LEN]) snprintf(v, sizeof v, "%s", o + OUT_CARD_PREFIX_LEN);
+    const char *a = strstr(v, "\xe2\x86\x92"), *s = a ? a + 3 : v;
+    while (*s == ' ') s++;
+    size_t l = strcspn(s, "(");
+    while (l && s[l - 1] == ' ') l--;
+    snprintf(k, n, "%.*s", (int)l, s);
+    for (char *p = k; *p; p++) *p = (unsigned char)*p < 0x20 ? ' ' : *p >= 'A' && *p <= 'Z' ? (char)(*p - 'A' + 'a') : *p;
 }
 
 static void rooms_json(char *o, size_t len) {
@@ -339,14 +358,58 @@ static int channels_json(char *b, size_t bn, int n) {
     b[n - 1] = '}'; b[n] = 0;
     return n;
 }
-/* The speakers' channels (roomd.c, channels.h), added to /state: outChannels { swap (left and right swapped),
- * invertL, invertR (that speaker's polarity inverted: the one playing the music's left, or right), as the control keeps
+/* The speakers' channels (roomd.c, channels.h), added to /state: outChannels { swap (the music's left and right
+ * swapped, before the correction: each speaker keeps its own), invertL, invertR (the polarity of the speaker on the
+ * output's left channel, or right: per output channel, after everything), as the control keeps
  * them for out (swap.<out>=1, invert_l.<out>=1, invert_r.<out>=1; <out> "default" for the command line's; absent: off),
  * now (what the output plays with, the player's status: CH_* bits, swap 1, left 2, right 4) }. */
 static void spk_keys(const char *out, char k[3][200]) {
     snprintf(k[0], sizeof k[0], "swap.%s", out[0] ? out : "default");
     snprintf(k[1], sizeof k[1], "invert_l.%s", out[0] ? out : "default");
     snprintf(k[2], sizeof k[2], "invert_r.%s", out[0] ? out : "default");
+}
+/* (23/10, the release) The polarity's meaning, kept for those who had set it: until 1.2.8 each inversion acted on the
+ * music's channel before the swap (invert_l: the speaker that plays the music's left, wherever the swap sent it), since
+ * 1.2.9 on the speaker of the output's left or right channel, after the swap moved to the music before the correction.
+ * With swap.<out>=1 that is the other side: invert_l.<out> and invert_r.<out> exchanged once, so every speaker keeps
+ * its polarity and an update changes nothing heard (swap off: the same side, nothing to do). Done once per folder,
+ * before the player reads its control (roomd.c main), marked channels_order=2; every POST /channels writes the mark
+ * too (a control made after the update never exchanged). → how many outputs were exchanged, −1 none read. */
+#define CHAN_ORDER_KEY "channels_order"
+int page_channels_migrate(const char *rooms) {
+    if (!rooms_dir[0]) snprintf(rooms_dir, sizeof rooms_dir, "%s", rooms);
+    char v[16] = "";
+    if (control_get(CHAN_ORDER_KEY, v, sizeof v) && atoi(v) >= 2) return 0;
+    char p[1024], line[600];
+    snprintf(p, sizeof p, "%s/control", rooms_dir);
+    static char outs[64][200];
+    int n = 0;
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;   /* no control yet: nothing set, marked by the first POST /channels */
+    while (fgets(line, sizeof line, f) && n < 64) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (strncmp(line, "swap.", 5)) continue;
+        char *eq = strrchr(line + 5, '=');
+        if (!eq || eq == line + 5 || atoi(eq + 1) != 1 || eq - (line + 5) >= (long)sizeof outs[0]) continue;
+        int dup = 0;
+        for (int i = 0; i < n; i++) if ((size_t)(eq - (line + 5)) == strlen(outs[i]) && !strncmp(outs[i], line + 5, (size_t)(eq - (line + 5)))) dup = 1;
+        if (!dup) { snprintf(outs[n], sizeof outs[n], "%.*s", (int)(eq - (line + 5)), line + 5); n++; }
+    }
+    fclose(f);
+    int moved = 0;
+    for (int i = 0; i < n; i++) {
+        char kl[220], kr[220], vl[8] = "", vr[8] = "";
+        snprintf(kl, sizeof kl, "invert_l.%.199s", outs[i]);
+        snprintf(kr, sizeof kr, "invert_r.%.199s", outs[i]);
+        const int l = control_get(kl, vl, sizeof vl) && atoi(vl) == 1, r = control_get(kr, vr, sizeof vr) && atoi(vr) == 1;
+        if (l == r) continue;   /* both or neither: the same either way */
+        const char *ks[2] = { kl, kr }, *vs[2] = { r ? "1" : NULL, l ? "1" : NULL };
+        control_set(ks, vs, 2);
+        moved++;
+    }
+    const char *mk[1] = { CHAN_ORDER_KEY }, *mv[1] = { "2" };
+    control_set(mk, mv, 1);
+    return moved;
 }
 static int spk_get(const char *out) {
     char k[3][200], v[8];
@@ -459,11 +522,13 @@ static void save_conf(void) {
     vol_conf_save(f);
     fclose(f);
 }
+static int vol_migrated = -1;                          /* vol_migrate's at the last read */
 static void load_conf(void) {
     char p[1024], line[1024];   /* 256 before: the bells' lines are longer */
     snprintf(p, sizeof p, "%s/page.conf", rooms_dir);
     FILE *f = fopen(p, "r");
     if (!f) return;
+    vol_conf_begin();                                  /* volume_paths= as this file says it */
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
         if (!strncmp(line, "mode=", 5)) snprintf(level_mode, sizeof level_mode, "%s", strcmp(line + 5, "manual") ? "auto" : "manual");
@@ -476,6 +541,7 @@ static void load_conf(void) {
         else if (vol_conf_line(line)) { }
     }
     fclose(f);
+    vol_migrated = vol_migrate();                          /* a page.conf of before: its rooms' answers per output */
 }
 
 static void sounds_check(void) { }
@@ -555,18 +621,21 @@ CURVE_CSS \
 ".sy{flex:1;min-height:40px;border:0;border-radius:var(--r);background:var(--tile);color:var(--ink);font-family:inherit;font-size:13px;font-weight:700;cursor:pointer}.sy:hover{background:var(--tile2)}.sy:active{transform:translateY(1px)}#syb{gap:8px}\n"
 
 /* The speakers' channels (POST /channels, /state outChannels), on every page: its three switches sent together,
- * shown as /state says them (not while one has the focus: the one just pressed). */
+ * shown as /state says them (not while one has the focus: the one just pressed). The swap acts on the music,
+ * before the correction (each speaker keeps its own); the polarity is the output's, per channel. */
+#define SPK_NOTE_EN "For this output. The swap acts on the music; the polarity on the speaker at each output. Every sample kept exactly: lossless."
+#define SPK_NOTE_FR "Pour cette sortie. L’inversion gauche-droite agit sur la musique, la phase sur l’enceinte de chaque sortie. Chaque échantillon gardé à l’identique\u00a0: sans perte."
 #define SPK_HTML_EN \
 "<div id=\"spk\" hidden><div class=\"label\">Channels</div><div class=\"panel\">\n" \
 "<div class=\"row\"><span>Swap left and right</span><span><input type=\"checkbox\" id=\"cws\" onchange=\"spk()\"></span></div>\n" \
-"<div class=\"row\"><span>Invert polarity</span><span><label>left speaker <input type=\"checkbox\" id=\"cil\" onchange=\"spk()\"></label> <label>right speaker <input type=\"checkbox\" id=\"cir\" onchange=\"spk()\"></label></span></div>\n" \
-"<div class=\"row note\"><span>For this output. Every sample kept exactly: lossless.</span></div>\n" \
+"<div class=\"row\"><span>Invert polarity</span><span><label>left output <input type=\"checkbox\" id=\"cil\" onchange=\"spk()\"></label> <label>right output <input type=\"checkbox\" id=\"cir\" onchange=\"spk()\"></label></span></div>\n" \
+"<div class=\"row note\"><span>" SPK_NOTE_EN "</span></div>\n" \
 "</div></div>\n"
 #define SPK_HTML_FR \
 "<div id=\"spk\" hidden><div class=\"label\">Canaux</div><div class=\"panel\">\n" \
 "<div class=\"row\"><span>Inverser gauche et droite</span><span><input type=\"checkbox\" id=\"cws\" onchange=\"spk()\"></span></div>\n" \
-"<div class=\"row\"><span>Inverser la phase</span><span><label>enceinte gauche <input type=\"checkbox\" id=\"cil\" onchange=\"spk()\"></label> <label>enceinte droite <input type=\"checkbox\" id=\"cir\" onchange=\"spk()\"></label></span></div>\n" \
-"<div class=\"row note\"><span>Pour cette sortie. Chaque échantillon gardé à l’identique : sans perte.</span></div>\n" \
+"<div class=\"row\"><span>Inverser la phase</span><span><label>sortie gauche <input type=\"checkbox\" id=\"cil\" onchange=\"spk()\"></label> <label>sortie droite <input type=\"checkbox\" id=\"cir\" onchange=\"spk()\"></label></span></div>\n" \
+"<div class=\"row note\"><span>" SPK_NOTE_FR "</span></div>\n" \
 "</div></div>\n"
 #define SPK_JS \
 "function spk(){post('/channels?swap='+($('cws').checked?1:0)+'&invert_l='+($('cil').checked?1:0)+'&invert_r='+($('cir').checked?1:0))}\n" \
@@ -585,7 +654,7 @@ CURVE_CSS \
 "$('rt').textContent=on&&s.rate>0?(s.rate/1000).toFixed(s.rate%1000?1:0):'–';$('in').textContent=s.input==='squeeze'?'Roon':s.input||'–';\n" \
 "$('ch').textContent=s.inputChannels>2?T.first2(s.inputChannels):'';$('ch').hidden=!(s.inputChannels>2);outs(s);spks(s);\n" \
 "const P=s.soundPath,LL=s.bitPerfect===false&&s.bitPerfectLossless===true,V=s.volume,VO=!!(V&&V.on),Z=VO&&s.bitPerfect===true&&!V.mute&&Math.abs(V.db)<0.005;\n" \
-"const VB=VO&&!Z&&(s.bitPerfect!==false||(s.bitPerfectWhy||[]).every(w=>['volume','changed','bits'].includes(w)));\n" \
+"const VB=VO&&!Z&&(s.bitPerfect!==false||(s.bitPerfectWhy||[]).every(w=>['volume','ampvolume','changed','bits'].includes(w)));\n" \
 "$('bp').textContent=VB?T.vbp:s.bitPerfect===true?T.bp:s.bitPerfect===false?(LL?T.lbp:T.nbp)+(s.bitPerfectWhy||[]).map(w=>T.why[w]||w).join(', '):T.ubp;$('bp').classList.toggle('acting',!VB&&(s.bitPerfect===true||LL));\n" \
 "$('path').textContent=P?(P.inRate/1000)+' kHz'+(P.inBits?' · '+P.inBits+' bits':'')+' → '+((P.deviceRate||P.outRate)/1000)+' kHz · '+P.outBits+' bits'+(P.dac?' · '+P.dac:''):'';\n" \
 "$('volr').hidden=$('voln').hidden=!VO;if(VO)$('vol').textContent=V.mute?T.muted:Math.abs(V.db)<0.05?'0 dB':(V.db<0?'\\u2212':'')+Math.abs(V.db).toFixed(Math.abs(Math.round(V.db)-V.db)>=0.05?1:0).replace('.',T.dec)+' dB';\n" \
@@ -614,7 +683,7 @@ PAGE_CSS
 "</div><div id=\"roomb\" hidden><div class=\"label\">Your room</div><div class=\"panel\"><a class=\"row\" id=\"room\" style=\"color:inherit;text-decoration:none\"><span>What your room does to the sound, and what its correction would give back</span><span>›</span></a></div></div>\n"
 SPK_HTML_EN
 "<script>const T={playing:'playing',busy:'output busy',idle:'waiting',first2:n=>'A source of '+n+' channels: its first two (needed for this output)',muted:'Muted',dec:'.',\n"
-"bp:'Bit-perfect, verified',vbp:'Adjustable volume: bit-perfect at 0 dB',nbp:'Not intact: ',lbp:'Lossless, verified: ',ubp:'Bit-perfect: not known yet',why:{volume:'volume set here (bit-perfect at 0 dB)',swap:'left and right swapped',polarity:'polarity inverted',channels:'channels (needed for this output)',bits:'word length (needed for this output)',rate:'rate (needed for this device)',output:'converted by the AirPlay device',dropped:'frames dropped',changed:'samples changed'}};\n"
+"bp:'Bit-perfect, verified',vbp:'Adjustable volume: bit-perfect at 0 dB',nbp:'Not intact: ',lbp:'Lossless, verified: ',ubp:'Bit-perfect: not known yet',why:{volume:'volume set here (bit-perfect at 0 dB)',ampvolume:'volume (power amplifier)',swap:'left and right swapped',polarity:'polarity inverted',channels:'channels (needed for this output)',bits:'word length (needed for this output)',rate:'rate (needed for this device)',output:'converted by the AirPlay device',dropped:'frames dropped',changed:'samples changed'}};\n"
 #else
 "<div class=\"label\">Lecture</div><div class=\"panel\">\n"
 "<div class=\"row\"><span>Depuis</span><span id=\"in\">–</span></div>\n"
@@ -627,7 +696,7 @@ SPK_HTML_EN
 "</div><div id=\"roomb\" hidden><div class=\"label\">Votre pièce</div><div class=\"panel\"><a class=\"row\" id=\"room\" style=\"color:inherit;text-decoration:none\"><span>Ce que votre pièce fait au son, et ce que la correction rendrait</span><span>›</span></a></div></div>\n"
 SPK_HTML_FR
 "<script>const T={playing:'en lecture',busy:'sortie occupée',idle:'en attente',first2:n=>'Une source de '+n+' voies : ses deux premières (conversion nécessaire pour cette sortie)',muted:'Muet',dec:',',\n"
-"bp:'Bit-perfect, vérifié',vbp:'Volume réglable : bit-perfect à 0 dB',nbp:'Pas intact : ',lbp:'Sans perte, vérifié : ',ubp:'Bit-perfect : pas encore vérifié',why:{volume:'volume réglé ici (bit-perfect à 0 dB)',swap:'gauche et droite inversées',polarity:'phase inversée',channels:'voies (conversion nécessaire pour cette sortie)',bits:'résolution (conversion nécessaire pour cette sortie)',rate:'fréquence (conversion nécessaire pour cet appareil)',output:'converti par l’appareil AirPlay',dropped:'échantillons perdus',changed:'échantillons modifiés'}};\n"
+"bp:'Bit-perfect, vérifié',vbp:'Volume réglable : bit-perfect à 0 dB',nbp:'Pas intact : ',lbp:'Sans perte, vérifié : ',ubp:'Bit-perfect : pas encore vérifié',why:{volume:'volume réglé ici (bit-perfect à 0 dB)',ampvolume:'volume (ampli de puissance)',swap:'gauche et droite inversées',polarity:'phase inversée',channels:'voies (conversion nécessaire pour cette sortie)',bits:'résolution (conversion nécessaire pour cette sortie)',rate:'fréquence (conversion nécessaire pour cet appareil)',output:'converti par l’appareil AirPlay',dropped:'échantillons perdus',changed:'échantillons modifiés'}};\n"
 #endif
 PLAYER_JS
 SPK_JS
@@ -856,9 +925,10 @@ static void state_json(int c) {
     for (char *p = amodel; *p; p++) if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) *p = ' ';
 
     char needv[32], needj[32], missv[32], declv[8], olk[200], olv[32] = "0", outc[180] = "";
-
-    char lv0[8] = "", ivc[8] = "", ivs[8] = "", ass[8] = "";
-    status_get("airplay_level0", lv0, sizeof lv0); control_get("airplay_ignore_volume", ivc, sizeof ivc);
+    /* the sender's volume: the page's choice (the control's), as the AirPlay input has it now (the status's:
+     * airplay.conf), an AirPlay session now. airplayLevel0 always false: AirPlay at the control's level */
+    char ivc[8] = "", ivs[8] = "", ass[8] = "";
+    control_get("airplay_ignore_volume", ivc, sizeof ivc);
     status_get("airplay_ignore_volume", ivs, sizeof ivs); status_get("airplay_session", ass, sizeof ass);
     /* "2": the player's own "yes", the sender's volume on the device (roomd.c AIR_IV_DEV): not the page's choice */
     if (!ivc[0]) snprintf(ivc, sizeof ivc, "%d", atoi(ivs) == 1);   /* never chosen here: as the AirPlay input has it */
@@ -928,7 +998,7 @@ static void state_json(int c) {
         sq_measuring(), sq_measuring() == 1 ? sq_heard_position() : -1.0, sq_connected() ? sq_heard_position() : -1.0, input, outj, kind, onamej, rcvs, page_slim_port, out_label, cards, hosted, appj, netout_airplay_ready() > 0 ? "true" : "false", latj, airj
         , airplay_input() ? "true" : "false", amode, aset, asend, amodel
         , needj, atoi(missv), atoi(declv) ? "true" : "false", atoi(olv)
-        , atoi(lv0) ? "true" : "false", atoi(ivc) ? "true" : "false", atoi(ivs) == 1 ? "true" : "false", atoi(ass) ? "true" : "false",
+        , "false", atoi(ivc) ? "true" : "false", atoi(ivs) == 1 ? "true" : "false", atoi(ass) ? "true" : "false",
         atoi(dvc) ? "true" : "false", atoi(ivs) == 2 ? "true" : "false", dvs, dvm, inpk, apn, apnx
         , rid, rname, orooms, roomsj, prid, prname, heard
         , ubyj, used == 2 ? "true" : "false", tkrj, tkbj, players, ceil(rtry), rtryj
@@ -1110,7 +1180,8 @@ static void handle(int c) {
         return;
     }
     /* The speakers' channels (roomd.c, channels.h; the free player too: nothing resampled nor rounded, every
-     * sample exact, moved or negated): POST /channels?[swap=0|1][&invert_l=0|1][&invert_r=0|1][&out=<the output, URL-encoded;
+     * sample exact, moved or negated; the swap on the music, before the correction, the polarity per output
+     * channel): POST /channels?[swap=0|1][&invert_l=0|1][&invert_r=0|1][&out=<the output, URL-encoded;
      * "default" the command line's; absent: the control's out=, the one playing>]: each one given set for that output
      * (1 its line, 0 its line taken off), the others kept; the player follows at once (a crossfade of a few ms).
      * {"ok":true,"outChannels":{swap, invertL, invertR, now}} as /state says it, or {"ok":false,"why":"bad"}. */
@@ -1121,7 +1192,7 @@ static void handle(int c) {
         if (o && (o == q || o[-1] == '&')) url_decode(o + 4, to, sizeof to);
         else control_get("out", to, sizeof to);
         if (!strcmp(to, "default")) to[0] = 0;
-        const char *kk[3], *vv[3];
+        const char *kk[4], *vv[4];
         int nk = 0, good = out_ok(to);
         spk_keys(to, k);
         for (int i = 0; i < 3 && q && good; i++) {
@@ -1133,6 +1204,7 @@ static void handle(int c) {
             kk[nk] = k[i]; vv[nk++] = x[0] == '1' ? "1" : NULL;
         }
         if (!good || !nk) { static const char BAD[] = "{\"ok\":false,\"why\":\"bad\"}"; reply(c, "application/json", BAD, sizeof BAD - 1); return; }
+        kk[nk] = CHAN_ORDER_KEY; vv[nk++] = "2";   /* set with the meaning of 1.2.9: never exchanged later */
         control_set(kk, vv, nk);
         char nw[8] = "", ob[120], b[200];
         status_get("channels_now", nw, sizeof nw);
@@ -1267,6 +1339,7 @@ int page_start(int port, const char *rooms, const char *output) {
     snprintf(out_label, sizeof out_label, "%s", output && *output ? output : THE_DAC);
     for (char *p = out_label; *p; p++) if (*p == '"' || *p == '\\') *p = ' ';
     load_conf();
+    if (vol_migrated >= 0) save_conf();                /* migrated (vol_migrate): kept, with volume_paths=1 */
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     int on = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);

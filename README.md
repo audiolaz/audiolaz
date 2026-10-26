@@ -57,8 +57,8 @@ at all is done, and said on the page as *a conversion needed for this device*:
   16- or 24-bit source is left untouched);
 - a source of more than two channels to a stereo output: its first two channels (a mono source: on both).
 
-**Your speakers** — left and right swapped, or one speaker's polarity inverted (a cable connected the wrong way round),
-from the player's page or `POST /channels`: every sample moved or negated exactly, nothing recalculated, and the page
+**Your speakers** — left and right swapped (the music itself, as it comes in), or the polarity of the speaker on one
+output channel inverted (a cable connected the wrong way round), from the player's page or `POST /channels`: every sample moved or negated exactly, nothing recalculated, and the page
 says *lossless* instead of bit-perfect while it is on.
 
 **Bit-perfect, verified** — while it plays, the player fingerprints every frame that comes in and every frame it hands

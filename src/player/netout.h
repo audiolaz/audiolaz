@@ -82,6 +82,10 @@ void netout_end(void);
 /* The stream ends. finish: the music ended there (the receiver plays out what it holds, its connection closed as an
  * end of file); 0: stopped or flushed (the receiver told to stop at once). */
 void netout_close(int finish);
+/* a pause given back to Roon: the receiver's reckoning before netout_close (mark), what it played beyond it after
+ * (extra: its STMf awaited ms at most; the play's frames; 0 nothing known) */
+void netout_stop_mark(void);
+long netout_stop_extra(int ms);
 /* Why the last open or write failed, for the journal. */
 const char *netout_why(void);
 /* The chosen receiver failed and is not asked again yet: the seconds left (0: it may be), its name. A receiver
@@ -125,8 +129,18 @@ void netout_np_tick(void);
 /* an audiolaz receiver whose DAC does not take the stream's rate as it is: the rate it is sent at, converted
  * here (netout.c, azsrc.h); 0 none (the stream as it is, or another kind of output) */
 unsigned netout_link_rate(void);
+
+int netout_link_bits(void);
+int netout_link_bits_for(const char *spec, unsigned rate);
+/* the rate the stream goes at once converted here: a Link receiver's DAC's, or the AirPlay bridge's 44.1 kHz (0: as it is) */
+unsigned netout_conv_rate(void);
 /* the tests': 0, never converted, never offered (a sender before 21/10); 1 the default */
 void netout_link_convert(int on);
+/* (22/10, the review) the next stream to an audiolaz receiver is DoP (roomd.c): said to it (ANET_F_DOP), never
+ * converted; refused when its DAC cannot play it whole (not that rate as it is, fewer than 24 bits there: its INFO, or
+ * the receiver's ANET_E_FORMAT): netout_dop_refused() 1 after that open (cleared as read), PCM to it from then on */
+void netout_link_dop(int on);
+int netout_dop_refused(void);
 /* the audiolaz receiver spec names: its DAC refuses to start (its INFO said it, it refused a stream for it, or
  * it stopped one for it), until a stream to it opens again: 1 */
 int netout_dac_start(const char *spec);
@@ -161,10 +175,10 @@ enum { NETOUT_WHY_END = 1, NETOUT_WHY_USER = 2, NETOUT_WHY_RATE = 3, NETOUT_WHY_
 void netout_live(int on);
 /* the source read at the output's pace (src_paced: a card, its app on the DAC's clock): an audiolaz receiver's
  * ring pulled harder (anet_paced). netout_link_pace: the stream to an audiolaz receiver now, its pace said (the voie's
- * clock line): its DAC's clock against ours and the ring's pull (ppm), the ring, its target and anchor (ms); 0, or −1
- * none. */
+ * clock line): its DAC's clock against ours (the estimate now, and its average this stream over avg_s seconds, 0 not
+ * yet: netout.c as_dac_avg) and the ring's pull (ppm), the ring, its target and anchor (ms); 0, or −1 none. */
 void netout_paced(int on);
-int netout_link_pace(double *dac_ppm, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms);
+int netout_link_pace(double *dac_ppm, double *dac_avg_ppm, double *avg_s, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms);
 /* the audiolaz receiver's underruns this stream (what it heard missing), 0 none or no such stream */
 long netout_link_gaps(void);
 void netout_fifo_ms(int ms);

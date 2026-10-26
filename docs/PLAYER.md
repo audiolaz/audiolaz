@@ -43,19 +43,23 @@ macOS, the `audiolaz` output (`src/mac/driver`) does the same for every app of t
 | `airplay_buffered=` | `full` or `declared`: how AirPlay's buffered streams' offset is set |
 | `upnp=` | `1` / `0`: the built-in renderer on or off |
 | `swap.<out>=` | `1`: left and right swapped on that output (`<out>` as `out=` names it, `default` for `--dac`); absent: as they come |
-| `invert_l.<out>=` `invert_r.<out>=` | `1`: the polarity (phase) of the speaker playing the left (right) channel inverted on that output; absent: normal |
+| `invert_l.<out>=` `invert_r.<out>=` | `1`: the polarity (phase) of the speaker on that output's left (right) channel inverted; absent: normal |
+| `channels_order=` | `2`: `invert_l` / `invert_r` name the output's channels (written by `POST /channels` and at the first start of 1.2.9). Absent, with `swap.<out>=1`: a control of 1.2.8, whose inversions named the music's channels; the player exchanges that output's `invert_l` and `invert_r` once, so it sounds as before |
 
 The page writes it for you (`POST /output?to=…`, `POST /airplay?m=…`, `POST /upnp?on=…`, `POST /channels?…`).
 
 ### The speakers' channels
 
-Swapping left and right and inverting a speaker's polarity (`src/player/channels.h`) are the very last step before
-the output, for every kind of output, and each output keeps its own setting. The swap moves the samples as they are;
-an inversion is the exact negation of each sample in the output's format (the most negative value, which has no
-opposite, becomes the largest positive one). Nothing is resampled or rounded: the sound is lossless, though no longer the source channel for channel
-(`bitPerfectWhy` says `swap` or `polarity`, `bitPerfectLossless` true). « Left speaker » is the one playing the music's
-left channel: its inversion follows it when left and right are swapped. A change while music plays is a crossfade of
-5 ms (no click). The output is always one stereo pair: these act on it alone.
+Swapping left and right and inverting a speaker's polarity (`src/player/channels.h`) work for every kind of output, and
+each output keeps its own setting. The swap acts on the music as soon as it is read, before anything else; the polarity
+is the very last step before the output, per output channel: `invert_l` is the speaker on the output's left channel,
+whatever it plays (with the swap on, the music's right). The swap moves the samples as they are; an inversion is the
+exact negation of each sample in the output's format (the most negative value, which has no opposite, becomes the
+largest positive one). Nothing is resampled or rounded: the sound is lossless, though no longer the source channel for
+channel (`bitPerfectWhy` says `swap` or `polarity`, `bitPerfectLossless` true). What the player sends to one speaker
+itself (a measurement played through `POST /measure`) is never swapped: it reaches the speaker it was meant for. A
+change while music plays is a crossfade of 5 ms (no click). The output is always one stereo pair: these act on it
+alone.
 
 ## The page and its API (`--page <port>`)
 

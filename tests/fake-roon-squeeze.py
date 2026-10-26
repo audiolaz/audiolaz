@@ -44,17 +44,24 @@ ap.add_argument('--tone', type=float, default=0, help='track 1\'s tone in Hz, a 
                 'track 1.25 times the one before), at -20 dBFS (10/10, tests/mac-roomd-out.py: 1 kHz resampled)')
 ap.add_argument('--noise', type=float, default=0, help='(22/10) in place of the tone: this many seconds of mono music-like noise '
                 '(pinkish, about -20 dBFS, the same on both channels, seeded: the same each run), looped')
+ap.add_argument('--whole16', action='store_true', help='(23/10) the tones as whole 16-bit values (a CD\'s, in the 24-bit '
+                'stream: its low byte zero), so that what passes untouched to 16 bits can be checked bit for bit')
 ap.add_argument('--right-tone', type=float, default=0, help='the right channel\'s own tone in Hz, a whole number, at -26 dBFS '
                 '(20/10, the speakers\' channels: left and right told apart); 0 (default): the left\'s on both')
+ap.add_argument('--bits', type=int, default=24, choices=(16, 24), help='(23/10) the PCM\'s sample size: 24 (Roon\'s with '
+                'FLAC off) or 16 (a CD track sent as it is); the tone at -20 dBFS either way (tests/pcm-exact.py knows it)')
 ap.add_argument('--gapless', action='store_true', help='tracks of the same rate in one HTTP stream, the zone following the '
                 'player\'s elapsed time, one track ahead at most (the real Roon)')
 ap.add_argument('--stuck-after', type=float, default=30, help='--gapless: STUCK once the stream has waited this long for a '
                 'zone that does not move')
 ap.add_argument('--stuck-linger', type=float, default=15, help='--gapless: then the results, this many s later')
+ap.add_argument('--volume', type=float, default=None, help='(24/10) Roon\'s volume in dB, sent as audg once the player '
+                'says HELO (none by default: the player at unity)')
 A = ap.parse_args()
+if A.bits == 16 and (A.flac or 'f' in A.formats or A.noise): ap.error('--bits 16: the tone in PCM only')
 
 RATE_CODES = {11025: '0', 22050: '1', 32000: '2', 44100: '3', 48000: '4', 96000: '9', 88200: ':', 176400: ';', 192000: '<'}
-CH, BYTES = 2, 3
+CH, BYTES = 2, A.bits // 8
 FRAME = CH * BYTES
 BPS = A.rate * FRAME                        # bytes per second of music
 T0 = time.monotonic()
@@ -129,17 +136,20 @@ def second_of(n):
         return noise_of(n)
     R = rate_of(n)
     f = (A.tone or 440.0) * (1.25 ** (n - 1))
-    amp = 0.1 * (1 << 23)
+    amp = 0.1 * (1 << 23) if BYTES == 3 else 0.1 * 32767
+    mask = (1 << 8 * BYTES) - 1
     out = bytearray(R * FRAME)
     fr = A.right_tone * (1.25 ** (n - 1)) if A.right_tone else 0
     for i in range(R):
-        v = int(round(amp * math.sin(2 * math.pi * f * i / R))) & 0xffffff
-        b = bytes((v & 0xff, v >> 8 & 0xff, v >> 16 & 0xff))
-        out[i * FRAME:i * FRAME + 3] = b
+        # --whole16: whole 16-bit values (airplay-clean); in a 24-bit stream their low byte zero
+        if A.whole16: v = (int(round(0.1 * (1 << 15) * math.sin(2 * math.pi * f * i / R))) << (8 * (BYTES - 2))) & mask
+        else: v = int(round(amp * math.sin(2 * math.pi * f * i / R))) & mask
+        b = v.to_bytes(BYTES, 'little')
+        out[i * FRAME:i * FRAME + BYTES] = b
         if fr:
-            v = int(round(amp / 2 * math.sin(2 * math.pi * fr * i / R))) & 0xffffff
-            b = bytes((v & 0xff, v >> 8 & 0xff, v >> 16 & 0xff))
-        out[i * FRAME + 3:i * FRAME + 6] = b
+            v = int(round(amp / 2 * math.sin(2 * math.pi * fr * i / R))) & mask
+            b = v.to_bytes(BYTES, 'little')
+        out[i * FRAME + BYTES:i * FRAME + 2 * BYTES] = b
     return bytes(out)
 
 
@@ -304,7 +314,7 @@ def strm(cmd, autostart=b'1', fmt=b'p', ts=0, req=b'', rate=None):
     if fmt == b'f':
         p = cmd + autostart + fmt + b'????'                                         # FLAC: its own header says
     else:
-        p = cmd + autostart + fmt + b'2' + RATE_CODES[rate or A.rate].encode() + b'2' + b'1'   # 24-bit, the rate, stereo, little endian
+        p = cmd + autostart + fmt + (b'2' if BYTES == 3 else b'1') + RATE_CODES[rate or A.rate].encode() + b'2' + b'1'   # 24 (or 16) bits, the rate, stereo, little endian
     p += bytes((255, 0, 0)) + b'0' + bytes((0, 0, 0)) + struct.pack('>I', ts) + struct.pack('>H', port) + struct.pack('>I', 0)
     send_cmd('strm', p + req)
 
@@ -315,7 +325,7 @@ def start_track(n):
     m = n
     while m < A.tracks and same_run(n, m + 1):
         m += 1
-    log(f'← strm s track {n} ({"FLAC" if fmt_of(n) == "f" else "PCM"} 24-bit {rate_of(n)} Hz, {SECS.get(n, A.seconds):g} s)'
+    log(f'← strm s track {n} ({"FLAC" if fmt_of(n) == "f" else "PCM"} {A.bits}-bit {rate_of(n)} Hz, {SECS.get(n, A.seconds):g} s)'
         + (f', tracks {n} to {m} to follow in the same stream' if m > n else ''))
     if A.gapless:
         state['pending'] = (n, m)               # the zone moves to it at its STMs: the previous stream plays until then
@@ -442,6 +452,10 @@ def slim_conn(c):
             if op == 'HELO':
                 caps = d[36:].decode('utf-8', 'replace') if len(d) > 36 else ''
                 log(f'→ HELO ({caps})')
+                if A.volume is not None:        # (24/10) old gains, digital volume, preamp, new gains (16.16)
+                    g = min(65536, max(0, round(65536 * 10 ** (A.volume / 20))))
+                    send_cmd('audg', struct.pack('>IIBBII', g, g, 1, 255, g, g))
+                    log(f'← audg {A.volume:g} dB')
                 if state['next'] == 1:
                     state['next'] = 2
                     start_track(1)

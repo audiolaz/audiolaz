@@ -35,7 +35,11 @@ request (a stream header with rate 0) on the TCP port answers the same.
    INFO: the receiver answers 192 bytes, `AZI2` then `id=…;dac=…;max=…;v=…;hw=…`, NUL-padded, and closes. Optional
    keys, each whole or absent (a reader skips the ones it does not know): `rates=44100,48000,…` the PCM rates its DAC
    takes as it is now (a rate it lists but would not go to left out once tried), `err=dac-start` while its DAC refuses
-   to start, `room=<name>` the room a receiver that feeds another player serves. An INFO request may say who asks in
+   to start, `room=<name>` the room a receiver that feeds another player serves, `bits=16` the bits its DAC keeps of
+   each 32-bit word when fewer than 32 (a DAC that takes S16_LE only: 16; S24_3LE: 24), one for all the rates of
+   `rates=` or one for each of them in its order (`bits=24,24,16`). A sender that reads it requantizes to them once
+   itself, with TPDF dither, and says so (`bitPerfectWhy` « bits »); the receiver passes words on that grid bit for bit
+   and dithers once those of a sender that does not. An INFO request may say who asks in
    its capabilities word: `0x555xxxxx` (an uplink: bit 0 its system output is its own « audiolaz » device, bit 1 that
    device is there); a receiver before ignores it.
 

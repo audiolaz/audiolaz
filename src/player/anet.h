@@ -73,7 +73,13 @@ static inline const char *anet_rs_text(unsigned s) {
 }
 enum { ANET_E_NONE = 0, ANET_E_HEADER = 1, ANET_E_RATE = 2, ANET_E_DAC = 3, ANET_E_TAKEN = 4,
        ANET_E_BUSY = 5,             /* another player plays (its name after the report: ANET_BMAGIC) */
-       ANET_E_DAC_START = 6 };      /* its DAC refuses to start (ANET_WHY_DAC_START), a while */
+       ANET_E_DAC_START = 6,        /* its DAC refuses to start (ANET_WHY_DAC_START), a while */
+       ANET_E_FORMAT = 7 };         /* (22/10, the review) DoP (ANET_F_DOP) its DAC cannot play whole: fewer than 24 bits
+                                     * kept at that rate, or only resampled (a Mac's): the sender plays PCM to it. A
+                                     * sender says ANET_F_DOP for DoP (every receiver takes the value: it only told the
+                                     * journal); an older one says ANET_F_S32, and its DoP to such a DAC is silence there
+                                     * (out_alsa.c, pcmpack.h pk_dop), after its first 20 ms (23/10: pk_dop_mute,
+                                     * music never muted on markers alone) */
 
 typedef struct { uint32_t id, rate, pkt_frames, pkt_us, caps; uint16_t ch, fmt; } anet_hdr;
 typedef struct { uint32_t id, flags, dac_rate, ring, reason; uint64_t played, received;
@@ -179,7 +185,7 @@ static inline int anet_rep_parse(const uint8_t *b, anet_rep *r) {
 
 /* ── mDNS (anet_mdns.c) ── */
 
-typedef struct { char id[64], dac[96], addr[48], hw[96]; int port; unsigned max_rate; double seen; char rates[96], err[24], room[80]; } anet_peer;
+typedef struct { char id[64], dac[96], addr[48], hw[96]; int port; unsigned max_rate; double seen; char rates[96], err[24], room[80], bits[48]; } anet_peer;
 /* Receiver: answer for this service until the process ends (a thread). */
 int anet_mdns_publish(const char *id, const char *dac, int port, unsigned max_rate);
 
@@ -210,6 +216,24 @@ void anet_caps(unsigned caps);
 void anet_convert(int on);
 /* after an anet_open refused: the receiver's reason (ANET_E_*), 0 none (not reached, no answer) */
 unsigned anet_refused(void);
+
+static inline int anet_bits_at(const char *rates, const char *bits, unsigned rate) {
+    if (!bits || !bits[0]) return 0;
+    int k = 0, i = 0;
+    if (strchr(bits, ',')) k = -1;                    /* one a rate: the rate's place in rates= */
+    for (const char *p = rates ? rates : ""; *p && k < 0; i++) {
+        unsigned long v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (unsigned long)(*p++ - '0');
+        if (v == rate) k = i;
+        while (*p && (*p < '0' || *p > '9')) p++;
+    }
+    if (k < 0) return 0;
+    const char *q = bits;
+    for (int j = 0; j < k && q; j++) { q = strchr(q, ','); if (q) q++; }
+    int b = 0;
+    while (q && *q >= '0' && *q <= '9' && b < 100) b = b * 10 + (*q++ - '0');
+    return b >= 8 && b <= 32 ? b : 0;
+}
 
 static inline int anet_rate_in(const char *rates, unsigned rate) {
     if (!rates || !rates[0]) return -1;

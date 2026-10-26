@@ -32,6 +32,7 @@
 
 #define BPF 6                    /* bytes per frame: two 24-bit samples (S.bpf: 4 to the AirPlay bridge, 10/10) */
 #define CHUNK 2048               /* frames packed per write */
+#define AP_RATE 44100            /* the AirPlay device's rate (libraop's): what the bridge is sent, converted here */
 #define STALL_S 10.0             /* nothing taken for this long while playing (not paused): the receiver is lost */
 #define GONE_S 5.0               /* its stream connection closed: this long for it to come again (a renderer's retry) */
 #define FETCH_S 10.0             /* after it is told to play: this long to fetch the stream */
@@ -66,6 +67,7 @@ typedef struct {
     char id[96], name[96], model[64], addr[48];   /* id: the MAC (aa:bb:…) or the UDN (uuid:…) */
     char hw[96];                                  /* audiolaz: its DAC's identity as it says it (anet.h anet_peer) */
     char rates[96], err[24];                      /* audiolaz: the rates its DAC takes as it is, its error (INFO) */
+    char bits[48];                                /* audiolaz: the bits its DAC keeps (INFO bits=, anet.h) */
     unsigned max_rate;                            /* its HELO's MaxSampleRate (0: not said) */
     double seen;
     int fd;                                       /* Squeezebox: its SlimProto connection */
@@ -120,6 +122,14 @@ static struct {
     int smooth, n_corr;                           /* a renderer's position smoothed (netout_smooth_position) */
     double corr, corr0;                           /* its position less the time since it was seen playing (s), averaged;
                                                    * that difference when it settled (ten reads) */
+    /* to the AirPlay bridge at another rate than the device's 44.1 kHz: converted here (azsrc.h), then made 16
+     * bits once (see netout_open). rate is then what goes on the wire (44100), irate the play's own; every count
+     * the play reads (netout_sent, netout_held) said in irate's frames. cv NULL: none (irate == rate). */
+    unsigned irate;
+    azsrc *cv;
+    int32_t *cvb;                                 /* its output, CHUNK frames, before pack16 */
+    uint64_t cin;                                 /* the play's frames the converter took (this stream) */
+    long clips;                                   /* its samples beyond full scale (intersample peaks), clipped */
 } S = { .fd = -1, .bpf = BPF };
 enum { TS_UNKNOWN, TS_PLAYING, TS_PAUSED, TS_STOPPED, TS_TRANSITIONING, TS_NO_MEDIA };
 static pthread_mutex_t slk = PTHREAD_MUTEX_INITIALIZER;
@@ -870,6 +880,36 @@ static void http_reply(int c, int code, const char *text) {
     const int n = snprintf(h, sizeof h, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, text);
     send_all(c, h, (size_t)n);
 }
+
+/* A renderer asking for a part of the stream: Range: bytes=N- (any case). MPD's curl input takes any 2xx answer to a
+ * Range as the bytes from N: its decoder (ffmpeg's WAV demuxer, which looks at the end then seeks to byte 44 while it
+ * opens the stream) was given 200, a new WAV header and the live music, read as audio from byte 44: RIFF a click near
+ * full scale, then every 24-bit frame 2 bytes off (44 is not a multiple of 6), noise near full scale. 0: no Range (or
+ * from 0); 1: from *from; 2: past any end (a suffix bytes=-N, or N at RANGE_END or beyond: ffmpeg's look at the end
+ * asks for 9223372036854775807-). */
+#define RANGE_END (1ULL << 40)
+static int http_range(const char *req, unsigned long long *from) {
+    const char *e = strstr(req, "\r\n\r\n");
+    for (const char *p = req; (p = strcasestr_(p, "\r\nrange:")) && (!e || p < e); p += 8) {
+        const char *v = p + 8;
+        while (*v == ' ' || *v == '\t') v++;
+        if (strncasecmp(v, "bytes", 5)) return 0;
+        v += 5;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v++ != '=') return 0;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v == '-') return 2;                      /* its last bytes: a stream with no end has none */
+        if (*v < '0' || *v > '9') return 0;
+        char *w;
+        const unsigned long long n = strtoull(v, &w, 10);   /* past 2^64: ULLONG_MAX */
+        v = w;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v != '-') return 0;
+        *from = n;
+        return !n ? 0 : n >= RANGE_END ? 2 : 1;
+    }
+    return 0;
+}
 static void *http_main(void *arg) {
     (void)arg;
     for (;;) {
@@ -921,8 +961,13 @@ static void *http_main(void *arg) {
                 continue;
             }
         }
-        static const char HEAD[] = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nServer: audiolaz-roomd\r\nCache-Control: no-cache\r\n"
-            "Connection: close\r\naccept-ranges: none\r\ntransferMode.dlna.org: Streaming\r\n"
+        /* No Accept-Ranges header, not even "none": MPD 0.21 to 0.24 (behind upmpdcli's renderers; its
+         * CurlInputPlugin, OnHeaders) takes the header being there as seekable, whatever it says, and its ffmpeg decoder
+         * then seeks while it opens the stream (http_range above). That the stream cannot be sought is said by
+         * DLNA.ORG_OP=00, transferMode Streaming and no Content-Length. The bench's MPD 0.24.4 without it: one fetch,
+         * no seek, the music decoded as it was sent. */
+        static const char HEAD_REST[] = "Content-Type: audio/wav\r\nServer: audiolaz-roomd\r\nCache-Control: no-cache\r\n"
+            "Connection: close\r\ntransferMode.dlna.org: Streaming\r\n"
             "contentFeatures.dlna.org: DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\r\n";
         /* the WAV header to a renderer only (08/10, review): a Squeezebox player takes the format strm s gave it and does
          * not read a header then, it plays it as audio: squeezelite 2.0 played our 44 bytes, and every sample after them
@@ -930,8 +975,29 @@ static void *http_main(void *arg) {
         uint8_t wav[44];
         wav_header(wav, S.rate);
         const int hdr = S.kind == NK_UPNP;
-        if (send_all(c, HEAD, sizeof HEAD - 1) || (hdr && !strcmp(method, "GET") && send_all(c, wav, sizeof wav))) { pthread_mutex_unlock(&slk); close(c); continue; }
-        if (!strcmp(method, "HEAD")) { pthread_mutex_unlock(&slk); close(c); continue; }
+        /* A renderer asking for a part anyway (a Range, http_range) is never given a stream out of its frames:
+         * from byte N < 44, the WAV header's rest, then the music; from N ≥ 44, as many zero bytes as bring it to the
+         * next frame of its grid (44 + a whole number of frames), then whole frames: what it decodes from N is the music,
+         * as it believes. Past any end (ffmpeg's look at the end): 206 and nothing, the stream left where it plays (the
+         * bench: MPD then seeks back to 44 and plays it right). Never 416: MPD then ends the song (the renderer STOPPED,
+         * the stream lost). 206 Partial Content, its Content-Range open (no length: a live stream). Its WAV streams
+         * only (a Squeezebox player, the AirPlay bridge: no header, never a Range). */
+        unsigned long long from = 0;
+        const int rg = hdr && !strcmp(method, "GET") ? http_range(req, &from) : 0;
+        char head[sizeof HEAD_REST + 160];
+        const int hl = rg == 2 ? snprintf(head, sizeof head, "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nServer: audiolaz-roomd\r\n"
+                                                                    "Content-Length: 0\r\nConnection: close\r\n\r\n")
+                     : rg == 1 ? snprintf(head, sizeof head, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %llu-%llu/*\r\n%s", from, from + RANGE_END - 1, HEAD_REST)
+                     : snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\n%s", HEAD_REST);
+        static unsigned said_end, said_from;          /* each said once per stream (MPD asks twice from 44) */
+        if (rg == 2 && said_end != S.id) { said_end = S.id; nlog("stream %u: the receiver looked for its end (Range): answered empty (206), the stream left where it plays", S.id); }
+        if (rg == 1 && said_from != S.id) { said_from = S.id; nlog("stream %u fetched again from byte %llu (Range): answered from there, its frames where the receiver counts them", S.id, from); }
+        uint8_t pre[44];                              /* rg 1: what goes before the music (the header's rest, or zeros) */
+        size_t pl = 0;
+        if (rg == 1 && from < sizeof wav) { pl = sizeof wav - (size_t)from; memcpy(pre, wav + from, pl); }
+        else if (rg == 1) { pl = (size_t)((S.bpf - (from - sizeof wav) % (unsigned)S.bpf) % (unsigned)S.bpf); memset(pre, 0, pl); }
+        if (send_all(c, head, (size_t)hl) || (hdr && !strcmp(method, "GET") && !rg && send_all(c, wav, sizeof wav)) || (pl && send_all(c, pre, pl))) { pthread_mutex_unlock(&slk); close(c); continue; }
+        if (!strcmp(method, "HEAD") || rg == 2) { pthread_mutex_unlock(&slk); close(c); continue; }
         /* A small send buffer (Linux doubles it: 128 KB, half a second at 44.1 kHz): the push-back is the receiver's. */
         int sb = 64 * 1024, one = 1;
         setsockopt(c, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
@@ -1899,6 +1965,7 @@ static void *az_browse_main(void *arg) {
             snprintf(R[i].loc, sizeof R[i].loc, "%s:%d", P[k].addr, P[k].port);
             if (P[k].hw[0] || !R[i].hw[0]) snprintf(R[i].hw, sizeof R[i].hw, "%.95s", P[k].hw);   /* (an mDNS answer and INFO agree) */
             if (P[k].rates[0]) snprintf(R[i].rates, sizeof R[i].rates, "%s", P[k].rates);   /* INFO's only */
+            if (P[k].rates[0]) snprintf(R[i].bits, sizeof R[i].bits, "%s", P[k].bits);      /* INFO's only, with its rates */
             if (P[k].rates[0] || P[k].err[0]) snprintf(R[i].err, sizeof R[i].err, "%s", P[k].err);
             R[i].max_rate = P[k].max_rate; R[i].seen = t;
             az_known_put(R[i].id, R[i].loc);              /* its address kept by its id */
@@ -1975,8 +2042,35 @@ static unsigned az_pick(const char *rates, unsigned want) {
     return 0;
 }
 unsigned netout_link_rate(void) { return AZ && AZC.s ? AZC.drate : 0; }
+/* the bits the receiver's DAC keeps at the rate it is sent (INFO bits=, anet.h): this stream's, or (for a plan
+ * before it opens, roomd.c's DoP) the last INFO's of the receiver spec names; 0 not said */
+static int AZ_BITS = 0;
+int netout_link_bits(void) { return AZ ? AZ_BITS : 0; }
+int netout_link_bits_for(const char *spec, unsigned rate) {
+    const char *key;
+    if (!spec || spec_kind(spec, &key) != NK_AUDIOLAZ) return 0;
+    pthread_mutex_lock(&rlk);
+    const int i = find_rcv(NK_AUDIOLAZ, key);
+    const int b = i >= 0 ? anet_bits_at(R[i].rates, R[i].bits, rate) : 0;
+    pthread_mutex_unlock(&rlk);
+    return b;
+}
+unsigned netout_conv_rate(void) {                     /* the rate it goes at once converted here (0: as it is) */
+    if (AZ) return AZC.s ? AZC.drate : 0;
+    pthread_mutex_lock(&slk);
+    const unsigned r = S.on && S.cv ? S.rate : 0;
+    pthread_mutex_unlock(&slk);
+    return r;
+}
 static int AZ_CONV = 1;                                /* netout_link_convert (the tests: a sender before 21/10) */
 void netout_link_convert(int on) { AZ_CONV = on; }
+/* (22/10, the review) the next stream's words DoP (roomd.c): said to the receiver (ANET_F_DOP), never converted (its
+ * markers and one-bit samples would be noise), refused by us when its DAC does not take that rate as it is or keeps
+ * fewer than 24 bits there (its INFO), and by it when it cannot play them whole (ANET_E_FORMAT): netout_dop_refused 1,
+ * once, the player playing PCM to it from then on */
+static int AZ_DOP = 0, AZ_DOP_NO = 0;
+void netout_link_dop(int on) { AZ_DOP = on; }
+int netout_dop_refused(void) { const int r = AZ_DOP_NO; AZ_DOP_NO = 0; return r; }
 static int az_open(const char *spec, const char *key, unsigned rate) {
     char host[256] = ""; int port = ANET_PORT;
     az_conv_free();
@@ -2025,11 +2119,12 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
     char why[600];
     /* its rates (and whether its DAC refuses to start), asked now: the rate it takes */
     anet_peer ip;
-    char rates[96] = "";
+    char rates[96] = "", bits[48] = "";
     if (!anet_info(host, port, &ip, 1000)) {
         snprintf(rates, sizeof rates, "%s", ip.rates);
+        snprintf(bits, sizeof bits, "%s", ip.bits);
         pthread_mutex_lock(&rlk);
-        if (ri >= 0 && R[ri].used) { snprintf(R[ri].rates, sizeof R[ri].rates, "%s", ip.rates); snprintf(R[ri].err, sizeof R[ri].err, "%s", ip.err); }
+        if (ri >= 0 && R[ri].used) { snprintf(R[ri].rates, sizeof R[ri].rates, "%s", ip.rates); snprintf(R[ri].err, sizeof R[ri].err, "%s", ip.err); snprintf(R[ri].bits, sizeof R[ri].bits, "%s", ip.bits); }
         pthread_mutex_unlock(&rlk);
         if (!strcmp(ip.err, "dac-start")) {
             snprintf(AZ_STUCK, sizeof AZ_STUCK, "%s", spec);
@@ -2039,13 +2134,26 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
         }
     }
     unsigned drate = rate;
-    if (AZ_CONV && anet_rate_in(rates, rate) == 0) drate = az_pick(rates, rate);
+    AZ_DOP_NO = 0;
+    if (AZ_DOP) {                                      /* DoP: as it is, or not at all */
+        const int b = anet_bits_at(rates, bits, rate);
+        if (anet_rate_in(rates, rate) == 0 || (b > 0 && b < 24)) {
+            AZ_DOP_NO = 1;
+            set_why("%s: DoP at %u Hz not sent: its DAC %s (its markers and one-bit samples would be noise): PCM to it", spec, rate,
+                    b > 0 && b < 24 ? "keeps fewer than 24 bits there" : "does not take that rate as it is, and DoP is never converted");
+            last_asked = 1;
+            return -1;
+        }
+    }
+    if (!AZ_DOP && AZ_CONV && anet_rate_in(rates, rate) == 0) drate = az_pick(rates, rate);
     if (!drate) drate = rate;
-    anet_convert(AZ_CONV);
-    int e = anet_open(host, port, drate, ANET_F_S32, 0, why, sizeof why);
-    if (e && AZ_CONV && anet_refused() == ANET_E_RATE && drate == rate) {   /* refused by trying (a Mac's device): its rates again */
+    anet_convert(AZ_CONV && !AZ_DOP);
+    int e = anet_open(host, port, drate, AZ_DOP ? ANET_F_DOP : ANET_F_S32, 0, why, sizeof why);
+    if (e && AZ_DOP && anet_refused() == ANET_E_FORMAT) AZ_DOP_NO = 1;   /* its DAC cannot play it whole: PCM */
+    if (e && !AZ_DOP && AZ_CONV && anet_refused() == ANET_E_RATE && drate == rate) {   /* refused by trying (a Mac's device): its rates again */
         if (!anet_info(host, port, &ip, 1000) && ip.rates[0]) {
             snprintf(rates, sizeof rates, "%s", ip.rates);
+            snprintf(bits, sizeof bits, "%s", ip.bits);
             const unsigned d2 = az_pick(rates, rate);
             if (d2 && d2 != rate) { drate = d2; e = anet_open(host, port, drate, ANET_F_S32, 0, why, sizeof why); }
         }
@@ -2087,6 +2195,7 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
     }
     pthread_mutex_lock(&slk);
     AZ = 1; S.ri = ri;
+    AZ_BITS = anet_bits_at(rates, bits, drate);        /* its DAC's bits at the rate sent (0 not said) */
     pthread_mutex_unlock(&slk);
     {   /* the receiver ours: the wait forgotten, said */
         pthread_mutex_lock(&azlk);
@@ -2098,6 +2207,7 @@ static int az_open(const char *spec, const char *key, unsigned rate) {
         else if (take) nlog("%s: taken over (the listener asked)", spec);
     }
     if (AZC.s) nlog("stream to %s at %u Hz, converted from %u Hz (audiolaz net: the DAC's clock)", spec, AZC.drate, rate);
+    else if (AZ_BITS > 0 && AZ_BITS < 32) nlog("stream to %s at %u Hz (audiolaz net: its DAC keeps %d bits, the music requantized to them here, the DAC's clock)", spec, rate, AZ_BITS);
     else nlog("stream to %s at %u Hz (audiolaz net: 32 bits as they are, the DAC's clock)", spec, rate);
     return 0;
 }
@@ -2206,9 +2316,15 @@ int netout_open(unsigned rate) {
         return -1;
     }
     const unsigned id = ++stream_ids;
-    S.on = 1; S.kind = kind; S.ri = ri; S.id = id; S.rate = rate;
-    /* the AirPlay bridge plays 16 bits to the device: given 24, squeeze2raop 1.8.12 drops the low byte
-     * (truncation, its output.c); so made 16 bits here, once, with TPDF dither (netout_write) */
+
+    azsrc_free(S.cv); free(S.cvb); S.cv = NULL; S.cvb = NULL;
+    S.irate = rate; S.cin = 0; S.clips = 0;
+    if (kind == NK_AIRPLAY && rate != AP_RATE) {
+        S.cv = azsrc_new(rate, AP_RATE);
+        S.cvb = S.cv ? malloc(sizeof(int32_t) * 2 * CHUNK) : NULL;
+        if (!S.cv || !S.cvb) { azsrc_free(S.cv); S.cv = NULL; free(S.cvb); S.cvb = NULL; nlog("%s: no converter %u → %u Hz: sent at %u Hz (the bridge resamples it)", name, rate, AP_RATE, rate); }
+    }
+    S.on = 1; S.kind = kind; S.ri = ri; S.id = id; S.rate = S.cv ? AP_RATE : rate;
     S.bpf = kind == NK_AIRPLAY ? 4 : BPF;
     S.plen = S.poff = 0; S.bytes = 0; S.full_once = 0; S.paused = 0; S.lost = 0; S.ended = 0; S.t_take = S.t_gone = mono(); S.t_block = 0;
     S.tstate = TS_UNKNOWN; S.fails = 0; S.seen_playing = 0; S.rel_moved = 0; S.rel = 0; S.t_rel = 0; S.t_playing = 0;
@@ -2229,7 +2345,7 @@ int netout_open(unsigned rate) {
         snprintf(hdr, sizeof hdr, "GET /stream/%u.wav HTTP/1.0\r\nHost: %s:%d\r\n\r\n", id, ip, http_port_);
         if (kind == NK_SQUEEZE) audg_unity(fd);
         else audg_bridge(fd);                        /* AirPlay: its volume left as it is */
-        told = !strm_send(fd, 's', 0, rate, local, hdr, kind == NK_AIRPLAY);
+        told = !strm_send(fd, 's', 0, S.cv ? AP_RATE : rate, local, hdr, kind == NK_AIRPLAY);   /* the wire's rate */
         close(fd);
     } else {
         /* what plays as it starts: title, artist, album, the cover (nowplay.h) */
@@ -2267,8 +2383,11 @@ int netout_open(unsigned rate) {
     pthread_mutex_unlock(&slk);
     if (!ok) { tell_stop(kind, ri); claim_announce(); return -1; }
     taken_clear(spec);
-    nlog("playing to \"%s\" (%s, %s) at %u Hz, %s: %s", name, kind == NK_SQUEEZE ? "Squeezebox" : kind == NK_AIRPLAY ? "AirPlay, through the bridge: 44.1 kHz 16 bits there" : "UPnP", addr, rate,
-         kind == NK_AIRPLAY ? "16 bits (TPDF dither, made here once)" : "24 bits", url);
+    char conv[200] = "";
+    if (S.cv) snprintf(conv, sizeof conv, ", converted here to %u Hz (the corrector's converter, %u taps a phase, %.1f ms: the bridge does not resample)",
+                       AP_RATE, S.cv->T, 1000.0 * azsrc_delay_in(S.cv) / rate);
+    nlog("playing to \"%s\" (%s, %s) at %u Hz%s, %s: %s", name, kind == NK_SQUEEZE ? "Squeezebox" : kind == NK_AIRPLAY ? "AirPlay, through the bridge: 44.1 kHz 16 bits there" : "UPnP", addr, rate,
+         conv, kind == NK_AIRPLAY ? "16 bits (TPDF dither, made here once)" : "24 bits", url);
     return 0;
 }
 /* Under slk: the pending bytes sent as far as the receiver takes them. 0 all sent; 1 some left (its buffer full); −1 the
@@ -2307,6 +2426,38 @@ static void pack16(const int32_t *lr, long n, uint8_t *p) {
         p[0] = (uint8_t)y; p[1] = (uint8_t)(y >> 8); p += 2;
     }
 }
+/* Under slk: the play's frames through the converter (S.cv), as many as make CHUNK frames at most at the
+ * wire's rate, into S.cvb; how many of the play's it took (*used), how many it made. Its samples pinned at full scale
+ * counted (an intersample peak above 0 dBFS: clipped, said at the stream's end). */
+static long cv_run(const int32_t *lr, long frames, long *used) {
+    long n = (long)((double)(CHUNK - 4) * S.irate / S.rate);
+    if (n > frames) n = frames;
+    const long o = azsrc_run(S.cv, lr, n, S.cvb, CHUNK, used);
+    for (long i = 0; i < 2 * o; i++) if (S.cvb[i] == INT32_MAX || S.cvb[i] == INT32_MIN) S.clips++;
+    S.cin += (uint64_t)*used;
+    return o;
+}
+/* Under slk, fd blocking: the converter's tail (its delay: the last frames given still inside it) sent before
+ * the end of file, zeros pushed after them; exactly as many frames at the wire's rate as the play's frames make there
+ * (the play's n frames: ceil(n · 44100 / rate)), none more. */
+static void cv_tail(int fd) {
+    if (!S.cv) return;
+    static const int32_t z[2 * 256] = { 0 };
+    const uint64_t want = (uint64_t)ceil((double)S.cin * S.rate / S.irate);
+    for (int guard = 0; S.cv->n_out < want && guard < 4096; guard++) {
+        long used = 0;
+        const long cap = (long)(want - S.cv->n_out) < CHUNK ? (long)(want - S.cv->n_out) : CHUNK;
+        const long o = azsrc_run(S.cv, z, 256, S.cvb, cap, &used);
+        if (o <= 0) { if (!used) break; continue; }
+        pack16(S.cvb, o, S.pend);
+        if (send_all(fd, S.pend, (size_t)o * 4)) break;
+        S.bytes += (uint64_t)o * 4;
+    }
+}
+static void cv_free(void) {                           /* under slk: the stream over (its clips said) */
+    if (S.cv && S.clips) nlog("stream %u: %ld samples beyond full scale once converted to %u Hz (intersample peaks): clipped", S.id, S.clips, S.rate);
+    azsrc_free(S.cv); free(S.cvb); S.cv = NULL; S.cvb = NULL;
+}
 long netout_write(const int32_t *lr, long frames) {
     if (AZ) { const long r = AZC.s ? az_conv_write(lr, frames) : anet_write(lr, frames); if (r < 0) set_why("%s", anet_why()); return r; }
     pthread_mutex_lock(&slk);
@@ -2319,7 +2470,14 @@ long netout_write(const int32_t *lr, long frames) {
         goto out;
     }
     int f = flush_pend();
-    if (f == 0 && frames > 0) {                       /* the next frames packed: 24 bits, rounded from the engine's 32 */
+    if (f == 0 && frames > 0 && S.cv) {               /* converted to the wire's rate, then 16 bits once */
+        long used = 0;
+        const long o = cv_run(lr, frames, &used);
+        pack16(S.cvb, o, S.pend);
+        S.plen = (size_t)o * 4; S.poff = 0;
+        r = used;
+        f = flush_pend();
+    } else if (f == 0 && frames > 0) {                /* the next frames packed: 24 bits, rounded from the engine's 32 */
         const long n = frames < CHUNK ? frames : CHUNK;
         uint8_t *p = S.pend;
         if (S.bpf == 4) pack16(lr, n, p);
@@ -2354,7 +2512,9 @@ void netout_wait(int ms) {
 uint64_t netout_sent(void) {
     if (AZ) return AZC.s ? AZC.taken : anet_sent();   /* the play's frames taken, converted or not */
     pthread_mutex_lock(&slk);
-    const uint64_t n = S.bytes / (uint64_t)S.bpf;
+    /* converted for the AirPlay bridge: the play's frames the converter took (what is still in it, and what it
+     * made and the network has not taken, held: netout_held) */
+    const uint64_t n = S.cv ? S.cin : S.bytes / (uint64_t)S.bpf;
     pthread_mutex_unlock(&slk);
     return n;
 }
@@ -2370,6 +2530,12 @@ long netout_held(void) {
     pthread_mutex_lock(&slk);
     if (!S.on) { pthread_mutex_unlock(&slk); return 0; }
     const double sent = (double)(S.bytes / (uint64_t)S.bpf), t = mono(), srate = S.rate;
+    /* converted for the AirPlay bridge: what follows counts frames at the wire's rate (44.1 kHz: the bridge's
+     * elapsed time, the bytes); turned back into the play's own at the end, with what the converter holds (taken, not
+     * made yet: its delay) and what it made that the network has not taken yet */
+    const double ratio = S.cv ? (double)S.irate / S.rate : 1;
+    const double inconv = S.cv ? (double)S.cin - (double)S.cv->n_out * ratio : 0;
+    const double unsent = S.cv ? (double)S.cv->n_out - sent : 0;
     double played = 0;
     if (SLIM(S.kind)) {
         pthread_mutex_lock(&rlk);
@@ -2400,6 +2566,7 @@ long netout_held(void) {
     if (played > sent + 0.5 * srate) played = 0;
     if (played > sent) played = sent;
     if (played < 0) played = 0;
+    if (ratio != 1) { const double h = (sent - played + (unsent > 0 ? unsent : 0)) * ratio + (inconv > 0 ? inconv : 0); return (long)h; }
     return (long)(sent - played);
 }
 int netout_started(void) {
@@ -2467,12 +2634,51 @@ void netout_end(void) {
     fcntl(fd, F_SETFL, 0);
     timeouts(fd, 3000);
     if (S.poff < S.plen) { const size_t k = S.plen - S.poff; if (!send_all(fd, S.pend + S.poff, k)) S.bytes += k; }
+    cv_tail(fd);                                      /* the converter's last frames */
     S.plen = S.poff = 0;
     S.fd = -1; S.ended = 1;
     const double secs = (double)(S.bytes / (uint64_t)S.bpf) / S.rate;
     pthread_mutex_unlock(&slk);
     close_gently(fd);
     nlog("all sent (%.1f s): the stream's end given to the receiver", secs);
+}
+/* (24/10, the release: test/engine-netout.sh fakeapsrc) Roon paused, to a Squeezebox player or the AirPlay bridge
+ * (roomd.c give_late): what it played beyond the player's reckoning while it was being stopped, in the play's frames.
+ * netout_stop_mark() just before netout_close (the reckoning: its frames played now, its STMf count, the stream's
+ * rates); netout_stop_extra(ms) after it: its STMf awaited ms at most, its elapsed time then against the reckoning;
+ * 0 when there is nothing to say (another kind of receiver, no STMf, a figure out of reason). */
+static struct { int on, ri; unsigned stmf0, rate; double played, ratio; } SM;
+void netout_stop_mark(void) {
+    SM.on = 0;
+    if (AZ) return;
+    pthread_mutex_lock(&slk);
+    if (!S.on || !SLIM(S.kind)) { pthread_mutex_unlock(&slk); return; }
+    const int ri = S.ri;
+    const unsigned rate = S.rate;
+    const double ratio = S.cv ? (double)S.irate / S.rate : 1;
+    pthread_mutex_unlock(&slk);
+    const double played = (double)netout_sent() - (double)netout_held();
+    pthread_mutex_lock(&rlk);
+    const unsigned f0 = R[ri].n_stmf;
+    pthread_mutex_unlock(&rlk);
+    SM.ri = ri; SM.rate = rate; SM.ratio = ratio; SM.played = played; SM.stmf0 = f0; SM.on = 1;
+}
+long netout_stop_extra(int ms) {
+    if (!SM.on) return 0;
+    SM.on = 0;
+    const double t0 = mono();
+    long e = -1;
+    for (;;) {
+        pthread_mutex_lock(&rlk);
+        if (R[SM.ri].used && R[SM.ri].n_stmf > SM.stmf0) e = R[SM.ri].elapsed_ms;
+        pthread_mutex_unlock(&rlk);
+        if (e >= 0 || mono() - t0 >= ms / 1000.0) break;
+        struct timespec ts = { 0, 5000000 };
+        nanosleep(&ts, NULL);
+    }
+    if (e < 0) return 0;
+    const double extra = (double)e * SM.rate / 1000.0 * SM.ratio - SM.played;
+    return extra > 0 && extra < SM.rate * SM.ratio ? (long)(extra + 0.5) : 0;   /* more than a second: not believed */
 }
 void netout_close(int finish) {
     if (AZ) {
@@ -2500,6 +2706,7 @@ void netout_close(int finish) {
          * decoded it all, seconds after our end of file; not waited for, the next stream's strm s cut the old one's
          * last seconds, or played them at the new rate); an STMd or STMu of this stream already in: no wait */
         const unsigned d0 = S.stmd0, u0 = S.stmu0, f0 = S.stmf0, s0 = S.stms0, c0 = S.stmc0;
+        cv_free();
         pthread_mutex_unlock(&slk);
         if (fd >= 0) close(fd);                       /* none should be (a fetch after the end is refused): never kept */
         pthread_mutex_lock(&rlk);
@@ -2519,8 +2726,10 @@ void netout_close(int finish) {
         fcntl(fd, F_SETFL, 0);
         timeouts(fd, 3000);
         if (S.poff < S.plen) { const size_t k = S.plen - S.poff; if (!send_all(fd, S.pend + S.poff, k)) S.bytes += k; }
+        cv_tail(fd);                                  /* the converter's last frames */
     }
     S.plen = S.poff = 0;
+    cv_free();
     pthread_mutex_unlock(&slk);
     if (finish && fd >= 0 && !lost) {
         close_gently(fd);
@@ -2859,10 +3068,19 @@ long netout_link_gaps(void) {
     if (!AZ || anet_get_state(NULL, &s) || !s.on) return 0;
     return (long)s.underruns;
 }
-int netout_link_pace(double *dac_ppm, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms) {
+
+static double as_dac_avg(double *ppm) {
+    pthread_mutex_lock(&as_lk);
+    const double secs = AS.on && AS.kp_n ? (double)AS.kp_n * (AS.pkt_us / 1e6) : 0;
+    if (secs > 0) *ppm = (AS.k_sum / (double)AS.kp_n - 1.0) * 1e6;
+    pthread_mutex_unlock(&as_lk);
+    return secs;
+}
+int netout_link_pace(double *dac_ppm, double *dac_avg_ppm, double *avg_s, double *pull_ppm, double *ring_ms, double *target_ms, double *anchor_ms) {
     anet_state s;
     if (!AZ || anet_get_state(NULL, &s) || !s.on || !s.adapt) return -1;
     *dac_ppm = s.dac_ppm; *pull_ppm = s.pull_ppm; *ring_ms = s.ring_ms; *target_ms = s.target_ms; *anchor_ms = s.anchor_ms;
+    *dac_avg_ppm = 0; *avg_s = as_dac_avg(dac_avg_ppm);   /* */
     return 0;
 }
 void netout_fifo_ms(int ms) { anet_fifo_ms(ms); }
@@ -2897,6 +3115,8 @@ int netout_link_json(const char *spec, char *out, size_t len) {
     az_hostport(spec, hp, sizeof hp);
     anet_state s;
     if (!hp[0] || anet_get_state(hp, &s)) return snprintf(out, len, "null");
+    double dac_shown = s.dac_ppm;                     /* dacPpm: its average this stream once known (as_dac_avg) */
+    if (s.on) (void)as_dac_avg(&dac_shown);
     {   /* the DAC's name and the receiver's id as it announces them */
         const char *key;
         if (spec_kind(spec, &key) == NK_AUDIOLAZ) {
@@ -2918,7 +3138,7 @@ int netout_link_json(const char *spec, char *out, size_t len) {
         rid, dac, s.on ? "true" : "false", s.on ? (s.p3 ? 3 : 2) : 0, s.adapt ? "true" : "false", s.live ? "true" : "false", s.rate,
         anet_rs_text(s.rstate), s.on ? s.ring_ms : 0, s.target_ms, s.start_ms, s.lo_ms, s.hi_ms, s.on ? s.held_ms : 0, s.on ? s.ins_ms : 0,
         s.late_ms, s.peak_ms, s.underruns, s.adjusts, s.tx_late, s.tx_late_ms, s.last_stop, s.last_stop_age, s.on ? s.after_ms : 0,   /* afterMs: in latencyMs too */
-        rates, AZ && AZC.s ? AZC.rate : 0u, netout_dac_start(spec) ? "true" : "false", s.on ? s.dac_ppm : 0, s.on ? s.pull_ppm : 0, s.on ? s.over_ms : 0, s.on ? s.back_ms : 0);   /* its DAC's rates, the stream's own rate when converted, its DAC refusing to start */
+        rates, AZ && AZC.s ? AZC.rate : 0u, netout_dac_start(spec) ? "true" : "false", s.on ? dac_shown : 0, s.on ? s.pull_ppm : 0, s.on ? s.over_ms : 0, s.on ? s.back_ms : 0);   /* its DAC's rates, the stream's own rate when converted, its DAC refusing to start */
 }
 /* under nplk (np_bump): what the source playing says, to the audiolaz receiver (its cover by our stream server's URL,
  * {self}: the address the receiver reaches us at, filled in by anet_send.c) */

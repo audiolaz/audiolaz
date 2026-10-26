@@ -40,6 +40,18 @@
 #define AS_REFILL 3.0
 #define AS_LATE_S 0.05
 #define AS_TX_BUSY 0.25                 /* macOS: the timer thread's computation, a share of its period (rt_clock) */
+
+#define AS_FIT_TAU 60.0                 /* s: the fit's memory */
+#define AS_FIT_MIN 20.0                 /* reports (their weight) before the fit says anything */
+#define AS_OUT_N 4.0                    /* set aside: further from the fit than this many times its spread … */
+#define AS_OUT_MS 2.0                   /* … and than this (ms) */
+#define AS_STEP_N 6                     /* this many set aside in a row: a step, the fit started again */
+#define AS_KF_SLEW 20e-6                /* the clock moved at most this much a second */
+#define AS_KF_LIMIT 1000e-6             /* never further from ours than this */
+#define AS_PULL_MAX 40e-6               /* the ring's pull: at most this */
+#define AS_PULL_FAR 300e-6              /* a source read at our pace, its ring far off its anchor (on average): up to this */
+#define AS_PULL_SLEW 10e-6              /* the pull moved at most this much a second */
+#define AS_PERR_S 2.0                   /* the ring's error averaged over about this long for the pull */
 #ifdef MSG_NOSIGNAL
 #define MSG_NOSIGNAL_ MSG_NOSIGNAL
 #else
@@ -81,6 +93,13 @@ static struct {
     double n_avg, t_navg;               /* the nominal ring averaged over about 2 s (frames): what over and under weigh;
                                          * since when (it plays: weighed from 3 s after) */
     double k_sum, pull_sum; long kp_n;  /* the DAC's clock and the pull, summed each tick while playing (their means said) */
+    /* the DAC's clock fitted (as_fit): its reports (t, played - rate·t) by least squares, weighted
+     * exp(-age/AS_FIT_TAU); a report far off the fit set aside (rep_out); the clock k that both the pace and the
+     * estimates follow, the fit's slope weighed against what was known before (kf0, its variance kf_p), moved
+     * AS_KF_SLEW at most; the ring's error to its anchor averaged for the pull (perr) */
+    double f_s0, f_sx, f_sy, f_sxx, f_sxy, f_t, f_sig, f_runsum; int f_run;
+    double kf0, kf_p, kf_var, t_kf, perr; int perr_on;
+    unsigned long rep_out, rep_steps;
     /* the timer thread's delays (AS_LATE_S and more): kept here by it, journaled by the control's thread */
     int rt_err, rt_said;                /* its priority refused (errno), said */
     unsigned long late_n[4]; double late_max[4];   /* by cause (AS_L_*): how many, the worst (s) */
@@ -110,6 +129,7 @@ static char as_meta_lines[ANET_META_MAX]; static unsigned as_meta_serial;
 static struct {
     char hp[160]; unsigned rate, rstate, rwhy; double target_ms, start_ms, late_ms, peak_ms, lo_ms, hi_ms, t_seen;
     unsigned long underruns, adjusts; char last_stop[200]; double t_stop;
+    double kf; int has_kf;              /* its DAC's clock as the last stream fitted it (the next one starts there) */
 } as_known[AS_KNOWN];
 /* the packets' rhythm as sent (the journal at each stream's end): gaps between two sends, 25 µs buckets */
 #define AS_HB 200
@@ -213,6 +233,59 @@ static double as_est_played(double t) {   /* under as_lk */
     if (p > (double)AS.sw) p = (double)AS.sw;          /* never more than was sent (the stream's frames, 14/10) */
     return p;
 }
+/* under as_lk: the fit started again (a step in the reports, a pause, the DAC stopped): the clock kept, known
+ * this well (its variance; no better than (10 ppm)², no worse than before) */
+static void as_fit_restart(void) {
+    AS.f_s0 = AS.f_sx = AS.f_sy = AS.f_sxx = AS.f_sxy = 0; AS.f_t = 0; AS.f_run = 0; AS.f_runsum = 0;
+    AS.kf0 = AS.k;
+    if (AS.kf_var > 0) { const double v = fmax(4.0 * AS.kf_var, 1e-10); if (v < AS.kf_p) AS.kf_p = v; }
+    AS.kf_var = 0; AS.t_kf = 0;
+}
+/* under as_lk: a report into the fit (x: s since the stream opened, y: what it played less rate·x, frames);
+ * 0 taken, 1 set aside (far off the fit), 2 a step (AS_STEP_N set aside in a row: the fit started again); the clock
+ * AS.k moved toward what the fit says, weighed by how well each knows it */
+static int as_fit(double x, double y, double t) {
+    const double rate = AS.rate;
+    if (AS.f_t > 0 && t > AS.f_t) {
+        const double d = exp(-(t - AS.f_t) / AS_FIT_TAU);
+        AS.f_s0 *= d; AS.f_sx *= d; AS.f_sy *= d; AS.f_sxx *= d; AS.f_sxy *= d;
+    }
+    AS.f_t = t;
+    if (AS.f_sig <= 0) AS.f_sig = 0.0005 * rate;
+    int out = 0;
+    if (AS.f_s0 >= AS_FIT_MIN) {
+        const double mx = AS.f_sx / AS.f_s0, my = AS.f_sy / AS.f_s0, vx = AS.f_sxx / AS.f_s0 - mx * mx;
+        if (vx > 1e-6) {
+            const double b = (AS.f_sxy / AS.f_s0 - mx * my) / vx;
+            const double res = y - (my + b * (x - mx)), lim = fmax(AS_OUT_N * AS.f_sig, AS_OUT_MS / 1000.0 * rate);
+            if (fabs(res) > lim) {
+                out = 1; AS.rep_out++;
+                AS.f_sig += (lim / AS_OUT_N * 1.5 - AS.f_sig) * 0.02;   /* the spread grown slowly when they keep coming */
+                AS.f_runsum += res;
+                if (++AS.f_run >= AS_STEP_N) { AS.rep_steps++; as_fit_restart(); return 2; }
+            } else { AS.f_run = 0; AS.f_runsum = 0; AS.f_sig += (fabs(res) * 1.25 - AS.f_sig) * 0.02; }
+        }
+    }
+    if (!out) { AS.f_s0 += 1; AS.f_sx += x; AS.f_sy += y; AS.f_sxx += x * x; AS.f_sxy += x * y; }
+    double want = AS.kf0;
+    if (AS.f_s0 >= AS_FIT_MIN) {
+        const double mx = AS.f_sx / AS.f_s0, my = AS.f_sy / AS.f_s0, vx = AS.f_sxx / AS.f_s0 - mx * mx;
+        if (vx > 1e-6) {
+            const double b = (AS.f_sxy / AS.f_s0 - mx * my) / vx;
+            const double sd = AS.f_sig / 1.25 / rate, v = sd * sd / (AS.f_s0 * vx), w = AS.kf_p / (AS.kf_p + v);
+            want = AS.kf0 + (1.0 + b / rate - AS.kf0) * w;
+            AS.kf_var = AS.kf_p * v / (AS.kf_p + v);
+        }
+    }
+    if (want > 1.0 + AS_KF_LIMIT) want = 1.0 + AS_KF_LIMIT;
+    if (want < 1.0 - AS_KF_LIMIT) want = 1.0 - AS_KF_LIMIT;
+    if (AS.t_kf > 0) {
+        const double m = AS_KF_SLEW * (t - AS.t_kf);
+        AS.k += fmax(-m, fmin(m, want - AS.k));
+    }
+    AS.t_kf = t;
+    return out;
+}
 static void as_on_report(const anet_rep *r, double t) {   /* under as_lk */
     if (r->id != AS.id) return;
     AS.t_rep = t;
@@ -238,13 +311,14 @@ static void as_on_report(const anet_rep *r, double t) {   /* under as_lk */
     const int playing = !!(r->flags & ANET_R_PLAYING);
     AS.rep_played = r->played; AS.rep_ring = r->ring;
     AS.rep_read = r->received > r->ring ? r->received - r->ring : 0;
-    if (!playing || !AS.locked) { AS.p0 = (double)r->played; AS.t0 = t; AS.locked = playing; AS.playing = playing; return; }
+    if (!playing || !AS.locked) { AS.p0 = (double)r->played; AS.t0 = t; AS.locked = playing; AS.playing = playing; as_fit_restart(); return; }
     const double pred = AS.p0 + (t - AS.t0) * AS.rate * (AS.paused ? 0 : AS.k), e = (double)r->played - pred;
-    if (e > 0.1 * AS.rate || e < -0.1 * AS.rate) { AS.p0 = (double)r->played; AS.t0 = t; return; }
+    /* the clock from the fit (as_fit), never from this report alone; the position as before, a report set
+     * aside left out of it too (the position as predicted at the clock) */
+    const int f = AS.paused ? 0 : as_fit(t - AS.t_open, (double)r->played - AS.rate * (t - AS.t_open), t);
+    if (f == 2 || e > 0.1 * AS.rate || e < -0.1 * AS.rate) { AS.p0 = (double)r->played; AS.t0 = t; if (f != 2) as_fit_restart(); return; }
+    if (f == 1) return;
     AS.p0 = pred + 0.25 * e; AS.t0 = t;
-    AS.k += 0.02 * e / (AS.rate * ANET_REPORT_MS / 1000.0);
-    if (AS.k > 1.001) AS.k = 1.001;
-    if (AS.k < 0.999) AS.k = 0.999;
 }
 
 static int as_send_all(int fd, const void *p, size_t n) {
@@ -442,7 +516,7 @@ static void *as_tx_main(void *arg) {
         const int adapt = !!(AS.caps & ANET_CAP_ADAPT), live = as_live_next;
         /* the DAC's rate (k), and the receiver's ring pulled gently to its target: 10 ms off → 25 ppm, ±300 at most;
          * protocol 3: its nominal ring (in flight counted as come) to the anchor */
-        double ratio = AS.locked ? AS.k : 1.0, N = 0;
+        double ratio = AS.k, N = 0;           /* the fitted clock (as_fit): the last stream's to start with */
         if (adapt) {
             N = (double)AS.sw - as_read_est(t);
             if (AS.playing) {
@@ -450,18 +524,29 @@ static void *as_tx_main(void *arg) {
                  * where it was kept: this pull at its ±300 ppm limit for half an hour) a source read at our pace (a
                  * card: the app that plays to it follows its clock, nothing resampled) pulled up to ±1000 ppm; the rest
                  * taken out, or put back, in silences (below) */
-                const double cmax = as_paced_next ? 1000e-6 : 300e-6;
-                double c = (AS.anchor - N) / rate / 400.0;
+                /* its error averaged (AS_PERR_S: the DAC's periods and the reports' jitter move N by
+                 * milliseconds from one tick to the next), the pull ±AS_PULL_MAX, moved slowly: the pace never more
+                 * than that from the DAC's clock; a card's app following us, its ring far off its anchor on
+                 * average: up to ±AS_PULL_FAR, reached as slowly */
+                const double err = AS.anchor - N;
+                if (!AS.perr_on) { AS.perr = err; AS.perr_on = 1; }
+                else AS.perr += (err - AS.perr) * fmin(1.0, T / AS_PERR_S);
+                const double far_ = fmax(2.0 * deficit, 0.2 * (double)AS.goal);
+                const double cmax = as_paced_next && fabs(AS.perr) > far_ ? AS_PULL_FAR : AS_PULL_MAX;
+                double c = AS.perr / rate / 400.0;
                 if (c > cmax) c = cmax;
                 if (c < -cmax) c = -cmax;
+                const double cs = AS_PULL_SLEW * T;
+                if (c > AS.pull + cs) c = AS.pull + cs;
+                if (c < AS.pull - cs) c = AS.pull - cs;
                 ratio += c;
                 AS.pull = c;
-                if (AS.locked && t - AS.t_open > 10.0) { AS.k_sum += AS.k; AS.pull_sum += c; AS.kp_n++; }
-            } else AS.pull = 0;
+                if (AS.locked && t - AS.t_open > 10.0 && AS.kf_var > 0 && AS.kf_var < 4e-10) { AS.k_sum += AS.k; AS.pull_sum += c; AS.kp_n++; }
+            } else { AS.pull = 0; AS.perr_on = 0; }
         } else if (AS.playing && AS.ring_target) {
             double c = -((double)AS.rep_ring - (double)AS.ring_target) / rate / 400.0;
-            if (c > 300e-6) c = 300e-6;
-            if (c < -300e-6) c = -300e-6;
+            if (c > AS_PULL_MAX) c = AS_PULL_MAX;            /* as protocol 3's */
+            if (c < -AS_PULL_MAX) c = -AS_PULL_MAX;
             ratio += c;
         }
         /* its delays noted (journaled by the control's thread): with what the receiver held then */
@@ -625,6 +710,7 @@ int anet_info_as(const char *host, int port, anet_peer *p, int ms, unsigned as) 
         else if (!strncmp(s, "max=", 4)) p->max_rate = (unsigned)strtoul(s + 4, NULL, 10);
         else if (!strncmp(s, "hw=", 3)) snprintf(p->hw, sizeof p->hw, "%.95s", s + 3);
         else if (!strncmp(s, "rates=", 6)) snprintf(p->rates, sizeof p->rates, "%.95s", s + 6);   /* */
+        else if (!strncmp(s, "bits=", 5)) snprintf(p->bits, sizeof p->bits, "%.47s", s + 5);      /* */
         else if (!strncmp(s, "err=", 4)) snprintf(p->err, sizeof p->err, "%.23s", s + 4);
         else if (!strncmp(s, "room=", 5)) snprintf(p->room, sizeof p->room, "%.79s", s + 5);   /* an uplink's receiver */
         if (!c) break;
@@ -706,7 +792,8 @@ int anet_open(const char *host, int port, unsigned rate, int fmt, unsigned hold_
         snprintf(why, wl, "audiolaz receiver refused %u Hz (%s)", rate,
                  r.reason == ANET_E_RATE ? ((offer & ANET_CAP_RATES) ? "not a rate its DAC takes as it is" : "above its DAC's rates")
                  : r.reason == ANET_E_DAC ? "its DAC did not open: busy, or the rate refused"
-                 : r.reason == ANET_E_DAC_START ? "its DAC refuses to start: unplug it and plug it in again" : "header");
+                 : r.reason == ANET_E_DAC_START ? "its DAC refuses to start: unplug it and plug it in again"
+                 : r.reason == ANET_E_FORMAT ? "DoP its DAC cannot play whole: fewer than 24 bits there, or resampled" : "header");
         return -1;
     }
     pthread_mutex_lock(&as_lk);
@@ -735,6 +822,16 @@ int anet_open(const char *host, int port, unsigned rate, int fmt, unsigned hold_
     AS.start = AS.goal = r.reason; AS.anchor = r.reason; AS.goal_lo = AS.goal_hi = r.reason;
     AS.late_us = AS.peak_us = AS.r_underruns = AS.r_adjusts = AS.r_min = AS.r_max = 0; AS.rstate = ANET_RS_FILLING; AS.rwhy = 0;
     AS.pull = 0; AS.left_over = AS.put_back = 0; AS.n_avg = 0; AS.t_navg = 0; AS.k_sum = AS.pull_sum = 0; AS.kp_n = 0;   /* */
+    {
+
+        char hp[sizeof AS.hp];
+        snprintf(hp, sizeof hp, "%s:%d", host, port);
+        const int kk = as_known_at(hp, 0), known = kk >= 0 && as_known[kk].has_kf;
+        AS.k = known ? as_known[kk].kf : 1.0; AS.kf_var = 0;
+        AS.f_sig = 0; AS.perr = 0; AS.perr_on = 0; AS.rep_out = AS.rep_steps = 0;
+        as_fit_restart();
+        AS.kf_p = known ? 9e-10 : 2.25e-8;
+    }
     AS.put_in = AS.left_out = AS.sped = AS.slowed = 0; AS.ping_seq = 0; AS.t_ping = 0; AS.r_stopped = 0;
     AS.stop_why = ANET_WHY_NONE; AS.stop_text[0] = 0; AS.meta_sent = 0; AS.after = 0;
     AS.rt_err = AS.rt_said = 0; memset(AS.late_n, 0, sizeof AS.late_n); memset(AS.late_max, 0, sizeof AS.late_max); AS.late_w = AS.late_r = 0;
@@ -833,7 +930,7 @@ int anet_get_state(const char *hostport, anet_state *s) {
         s->anchor_ms = AS.anchor * ms; s->ins_ms = (double)AS.ins * ms;
         s->held_ms = ((double)AS.qw + (double)AS.ins - as_est_played(t) + AS.after) * ms;
         s->after_ms = AS.after * ms;
-        s->dac_ppm = AS.locked ? (AS.k - 1.0) * 1e6 : 0; s->pull_ppm = AS.pull * 1e6;   /* */
+        s->dac_ppm = (AS.k - 1.0) * 1e6; s->pull_ppm = AS.pull * 1e6;   /* ; the fitted clock the pace follows */
         s->over_ms = (double)AS.left_over * ms; s->back_ms = (double)AS.put_back * ms;
         for (int i = 0; i < 4; i++) { s->tx_late += AS.late_n[i]; if (AS.late_max[i] * 1000 > s->tx_late_ms) s->tx_late_ms = AS.late_max[i] * 1000; }
         if (!s->adapt) { s->target_ms = AS.ring_target * ms; s->start_ms = s->target_ms; }
@@ -876,6 +973,8 @@ void anet_close(int finish) {
         if (AS.caps & ANET_CAP_ADAPT) {
             const size_t fl = strlen(fig);
             if (AS.kp_n) snprintf(fig + fl, sizeof fig - fl, "; its DAC's clock %+.0f ppm against ours on average, the ring's pull %+.0f ppm on average", (AS.k_sum / AS.kp_n - 1) * 1e6, AS.pull_sum / AS.kp_n * 1e6);
+            if (AS.rep_out) { const size_t f3 = strlen(fig); snprintf(fig + f3, sizeof fig - f3, "; its reports: %lu set aside (off its clock by more than %.1f ms), %lu steps", AS.rep_out, fmax(AS_OUT_N * AS.f_sig, AS_OUT_MS / 1000.0 * AS.rate) * ms, AS.rep_steps); }
+            if (AS.kf_var > 0 && AS.kf_var < 4e-10) { const int kk = as_known_at(AS.hp, 1); as_known[kk].kf = AS.k; as_known[kk].has_kf = 1; }   /* the next stream starts there */
             if (AS.left_over || AS.put_back) { const size_t f2 = strlen(fig); snprintf(fig + f2, sizeof fig - f2, " (silence left out above its target %.0f ms, put back below %.0f)", AS.left_over * ms, AS.put_back * ms); }
         }
         /* the sender's own delays this stream, by cause */

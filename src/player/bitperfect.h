@@ -12,20 +12,22 @@ enum {                                  /* why it is not intact (bits of bp.why)
     BP_CORRECTION = 1, BP_LEVEL = 2, BP_VOLUME = 4, BP_UPSAMPLING = 8, BP_DSD = 16, BP_CHANNELS = 32, BP_BITS = 64,
     BP_RATE = 128, BP_DROPPED = 256, BP_CHANGED = 512, BP_LIMITER = 1024, BP_OUTPUT = 2048,
     BP_NIGHT = 4096,
-    BP_SWAP = 8192, BP_POLARITY = 16384 /* the speakers' channels (channels.h): exact, after the comparison */
+    BP_SWAP = 8192, BP_POLARITY = 16384, /* the speakers' channels (channels.h): exact, after the comparison */
+    BP_AMP_VOLUME = 32768
 };
 #define BP_EXACT (BP_SWAP | BP_POLARITY) /* what changes no sample's value: lossless */
+enum { BP_IN_AS, BP_IN_SWAP, BP_IN_SKIP };   /* bp_in_as: the source as it came, its channels exchanged, not comparable */
 static const char *const BP_WHY_NAME[] = { "correction", "level", "volume", "upsampling", "dsd", "channels", "bits",
                                            "rate", "dropped", "changed", "limiter", "output", "night",
-                                           "swap", "polarity" };
+                                           "swap", "polarity", "ampvolume" };
 typedef struct {
     _Atomic int on;                     /* the writer compares (the offset below known) */
     _Atomic int checked;
     _Atomic int64_t base;               /* the ring's place of the music's frame 0 */
     _Atomic unsigned why;               /* BP_* said this play */
     /* the play's thread */
-    int64_t in_m; uint64_t in_h; int32_t in_or;
-    struct { int64_t end; uint64_t h; } q[BP_Q];
+    int64_t in_m; uint64_t in_h; int32_t in_or; int in_skip;
+    struct { int64_t end; uint64_t h; int skip; } q[BP_Q];
     _Atomic unsigned qw, qr;
     /* the writer */
     int64_t out_k; uint64_t out_h; int out_any, out_spoiled;
@@ -46,7 +48,7 @@ static inline uint64_t bp_f(int64_t m, int32_t l, int32_t r) {
 
 static inline void bp_start(int checked) {
     atomic_store(&bp.on, 0);
-    bp.in_m = 0; bp.in_h = 0; bp.in_or = 0;
+    bp.in_m = 0; bp.in_h = 0; bp.in_or = 0; bp.in_skip = 0;
     atomic_store(&bp.qw, 0); atomic_store(&bp.qr, 0);
     bp.out_k = -1; bp.out_h = 0; bp.out_any = 0; bp.out_spoiled = 0;
     atomic_store(&bp.ok, 0); atomic_store(&bp.bad, 0); atomic_store(&bp.skipped, 0);
@@ -57,20 +59,24 @@ static inline void bp_say(unsigned why) { atomic_fetch_or(&bp.why, why); }
 
 static inline void bp_base(int64_t base) { atomic_store(&bp.base, base); atomic_store_explicit(&bp.on, 1, memory_order_release); }
 static inline void bp_stop(void) { atomic_store(&bp.on, 0); atomic_store(&bp.checked, 0); }
-/* The play's thread: n frames of the source as read (nch channels interleaved). */
-static inline void bp_in(const int32_t *raw, long n, int nch) {
+/* The play's thread: n frames of the source as read (nch channels interleaved); how: BP_IN_AS (as they came),
+ * BP_IN_SWAP (the output carries them with their two channels exchanged: fingerprinted so), BP_IN_SKIP (the output
+ * carries neither: the spans they fall in are not compared). */
+static inline void bp_in_as(const int32_t *raw, long n, int nch, int how) {
     if (!atomic_load_explicit(&bp.checked, memory_order_relaxed)) return;
+    const size_t ia = how == BP_IN_SWAP ? (size_t)(nch > 1) : 0, ib = how == BP_IN_SWAP ? 0 : (size_t)(nch > 1);
     for (long i = 0; i < n; i++) {
-        const int32_t l = raw[(size_t)i * (size_t)nch], r = raw[(size_t)i * (size_t)nch + (nch > 1)];
+        const int32_t l = raw[(size_t)i * (size_t)nch + ia], r = raw[(size_t)i * (size_t)nch + ib];
         bp.in_or |= l | r;
         bp.in_h += bp_f(bp.in_m, l, r);
+        if (how == BP_IN_SKIP) bp.in_skip = 1;
         if (++bp.in_m % BP_SPAN == 0) {
             const unsigned w = atomic_load_explicit(&bp.qw, memory_order_relaxed);
             if (w - atomic_load_explicit(&bp.qr, memory_order_acquire) < BP_Q) {
-                bp.q[w % BP_Q].end = bp.in_m; bp.q[w % BP_Q].h = bp.in_h;
+                bp.q[w % BP_Q].end = bp.in_m; bp.q[w % BP_Q].h = bp.in_h; bp.q[w % BP_Q].skip = bp.in_skip;
                 atomic_store_explicit(&bp.qw, w + 1, memory_order_release);
             }
-            bp.in_h = 0;
+            bp.in_h = 0; bp.in_skip = 0;
         }
     }
     int b = 32;
@@ -78,6 +84,7 @@ static inline void bp_in(const int32_t *raw, long n, int nch) {
     else b = 0;
     atomic_store_explicit(&bp.bits_in, b, memory_order_relaxed);
 }
+static inline void bp_in(const int32_t *raw, long n, int nch) { bp_in_as(raw, n, nch, BP_IN_AS); }
 /* The writer: the span ending at end compared with the source's, if it has it. */
 static inline void bp_close(int64_t end, uint64_t h, int spoiled) {
     for (;;) {
@@ -86,9 +93,10 @@ static inline void bp_close(int64_t end, uint64_t h, int spoiled) {
         const int64_t e = bp.q[r % BP_Q].end;
         if (e > end) return;
         const uint64_t hin = bp.q[r % BP_Q].h;
+        const int skip = bp.q[r % BP_Q].skip;
         atomic_store_explicit(&bp.qr, r + 1, memory_order_release);
         if (e < end) { atomic_fetch_add(&bp.skipped, 1); continue; }           /* a span the output never had */
-        if (spoiled) atomic_fetch_add(&bp.skipped, 1);
+        if (spoiled || skip) atomic_fetch_add(&bp.skipped, 1);                 /* not whole, or a swap changing */
         else if (hin == h) atomic_fetch_add(&bp.ok, 1);
         else atomic_fetch_add(&bp.bad, 1);
         return;

@@ -13,10 +13,14 @@ int roomd_latency_json(char *b, size_t len);
 
 int page_outroom(const char *rooms, const char *out, char *id, size_t idn, char *base, size_t bn, char *name, size_t nn);
 int page_start(int port, const char *rooms, const char *output);
+/* the polarity's meaning of 1.2.8 kept once (swap on: invert_l/invert_r exchanged); how many outputs, −1 none */
+int page_channels_migrate(const char *rooms);
 
 void page_conf_follow(const char *rooms);
 
 int page_level_manual(void);
+
+double page_auto_level(const char *rooms, const char *base, const char *image, double *top);
 
 void page_sound_label(const char *key, char *sound, size_t sl, char *room, size_t rl);
 /* The acoustic calibration (10/10, roomd.c): clicks at at[0, n) ms of the app's next short track marked as it plays

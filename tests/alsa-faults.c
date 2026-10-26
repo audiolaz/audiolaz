@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static double t0 = -1, started, clockpos, first_open = 0;
@@ -18,10 +19,12 @@ static double env(const char *k, double d) { const char *v = getenv(k); return v
 static double since(void) { if (t0 < 0) t0 = now(); return now() - t0; }
 __attribute__((constructor)) static void init(void) { since(); }
 
+static int installed;                                /* LATE_SBITS: a playback device's parameters in place */
 int snd_pcm_open(snd_pcm_t **p, const char *name, snd_pcm_stream_t s, int mode) {
     static int (*real)(snd_pcm_t **, const char *, snd_pcm_stream_t, int);
     if (!real) real = dlsym(RTLD_NEXT, "snd_pcm_open");
     if (s == SND_PCM_STREAM_PLAYBACK) {
+        installed = 0;
         double t = since();
         if (t >= env("BUSY_FROM", 1e9) && t < env("BUSY_TO", 0)) { refused_opens++; return -EBUSY; }
         opens++;
@@ -67,7 +70,28 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *p, snd_pcm_hw_params_t *hw, snd_pcm_
     if (!real) real = dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_format");
     if (env("REFUSE_DSD", 0) > 0 && (f == SND_PCM_FORMAT_DSD_U8 || f == SND_PCM_FORMAT_DSD_U16_LE || f == SND_PCM_FORMAT_DSD_U16_BE ||
                                      f == SND_PCM_FORMAT_DSD_U32_LE || f == SND_PCM_FORMAT_DSD_U32_BE)) return -EINVAL;
+    const char *only = getenv("ONLY_FMT");               /* */
+    if (only && only[0] && snd_pcm_stream(p) == SND_PCM_STREAM_PLAYBACK) {
+        const char *n = snd_pcm_format_name(f);
+        const size_t l = n ? strlen(n) : 0;
+        int in = 0;
+        for (const char *q = only; l && *q; q += strcspn(q, ","), q += *q == ',') if (strcspn(q, ",") == l && !strncmp(q, n, l)) in = 1;
+        if (!in) return -EINVAL;
+    }
     return real(p, hw, f);
+}
+int snd_pcm_hw_params(snd_pcm_t *p, snd_pcm_hw_params_t *hw) {
+    static int (*real)(snd_pcm_t *, snd_pcm_hw_params_t *);
+    if (!real) real = dlsym(RTLD_NEXT, "snd_pcm_hw_params");
+    const int e = real(p, hw);
+    if (!e && snd_pcm_stream(p) == SND_PCM_STREAM_PLAYBACK) installed = 1;
+    return e;
+}
+int snd_pcm_hw_params_get_sbits(const snd_pcm_hw_params_t *hw) {
+    static int (*real)(const snd_pcm_hw_params_t *);
+    if (!real) real = dlsym(RTLD_NEXT, "snd_pcm_hw_params_get_sbits");
+    if (installed && env("LATE_SBITS", 0) > 0) return (int)env("LATE_SBITS", 0);
+    return real(hw);
 }
 
 static int over_max(snd_pcm_t *p, unsigned r) {

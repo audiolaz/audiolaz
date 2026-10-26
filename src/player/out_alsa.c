@@ -13,6 +13,7 @@
 #include "out.h"
 #include "alsa_hw.h"
 #include "azgrow.h"
+#include "pcmpack.h"
 
 struct out_pcm {
     snd_pcm_t *p; int bits; unsigned dev_rate;
@@ -21,7 +22,35 @@ struct out_pcm {
     int grow; unsigned rate; snd_pcm_uframes_t hwbuf, per, lvl, lvl0;
     long low; double t_look; azgrow g;
     char say[240]; int say_n;
+    /* PCM in a format of its own (pcmpack.h): its PCMF entry, its bits kept; pk: the words packed (not the card's
+     * S32_LE as they are), in pkbuf (pkcap frames, made at the open: nothing allocated by the writer) */
+    int fi, pk; unsigned long pkcap; uint8_t *pkbuf; uint64_t rng;
+    /* (22/10, the review) DoP told by its markers (pk_dop): its last frame's marker; said once (never played on a card
+     * keeping fewer than 24 bits) */
+    uint8_t dop_last; int dop_said;
+    unsigned long dop_run; unsigned dop_rate;   /* its frames of DoP in a row, the rate (pcmpack.h pk_dop_mute) */
+    snd_pcm_format_t f;                  /* the format it plays in (out_format) */
 };
+/* The PCM formats a card may take for the player's 32-bit words, best first (the first the card takes at the
+ * rate wins): bytes a sample, its width (the word's top bits), big-endian */
+static const struct { snd_pcm_format_t f; int bytes, width, be; } PCMF[] = {
+    { SND_PCM_FORMAT_S32_LE, 4, 32, 0 }, { SND_PCM_FORMAT_S24_LE, 4, 24, 0 }, { SND_PCM_FORMAT_S24_3LE, 3, 24, 0 }, { SND_PCM_FORMAT_S16_LE, 2, 16, 0 },
+    { SND_PCM_FORMAT_S32_BE, 4, 32, 1 }, { SND_PCM_FORMAT_S24_BE, 4, 24, 1 }, { SND_PCM_FORMAT_S24_3BE, 3, 24, 1 }, { SND_PCM_FORMAT_S16_BE, 2, 16, 1 } };
+#define NPCMF ((int)(sizeof PCMF / sizeof PCMF[0]))
+/* The first of PCMF this configuration (access and channels set) takes at the rate: its index, *bits its bits kept (the
+ * width, or the card's msbits when fewer); −1 none. hw left as it was. */
+static int pcm_pick(snd_pcm_t *p, const snd_pcm_hw_params_t *hw, unsigned rate, int *bits) {
+    snd_pcm_hw_params_t *t;
+    snd_pcm_hw_params_alloca(&t);
+    for (int i = 0; i < NPCMF; i++) {
+        snd_pcm_hw_params_copy(t, hw);
+        if (snd_pcm_hw_params_set_format(p, t, PCMF[i].f) < 0 || snd_pcm_hw_params_set_rate(p, t, rate, 0) < 0) continue;
+        const int sb = snd_pcm_hw_params_get_sbits(t);
+        if (bits) *bits = sb >= 8 && sb < PCMF[i].width ? sb : PCMF[i].width;
+        return i;
+    }
+    return -1;
+}
 static int opt_grow_ms = 0;
 static double mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 /* the level to wake at: a period under the level (avail_min = the buffer less the level, plus a period) */
@@ -75,21 +104,28 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
     snd_pcm_hw_params_any(p, hw);
     unsigned r = rate, n = periods;
     snd_pcm_uframes_t per = period;
+    int fi = -1, fbits = 32, nofmt = 0;
     if ((e = snd_pcm_hw_params_set_access(p, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
-        (e = snd_pcm_hw_params_set_format(p, hw, alsa_fmt(fmt))) < 0 ||
         (e = snd_pcm_hw_params_set_channels(p, hw, 2)) < 0 ||
+        /* PCM (DoP too): the best format it takes at this rate */
+        (fmt == OUTF_S32 && (fi = pcm_pick(p, hw, rate, &fbits)) < 0 && (nofmt = 1) && (e = -EINVAL) < 0) ||
+        (e = snd_pcm_hw_params_set_format(p, hw, fi >= 0 ? PCMF[fi].f : alsa_fmt(fmt))) < 0 ||
         (e = snd_pcm_hw_params_set_rate(p, hw, r, 0)) < 0 ||
         (e = snd_pcm_hw_params_set_period_size_near(p, hw, &per, 0)) < 0 ||
         (e = opt_grow_ms > 0 ? 0 : snd_pcm_hw_params_set_periods_near(p, hw, &n, 0)) < 0 ||
         (opt_grow_ms > 0 && (e = grow_buffer(p, hw, rate, per, n)) < 0) ||
         (e = snd_pcm_hw_params(p, hw)) < 0) {
-        if (!quiet) olog("%s at %u Hz: %s", dev, rate, snd_strerror(e));
+        /* (22/10, the review) the formats named only when they were the refusal (not the access, the channels…) */
+        if (!quiet) olog("%s at %u Hz: %s%s", dev, rate, snd_strerror(e), nofmt ? " (none of S32, S24, S24_3, S16, little- or big-endian, at this rate)" : "");
         snd_pcm_close(p);
         return NULL;
     }
     out_pcm *o = calloc(1, sizeof *o);
     if (!o) { snd_pcm_close(p); return NULL; }
     o->p = p;
+    o->fi = fi;
+    o->dop_rate = rate;
+    o->f = fi >= 0 ? PCMF[fi].f : alsa_fmt(fmt);
     if (opt_grow_ms > 0) {                             /* the level, from what was asked */
         snd_pcm_uframes_t b = 0, pp = 0;
         snd_pcm_get_params(p, &b, &pp);
@@ -126,14 +162,73 @@ out_pcm *out_open(const char *dev, int fmt, unsigned rate, unsigned long period,
             snd_output_close(so);
         }
     }
-    /* what the card keeps of the 32-bit words (out_bits): its significant bits (a USB DAC's S32_LE often 24) */
-    const int sb = fmt == OUTF_S32 ? snd_pcm_hw_params_get_sbits(hw) : 0;
-    o->bits = sb >= 8 && sb < 32 ? sb : 32;
+    /* what the card keeps of the 32-bit words (out_bits): its significant bits (a USB DAC's S32_LE often 24);
+     * in its own format: that format's width at most (S16_LE: 16) */
+    o->bits = 32;
+    if (fi >= 0) {
+        const int sb = snd_pcm_hw_params_get_sbits(hw);
+        o->bits = sb >= 8 && sb < PCMF[fi].width ? sb : PCMF[fi].width;
+        if (fbits < o->bits) o->bits = fbits;     /* as pcm_pick found it (out_takes_bits says the same) */
+        o->pk = fi != 0 || o->bits < 32;          /* packed unless S32_LE kept whole (the writes as before) */
+        o->rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)o ^ ((uint64_t)rate << 32);
+        if (o->pk) {   /* its pages touched here, never first by the writer (real time) */
+            o->pkcap = 2048;
+            if (!(o->pkbuf = malloc(o->pkcap * 2 * (size_t)PCMF[fi].bytes))) { snd_pcm_close(p); free(o); return NULL; }
+            memset(o->pkbuf, 0, o->pkcap * 2 * (size_t)PCMF[fi].bytes);
+        }
+        if (fi != 0) {   /* said once per device, format and rate (a play opens it again at each track) */
+            static char said[200];
+            char now_[200];
+            snprintf(now_, sizeof now_, "%s %d %u", dev, fi, rate);
+            if (strcmp(said, now_)) {
+                snprintf(said, sizeof said, "%s", now_);
+                olog("%s at %u Hz: it takes no S32_LE: %s, %d bits kept (a word with more dithered once, TPDF; one with as many "
+                     "or fewer bit for bit)", dev, rate, snd_pcm_format_name(PCMF[fi].f), o->bits);
+            }
+        }
+    }
     return o;
 }
 long out_write(out_pcm *o, const int32_t *pcm, unsigned long n) {
-    const snd_pcm_sframes_t w = snd_pcm_writei(o->p, pcm, n);
-    return w == -EAGAIN ? OUT_AGAIN : (long)w;
+    if (o->pk && o->fi == 0 && o->bits >= 24) {   /* S32_LE whose msbits are fewer: as it is when every word is on
+                                                    * that grid (fewer than 24: packed, below, where DoP is looked for) */
+        const uint32_t low = ((uint32_t)1 << (32 - o->bits)) - 1;
+        unsigned long i = 0;
+        while (i < 2 * n && !((uint32_t)pcm[i] & low)) i++;
+        if (i == 2 * n) { const snd_pcm_sframes_t w = snd_pcm_writei(o->p, pcm, n); return w == -EAGAIN ? OUT_AGAIN : (long)w; }
+    }
+    if (!o->pk) {
+        const snd_pcm_sframes_t w = snd_pcm_writei(o->p, pcm, n);
+        return w == -EAGAIN ? OUT_AGAIN : (long)w;
+    }
+    /* packed into its format, pkcap frames at a time: what it took (frames packed and not taken are packed again
+     * at the next write, dithered anew: nothing played twice). (22/10, the review) DoP never dithered, whatever the
+     * player decided before: told by its markers (pk_dop), its words packed with dither 0 (on the grid of 24 bits: as
+     * they are); a card keeping fewer than 24 bits plays silence instead (its one-bit samples cut would be noise), said
+     * once (roomd.c and the receiver refuse DoP there before: this is the last guard) */
+    unsigned long done = 0;
+    while (done < n) {
+        const unsigned long m = n - done < o->pkcap ? n - done : o->pkcap;
+        const uint8_t was = o->dop_last;
+        const unsigned long run0 = o->dop_run;
+        /* at 176.4 kHz or more only, silence once 20 ms of it in a row (pk_dop_mute): music never muted on
+         * its top bytes alone */
+        const int dop = pk_dop_at(o->dop_rate, pcm + 2 * done, m, &o->dop_last);
+        const int mute = pk_dop_mute(dop, m, o->dop_rate, &o->dop_run);
+        if (mute && o->bits < 24) {
+            memset(o->pkbuf, 0, m * 2 * (size_t)PCMF[o->fi].bytes);
+            if (!o->dop_said++) olog("DoP to a card that keeps %d bits (%s): silence instead (its one-bit samples would be noise; DoP needs 24)", o->bits, snd_pcm_format_name(PCMF[o->fi].f));
+        } else pk_pack(o->pkbuf, pcm + 2 * done, 2 * m, PCMF[o->fi].bytes, PCMF[o->fi].width, PCMF[o->fi].be, o->bits, !dop, &o->rng);
+        const snd_pcm_sframes_t w = snd_pcm_writei(o->p, o->pkbuf, m);
+        if (w < 0) { o->dop_last = was; o->dop_run = run0; return done ? (long)done : w == -EAGAIN ? OUT_AGAIN : (long)w; }
+        done += (unsigned long)w;
+        if ((unsigned long)w < m) {   /* the rest written again next time: the marker of the last frame it took */
+            o->dop_last = dop && w > 0 ? (uint8_t)((uint32_t)pcm[2 * (done - 1)] >> 24) : was;
+            if (dop) o->dop_run = run0 + (unsigned long)w;
+            break;
+        }
+    }
+    return (long)done;
 }
 void out_wait(out_pcm *o, int ms) { snd_pcm_wait(o->p, ms); }
 /* --grow-ms: the room below the level; how low it came (the writer comes after its wake: the lowest), looked
@@ -185,19 +280,26 @@ void out_close(out_pcm *o) {
     if (!o) return;
     snd_pcm_drop(o->p);
     snd_pcm_close(o->p);
+    free(o->pkbuf);
     free(o);
 }
-int out_takes(const char *dev, int fmt, unsigned rate) {
+/* PCM (DoP too): any format of PCMF at this rate; *bits: the bits kept then */
+static int takes(const char *dev, int fmt, unsigned rate, int *bits) {
     snd_pcm_t *p;
     if (snd_pcm_open(&p, dev, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return -1;
     snd_pcm_hw_params_t *hw;
     snd_pcm_hw_params_alloca(&hw);
-    const int ok = snd_pcm_hw_params_any(p, hw) >= 0 && snd_pcm_hw_params_set_access(p, hw, SND_PCM_ACCESS_RW_INTERLEAVED) >= 0 &&
-                   snd_pcm_hw_params_set_format(p, hw, alsa_fmt(fmt)) >= 0 && snd_pcm_hw_params_set_channels(p, hw, 2) >= 0 &&
-                   snd_pcm_hw_params_test_rate(p, hw, rate, 0) == 0;
+    int ok = snd_pcm_hw_params_any(p, hw) >= 0 && snd_pcm_hw_params_set_access(p, hw, SND_PCM_ACCESS_RW_INTERLEAVED) >= 0 &&
+             snd_pcm_hw_params_set_channels(p, hw, 2) >= 0;
+    if (ok && fmt == OUTF_S32) ok = pcm_pick(p, hw, rate, bits) >= 0;
+    else if (ok) ok = snd_pcm_hw_params_set_format(p, hw, alsa_fmt(fmt)) >= 0 && snd_pcm_hw_params_test_rate(p, hw, rate, 0) == 0;
     snd_pcm_close(p);
     return ok;
 }
+int out_takes(const char *dev, int fmt, unsigned rate) { return takes(dev, fmt, rate, NULL); }
+int out_takes_bits(const char *dev, unsigned rate) { int b = 0; const int t = takes(dev, OUTF_S32, rate, &b); return t == 1 ? b : t < 0 ? -1 : 0; }
+
+const char *out_format(out_pcm *o) { return o ? snd_pcm_format_name(o->f) : ""; }
 const char *out_strerror(long e) { return snd_strerror((int)e); }
 const char *out_fmt_name(int fmt) { return snd_pcm_format_name(alsa_fmt(fmt)); }
 unsigned out_device_rate(out_pcm *o) { return o ? o->dev_rate : 0; }

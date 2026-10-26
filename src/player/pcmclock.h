@@ -32,11 +32,16 @@ static inline int32_t s32_out_q(double x, int bits, uint64_t *rng) {
 #define CLOCK_I_BAND_S 0.05
 #define CLOCK_KP 20000.0
 #define CLOCK_KI 40.0
-static inline double clock_regulate(double e, double span, double *steady) {
+
+#define CLOCK_NET_DEAD_S 0.1
+#define CLOCK_DEAD_GAIN 0.1             /* the proportional part inside the band: a tenth (the loop damped, never pure integral) */
+static inline double clock_regulate_dead(double e, double span, double *steady, double dead) {
     if (fabs(e) < CLOCK_I_BAND_S) *steady += CLOCK_KI * e * span;
     if (*steady > CLOCK_STEADY_MAX) *steady = CLOCK_STEADY_MAX; else if (*steady < -CLOCK_STEADY_MAX) *steady = -CLOCK_STEADY_MAX;
-    double ppm = CLOCK_KP * e + *steady;
+    const double ep = fabs(e) <= dead ? CLOCK_DEAD_GAIN * e : e > 0 ? CLOCK_DEAD_GAIN * dead + (e - dead) : -CLOCK_DEAD_GAIN * dead + (e + dead);
+    double ppm = CLOCK_KP * ep + *steady;
     if (ppm > CLOCK_PPM_MAX) ppm = CLOCK_PPM_MAX; else if (ppm < -CLOCK_PPM_MAX) ppm = -CLOCK_PPM_MAX;
     return ppm;
 }
+static inline double clock_regulate(double e, double span, double *steady) { return clock_regulate_dead(e, span, steady, 0.0); }
 #endif

@@ -27,11 +27,19 @@ The player does not only promise to leave the music alone: it checks it, all the
 | `bitPerfectLossless` | `true` when only `swap` or `polarity` keep it from being bit-perfect and the spans compared were identical: lossless, verified; `null` when `bitPerfect` is not `false` |
 | `soundPath` | `input`, `inRate`, `inBits` (the source's significant bits seen), `channels`, `outRate`, `outBits` (what the output keeps), `deviceRate` (when the device plays at another rate), `dac` |
 
-Left and right swapped or a speaker's polarity inverted (`src/player/channels.h`) come after the comparison: the spans
-check the path up to them, and they are exact by construction (the samples moved, or negated in the output's format).
-The output is then no longer the source channel for channel, so the player does not call it bit-perfect; it says
-lossless.
+Left and right swapped or a speaker's polarity inverted (`src/player/channels.h`) are exact by construction (the
+samples moved, or negated in the output's format). The swap acts on the music as soon as it is read: the source is
+fingerprinted with its two channels exchanged, as the output must carry it, and the spans of a change while it plays
+(its 5 ms crossfade) are not compared. The polarity comes after the comparison. The output is then no longer the source
+channel for channel, so the player does not call it bit-perfect; it says lossless.
+
+A sound card on Linux (`src/player/out_alsa.c`, `pcmpack.h`) is opened in the best format it takes at the stream's
+rate: S32_LE, then S24_LE, S24_3LE, S16_LE (then their big-endian twins); many USB Audio Class 1 DACs take only S16_LE
+or S24_3LE. `soundPath.outBits` says what it keeps: 16, 24, or its own significant bits when an S32_LE card says fewer.
+A source with as many bits or fewer reaches it bit for bit (a CD on a 16-bit DAC: bit-perfect); one with more is
+requantized once, with TPDF dither, never truncated, and said (`bits`).
 
 What it cannot see beyond the writer is the output's own path: a sound card's driver, an ALSA `plug` device (the
 player reads its description and reports a rate conversion), a network receiver. audiolaz Link's receiver plays what
-it receives as it came, and the transfer itself is checked bit for bit by `tests/anet-loop.sh`.
+it receives as it came (to a DAC that keeps fewer bits, it says how many: the player requantizes once and says `bits`),
+and the transfer itself is checked bit for bit by `tests/anet-loop.sh`.

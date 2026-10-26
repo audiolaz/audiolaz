@@ -10,6 +10,7 @@
 
 #define SRC_ENDED (-1001)
 #define SRC_LOST (-1002)
+#define SRC_CHANGED (-1003)
 
 /* The inputs' device (--loop: the Loopback's index or id on Linux; on macOS the folder of the FIFOs, "" for
  * <rooms>/in), subs inputs, rooms the player's folder. 0: ready; −1: none (their sources stay silent, said). */
@@ -70,7 +71,7 @@ void src_shutdown(void);
 typedef struct src_pcm src_pcm;
 src_pcm *src_open(int k, unsigned rate, unsigned ch, unsigned long period, unsigned periods);
 void src_start(src_pcm *s);
-/* Frames waiting (≥ 0), or negative: an overrun (read too late: src_recover), SRC_ENDED, SRC_LOST. */
+/* Frames waiting (≥ 0), or negative: an overrun (read too late: src_recover), SRC_ENDED, SRC_LOST, SRC_CHANGED. */
 long src_avail(src_pcm *s);
 /* Up to n frames (the channels it was opened with, interleaved, 32-bit integers, full scale ±2^31) into pcm: how many,
  * SRC_AGAIN, or negative (overrun). */

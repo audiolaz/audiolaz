@@ -32,6 +32,7 @@
 #include "rt_thread.h"                     /* the packets' thread in Mach real time (macOS); rt_guard (both) */
 #include "rt_watch.h"                      /* who held the cores, said with a back-off for it (Linux) */
 #include "azgrow.h"                        /* the DAC's buffer sizing itself (the null DAC's here) */
+#include "pcmpack.h"                       /* (22/10, the review) the null DAC of --null-bits: its words as a card's */
 #ifndef ANET_NULL_ONLY
 #include "out.h"
 #define OUT_AGAIN_ OUT_AGAIN
@@ -86,6 +87,31 @@ static unsigned o_max = 0;
 static double o_ppm = 0;
 static char dac_dev[128];
 static char o_rates[100] = "";            /* the rates the DAC takes as it is (INFO rates=; Linux: at the start) */
+/* the bits its DAC keeps of each 32-bit word (INFO bits=, anet.h: one for all its rates, or one for each rate
+ * of o_rates; "" a DAC of 32 bits, or not known): Linux, at the start (out_takes_bits: a DAC that takes S16_LE only,
+ * 16). A stream with more bits is dithered once on its way to the DAC (out_alsa.c, pcmpack.h), unless its sender
+ * requantized it itself (it read bits=: roomd.c); words on that grid go bit for bit. */
+static char o_bits[48] = "";
+static int o_null_bits = 32;              /* (22/10, the review) the tests': the null DAC keeps these bits (--null-bits N:
+                                           * INFO bits=N with --null-rates; its words packed as out_alsa.c packs a card's,
+                                           * pcmpack.h: dithered once, DoP silence below 24 bits) */
+#if !defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+static void bits_of_rates(void) {
+    o_bits[0] = 0;
+    int b[16], n = 0, low = 0;
+    for (const char *p = o_rates; *p && n < 16;) {
+        unsigned long v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (unsigned long)(*p++ - '0');
+        if (v) { b[n] = out_takes_bits(dac_dev, (unsigned)v); if (b[n] <= 0) return; if (b[n] < 32) low = 1; n++; }
+        while (*p && (*p < '0' || *p > '9')) p++;
+    }
+    if (!n || !low) return;
+    int same = 1;
+    for (int i = 1; i < n; i++) same &= b[i] == b[0];
+    size_t w = 0;
+    for (int i = 0; i < (same ? 1 : n) && w + 4 < sizeof o_bits; i++) w += (size_t)snprintf(o_bits + w, sizeof o_bits - w, "%s%d", i ? "," : "", b[i]);
+}
+#endif
 
 static const char *o_status = NULL;
 static char o_room[96] = "";              /* --room: the room this receiver feeds (an uplink's), INFO room= */
@@ -130,6 +156,8 @@ static struct {
                                             * while it stands in (ns); the stream's start there (ns, CLOCK_MONOTONIC) */
     int seen;                              /* the reader came this stream (its beat since t_open) */
     azgrow g; long low; double t_look; unsigned long buf0;   /* the null DAC's buffer sizing itself (as out_alsa.c) */
+    uint8_t dop_last; int dop_said; uint64_t rng;            /* (22/10, the review) the null DAC of --null-bits (pcmpack.h) */
+    unsigned long dop_run;                                   /* its frames of DoP in a row (pk_dop_mute) */
 } D;
 
 static char o_shm[64] = "";
@@ -237,6 +265,7 @@ static int dev_open(unsigned rate) {
         D.rate = rate; D.period = per; D.buffer = per * np; D.t0 = 0; D.eaten0 = 0; D.written = 0; D.open = 1;
         /* as a Linux DAC's (out_alsa.c --grow-ms): its level from what was asked, growing at the first sign */
         D.buf0 = D.buffer; D.low = -1; D.t_look = 0;
+        D.dop_last = 0; D.dop_run = 0; if (!D.rng) D.rng = 0x9E3779B97F4A7C15ull ^ ((uint64_t)rate << 32);   /* --null-bits */
         azg_init(&D.g, (double)D.buffer, o_grow_ms > 0 ? (double)rate * o_grow_ms / 1000.0 : (double)D.buffer, rate, mono());
         if (o_dump && !D.dump) D.dump = fopen(o_dump, "ab");
         return 0;
@@ -251,7 +280,14 @@ static int dev_open(unsigned rate) {
     if (!D.o) return -1;
     out_params(D.o, &D.buffer, &D.period);
     D.rate = rate; D.open = 1;
+#ifndef __APPLE__
+    /* a DAC that takes no S32_LE (out_alsa.c says its format), or keeps fewer bits; (22/10, the review) its
+     * format as it is (S32_BE…) */
+    if (out_bits(D.o) < 32) lg("%s open at %u Hz, %s, %d bits kept (a stream with more dithered once on its way, TPDF), period %lu, buffer %lu frames", dac_dev, rate, out_format(D.o), out_bits(D.o), D.period, D.buffer);
+    else lg("%s open at %u Hz, %s, period %lu, buffer %lu frames", dac_dev, rate, out_format(D.o), D.period, D.buffer);
+#else
     lg("%s open at %u Hz, S32_LE, period %lu, buffer %lu frames", dac_dev, rate, D.period, D.buffer);
+#endif
 #ifdef __APPLE__
     /* a rate the device lists and will not go to (the miniDSP Flex 8 DL, 10/10): played at one it takes */
     if (out_device_rate(D.o)) lg("%s refuses %u Hz: it plays at %u Hz, resampled by Core Audio's converter (not bit for bit)", out_device_name(D.o), rate, out_device_rate(D.o));
@@ -268,6 +304,24 @@ static void dev_close(void) {
     if (o_shm[0]) { shm_close(); return; }
 #ifndef ANET_NULL_ONLY
     if (!o_null) { out_close(D.o); D.o = NULL; }   /* snd_pcm_drop, then close: the DAC given back at once */
+#endif
+}
+/* (22/10, the review) the bits the open DAC keeps (out_alsa.c: 16 for a card that takes S16_LE only), and whether it
+ * plays this rate only resampled (a Mac's: Core Audio's converter) */
+static int dev_bits(void) {
+    if (o_null) return o_null_bits;
+    if (o_shm[0]) return 32;
+#ifndef ANET_NULL_ONLY
+    return D.o ? out_bits(D.o) : 32;
+#else
+    return 32;
+#endif
+}
+static int dev_resampled(void) {
+#if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
+    return !o_null && !o_shm[0] && D.o && out_device_rate(D.o) != 0;
+#else
+    return 0;
 #endif
 }
 static _Atomic unsigned long null_xruns, null_xr_new;   /* _new: since the DAC's thread last counted them as gaps */
@@ -315,7 +369,19 @@ static long dev_write(const int32_t *p, unsigned long n, int data) {
             else if (t - t_x >= test_xrun_s) { t_x = t; return -EPIPE; }
         }
         if (D.t0 == 0) { D.t0 = mono(); D.eaten0 = 0; }
-        if (D.dump && data) fwrite(p, 8, n, D.dump);
+        if (D.dump && data && o_null_bits < 32) {   /* (22/10, the review) as a card of that many bits (out_alsa.c) */
+            int32_t b[2048];
+            for (unsigned long k = 0; k < n;) {
+                const unsigned long m = n - k < 1024 ? n - k : 1024;
+                const int dop = pk_dop_at(D.rate, p + 2 * k, m, &D.dop_last);   /* as out_alsa.c: 176.4 kHz */
+                if (pk_dop_mute(dop, m, D.rate, &D.dop_run) && o_null_bits < 24) {   /* up, 20 ms of it in a row */
+                    memset(b, 0, 8 * m);
+                    if (!D.dop_said++) note("DoP to a DAC that keeps %d bits: silence instead (its one-bit samples would be noise; DoP needs 24)", o_null_bits);
+                } else pk_pack((uint8_t *)b, p + 2 * k, 2 * m, 4, 32, 0, o_null_bits, !dop, &D.rng);
+                fwrite(b, 8, m, D.dump);
+                k += m;
+            }
+        } else if (D.dump && data) fwrite(p, 8, n, D.dump);
         D.written += n;
         return (long)n;
     }
@@ -507,6 +573,14 @@ static unsigned state_locked(void) {
 }
 /* a report now (under lk): never blocking (the DAC's thread sends them); a report the socket took half of is finished
  * before the next one (else the player would read them askew) */
+/* AUDIOLAZ_RECV_TEST_REPJIT=<ms>:<outlier ms>:<every s>: the tests' reports askew (test/link-nogap.sh pace):
+ * what each says played off by up to ±<ms> (its moment's jitter: the DAC's thread, the network), and every <every s>
+ * of the stream one report off by <outlier ms>, its sign alternating, every third time three in a row (a bad sample,
+ * a timestamp's glitch). The DAC itself, the ring, the music: untouched (what the sender is told only). */
+static double test_rj_ms = 0, test_rj_out_ms = 0, test_rj_every = 0, test_rj_next = 0;
+static unsigned test_rj_n = 0, test_rj_left = 0; static uint64_t test_rj_x = 0x2545F4914F6CDD1Dull;
+static double test_rj_u(void) { test_rj_x ^= test_rj_x << 13; test_rj_x ^= test_rj_x >> 7; test_rj_x ^= test_rj_x << 17; return (double)(test_rj_x >> 11) / 9007199254740992.0; }
+static double t_stream0;
 static void report_locked_f(uint32_t extra_flags) {
     if (S.cfd < 0) return;
     if (S.npend) {
@@ -518,6 +592,15 @@ static void report_locked_f(uint32_t extra_flags) {
     const uint64_t got = atomic_load(&rw), read = atomic_load(&rr);
     const long d = D.open ? S.delay : 0;
     r.played = read > (uint64_t)d ? read - (uint64_t)d : 0;
+    if ((test_rj_ms > 0 || test_rj_out_ms > 0) && S.started && r.played > 0) {   /* the tests' (above) */
+        const double now_ = mono() - t_stream0;
+        double off = (2.0 * test_rj_u() - 1.0) * test_rj_ms;
+        if (test_rj_every > 0 && test_rj_next == 0) test_rj_next = test_rj_every;
+        if (test_rj_every > 0 && now_ >= test_rj_next && !test_rj_left) { test_rj_n++; test_rj_left = test_rj_n % 3 == 0 ? 3 : 1; test_rj_next += test_rj_every; }
+        if (test_rj_left) { test_rj_left--; off += (test_rj_n & 1 ? -1.0 : 1.0) * test_rj_out_ms; }
+        const double pl = (double)r.played + off * D.rate / 1000.0;
+        r.played = pl > 0 ? (uint64_t)pl : 0;
+    }
     r.received = got;
     r.ring = (uint32_t)(got - read);
     if (S.started && !S.drained && D.open) r.flags |= ANET_R_PLAYING;
@@ -861,7 +944,6 @@ static double test_spin_s = 0; static int test_spin_park = 0;   /* AUDIOLAZ_RECV
 /* AUDIOLAZ_RECV_TEST_LATE=<ms>:<every s>[:<steps>]: the DAC's thread late that much now and then while it
  * plays (a loaded machine: the bench of point 9), growing to it over its first <steps> times (4: a quarter, a half…) */
 static double test_late_ms = 0, test_late_every = 0; static int test_late_steps = 4;
-static double t_stream0;
 
 /* the ring dry: what the DAC's buffer must still hold for this thread to leave it be (frames): three periods
  * (ten on a Mac, 50 ms: its delay counts the device's own latency too, and Core Audio takes an IO cycle, 12 ms at 44.1
@@ -1226,9 +1308,11 @@ static int conn_read(int fd, conn_t *k) {
         if (!o_null && !o_shm[0] && out_rates_text(dac_dev, rates, sizeof rates) < 0) rates[0] = 0;
 #endif
         for (char *q = o_room; *q; q++) if (*q == ';' || (unsigned char)*q < 0x20) *q = ' ';
-        const char *keys[4] = { o_room[0] ? "room" : NULL, o_hw[0] ? "hw" : NULL, rates[0] ? "rates" : NULL, stuck_until > mono() ? "err" : NULL };
-        const char *vals[4] = { o_room, o_hw, rates, "dac-start" };
-        for (int i = 0; i < 4; i++) {
+        /* the bits its DAC keeps (bits=, with its rates only: one for each of them, or one for all) */
+        const char *keys[5] = { o_room[0] ? "room" : NULL, o_hw[0] ? "hw" : NULL, rates[0] ? "rates" : NULL, stuck_until > mono() ? "err" : NULL,
+                                rates[0] && o_bits[0] && !strcmp(rates, o_rates) ? "bits" : NULL };
+        const char *vals[5] = { o_room, o_hw, rates, "dac-start", o_bits };
+        for (int i = 0; i < 5; i++) {
             if (!keys[i] || n <= 0) continue;
             const size_t need = strlen(keys[i]) + strlen(vals[i]) + 2;
             if ((size_t)n + need + 1 < ANET_INFO - 4) n += snprintf((char *)ib + 4 + n, ANET_INFO - 4 - (size_t)n, ";%s=%s", keys[i], vals[i]);
@@ -1323,7 +1407,7 @@ static int stream_begin(int fd, const conn_t *k) {
     /* the same rate, the last stream playing out: its tail heard first (the DAC kept open, fed), then this one */
     const int follow = D.open && cur_rate == h.rate && S.ended && !S.failed;
     place_recheck();   /* another program's real time on our cores since: below it */
-    t_stream0 = mono();
+    t_stream0 = mono(); test_rj_next = 0; test_rj_left = 0;
     if (follow) for (int i = 0; i < 400 && atomic_load(&rr) < atomic_load(&rw); i++) usleep(5000);
     park();
     S.live = 0;
@@ -1338,6 +1422,18 @@ static int stream_begin(int fd, const conn_t *k) {
         if (de == -2) { S.why = ANET_WHY_RATE; unpark(); refuse(fd, h.id, ANET_E_RATE); lg("stream %u: %u Hz refused: not a rate the DAC takes as it is (the sender converts; it takes %s)", h.id, h.rate, o_rates[0] ? o_rates : "others"); return -1; }
         if (de) { S.why = ANET_WHY_DAC; unpark(); refuse(fd, h.id, ANET_E_DAC); lg("stream %u: the DAC %s did not open at %u Hz", h.id, dac_dev, h.rate); return -1; }
         cur_rate = h.rate;
+    }
+    /* (22/10, the review) DoP, as the sender says (ANET_F_DOP): only to a DAC that plays its words whole, 24 bits kept or
+     * more at that rate, as it is (never resampled: a Mac's converter); else refused (ANET_E_FORMAT), the sender plays
+     * PCM to it. A sender before this says ANET_F_S32: its DoP to such a DAC is silence there (out_alsa.c), after its
+     * first 20 ms (23/10, pcmpack.h pk_dop_mute: never on markers alone) */
+    if (h.fmt == ANET_F_DOP && (dev_bits() < 24 || dev_resampled())) {
+        const int b = dev_bits();
+        dev_close();
+        S.why = ANET_WHY_DAC; unpark(); refuse(fd, h.id, ANET_E_FORMAT);
+        lg("stream %u: DoP at %u Hz refused: its DAC %s (its markers and one-bit samples would be noise): the sender plays PCM to it", h.id, h.rate,
+           b < 24 ? "keeps fewer than 24 bits there" : "plays that rate only resampled");
+        return -1;
     }
     atomic_store(&rw, 0); atomic_store(&rr, 0);
     S.delay = 0;
@@ -1646,12 +1742,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--null-ppm")) { o_ppm = atof(v); i++; }
         else if (!strcmp(a, "--dump")) { o_dump = v; i++; }
         else if (!strcmp(a, "--null-rates")) { snprintf(o_rates, sizeof o_rates, "%s", v); i++; }   /* the tests': a DAC taking these only */
+        else if (!strcmp(a, "--null-bits")) { o_null_bits = atoi(v); if (o_null_bits < 8 || o_null_bits > 32) o_null_bits = 32; if (o_null_bits < 32) snprintf(o_bits, sizeof o_bits, "%d", o_null_bits); i++; }   /* (22/10, the review) the tests' */
         else if (!strcmp(a, "--status")) { o_status = v; i++; }   /* the uplink's state for the box's app */
         else if (!strcmp(a, "--room")) { snprintf(o_room, sizeof o_room, "%s", v); i++; }   /* INFO room= */
 #if defined(__APPLE__) && !defined(ANET_NULL_ONLY)
         else if ((!strcmp(a, "--exclusive") || !strcmp(a, "--integer") || !strcmp(a, "--test-start-fail") || !strcmp(a, "--test-refuse-rates") || !strcmp(a, "--test-stick")) && out_option(a, v)) i++;   /* out_coreaudio.c's */
 #endif
-        else { fprintf(stderr, "usage: audiolaz-recv [--dac hw:…|auto|shm:<name>|<Core Audio UID or name>] [--null] [--port N] [--name S] [--id S] [--max-rate Hz] [--period-us N] [--periods N] [--ring-ms N] [--ring-max-ms N] [--no-adapt] [--jitter-q Q] [--jitter-memory-s S] [--no-mdns] [--rt auto|N] [--cpu auto|N] [--force] [--lock-mb N] [--null-ppm N] [--null-rates R,…] [--dump F] [--status F] [--room S] [--log-time] [--grow-ms N] [--stats] [--once] [--v2] (macOS: [--exclusive on|off] [--integer on|off] [--list-devices] [--test-start-fail N] [--test-refuse-rates R,…])\n"); return 2; }
+        else { fprintf(stderr, "usage: audiolaz-recv [--dac hw:…|auto|shm:<name>|<Core Audio UID or name>] [--null] [--port N] [--name S] [--id S] [--max-rate Hz] [--period-us N] [--periods N] [--ring-ms N] [--ring-max-ms N] [--no-adapt] [--jitter-q Q] [--jitter-memory-s S] [--no-mdns] [--rt auto|N] [--cpu auto|N] [--force] [--lock-mb N] [--null-ppm N] [--null-rates R,…] [--null-bits N] [--dump F] [--status F] [--room S] [--log-time] [--grow-ms N] [--stats] [--once] [--v2] (macOS: [--exclusive on|off] [--integer on|off] [--list-devices] [--test-start-fail N] [--test-refuse-rates R,…])\n"); return 2; }
     }
 
     if (!strncmp(o_dac, "shm:", 4)) {
@@ -1681,6 +1778,12 @@ int main(int argc, char **argv) {
         if (ts && *ts) { test_spin_s = atof(ts); test_spin_park = strstr(ts, ":park") != NULL; }
         const char *tx = getenv("AUDIOLAZ_RECV_TEST_XRUN");
         if (tx && *tx) test_xrun_s = atof(tx);
+        const char *tj = getenv("AUDIOLAZ_RECV_TEST_REPJIT");   /* */
+        if (tj && *tj) {
+            test_rj_ms = atof(tj); const char *c = strchr(tj, ':');
+            if (c) { test_rj_out_ms = atof(c + 1); const char *c2 = strchr(c + 1, ':'); test_rj_every = c2 ? atof(c2 + 1) : 7; if (test_rj_every < 0.2) test_rj_every = 0.2; }
+            lg("test: its reports askew (AUDIOLAZ_RECV_TEST_REPJIT): ±%.1f ms, %.0f ms off every %.1f s", test_rj_ms, test_rj_out_ms, test_rj_every);
+        }
         const char *tl = getenv("AUDIOLAZ_RECV_TEST_LATE");
         if (tl && *tl) {
             test_late_ms = atof(tl); const char *c = strchr(tl, ':'); test_late_every = c ? atof(c + 1) : 5; if (test_late_every < 0.1) test_late_every = 0.1;
@@ -1749,6 +1852,8 @@ int main(int argc, char **argv) {
             if (!o_max) o_max = 192000;
         }
         if (out_rates_text(dac_dev, o_rates, sizeof o_rates) < 0) o_rates[0] = 0;   /* INFO rates= */
+        bits_of_rates();                                                            /* INFO bits= */
+        if (o_bits[0]) lg("%s keeps %s bits of each word (at %s Hz; INFO bits=): a stream with more dithered once here (TPDF) unless its sender did it, one with as many bit for bit", dac_dev, o_bits, o_rates);
     }
 #endif
     /* the ring: half a second at the highest rate at least, and the ceiling's ring with room to spare */

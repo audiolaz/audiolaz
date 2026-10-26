@@ -133,6 +133,42 @@ int main(void) {
         check(at[1] > 0 && at[1] <= at[0] + 10 && over[1] < 0.005 && r120[1] >= r120[0] - 0.001, what);
         printf("  (ring at 2 min %.0f ms, old law %.0f ms)\n", r120[1] * 1000, r120[0] * 1000);
     }
+
+    for (int law = 0; law < 2; law++) {
+        int pinned = 0, dry = 0, full = 0;
+        double ppm_max = 0, dev_max = 0, steady_end = 0;
+        for (int ph = 0; ph < 3; ph++) {
+            const double dt = 0.01, target = 3.0, cap = 524288.0 / 88200.0, hi = cap - 1.5;
+            double ring = target, rbuf = 20.0 - 0.25 * ph, steady = 0, ppm = 0, sum = 0, anchor = -1, t_win = 0;
+            long n = 0;
+            for (long k = 0; k < (long)(3600 / dt); k++) {
+                const double t = k * dt;
+                ring += (1.0 + (60.0 - ppm) * 1e-6) * dt;          /* the source writes, slowed by ppm > 0 */
+                rbuf -= dt;                                        /* the receiver plays */
+                if (rbuf < 19.7) { double take = 20.0 - rbuf; if (take > 0.7) take = 0.7; if (take > ring) take = ring; ring -= take; rbuf += take; }
+                if (ring <= 0) dry++;
+                if (ring >= cap) full++;
+                sum += ring; n++;
+                if (t - t_win >= 10.0) {
+                    const double avg = sum / n;
+                    if (anchor < 0) anchor = law ? (avg < target / 4 ? target / 4 : avg > hi ? hi : avg) : (avg > target ? target : avg);
+                    const double e = avg - anchor;
+                    ppm = law ? clock_regulate_dead(e, t - t_win, &steady, CLOCK_NET_DEAD_S) : clock_regulate(e, t - t_win, &steady);
+                    if (fabs(ppm) >= CLOCK_PPM_MAX - 1e-9) pinned++;
+                    if (fabs(ppm) > ppm_max) ppm_max = fabs(ppm);
+                    if (t > 60 && fabs(avg - anchor) > dev_max) dev_max = fabs(avg - anchor);
+                    sum = 0; n = 0; t_win = t;
+                }
+            }
+            steady_end += steady / 3;
+        }
+        char what[240];
+        snprintf(what, sizeof what, "%s: a receiver in 0.7 s bursts, 60 min ×3: %d windows at ±600 ppm, largest %.0f ppm; the ring %.0f ms off its level at most",
+                 law ? "the player" : "(the old way)", pinned, ppm_max, dev_max * 1000);
+        if (law) check(pinned == 0 && ppm_max < 300 && dry == 0 && full == 0 && dev_max < 0.15 && fabs(steady_end - 60) < 30, what);
+        else printf("  %s\n", what);
+        if (law) printf("  (never dry, never full; the integral learned %.0f ppm of the 60)\n", steady_end);
+    }
     run(1, 1000, 0, 30, &se, &sm, &off, &dev);
     check(fabs(se) <= CLOCK_STEADY_MAX + 1e-9, "an impossible 1000 ppm: the integral held at its limit");
     printf(fails ? "PCMCLOCK: %d WRONG\n" : "PCMCLOCK OK\n", fails);
